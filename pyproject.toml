@@ -6,6 +6,9 @@ requires-python = ">=3.10"
 dependencies = [
     "pyyaml>=6.0",
     "pydantic>=2.0",
+    "qutebrowser>=3.0",
+    "PyQt6>=6.5",
+    "PyQt6-WebEngine>=6.5",
 ]
 
 [project.optional-dependencies]
