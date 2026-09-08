@@ -1,4 +1,5 @@
 # List of chats to open. Each must match a key in sites.py.
+# Use `sbsllm --list-sites` to see all available options.
 chats:
   - chatgpt
   - claude
@@ -9,3 +10,15 @@ login_wait: 30
 
 # Path to qutebrowser binary (auto-detected if omitted)
 # qutebrowser_bin: /usr/bin/qutebrowser
+
+# Logging level: DEBUG, INFO, WARNING, ERROR, CRITICAL (default: INFO)
+# log_level: INFO
+
+# Path to log file (optional, logs to stdout if omitted)
+# log_file: /tmp/sbsllm.log
+
+# Number of retries for failed browser operations (default: 3)
+# retry_count: 3
+
+# Delay between retries in seconds (default: 1.0)
+# retry_delay: 1.0

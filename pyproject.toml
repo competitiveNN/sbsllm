@@ -5,6 +5,14 @@ description = "Side-by-side LLM testing app — test prompts against multiple AI
 requires-python = ">=3.10"
 dependencies = [
     "pyyaml>=6.0",
+    "pydantic>=2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=6.0",
+    "ruff>=0.6.0",
 ]
 
 [project.scripts]

@@ -12,7 +12,7 @@ class TestListSites:
 
     def test_contains_all_expected_sites(self):
         sites = list_sites()
-        expected = ["chatgpt", "claude", "deepseek", "qwen", "grok", "google", "mistral", "kimi"]
+        expected = ["chatgpt", "claude", "deepseek", "qwen", "grok", "google", "mistral", "kimi", "perplexity", "poe", "cohere"]
         for site in expected:
             assert site in sites, f"Missing site: {site}"
 

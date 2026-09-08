@@ -11,6 +11,7 @@ from .browser import (
     ensure_qutebrowser,
     inject_and_submit,
     open_tabs,
+    setup_logging,
 )
 from .config import load_config
 from .inject import inject_prompt, submit_js
@@ -92,6 +93,9 @@ def get_prompt() -> str:
 
 def run(config, prompt: str | None, login_wait: int | None) -> int:
     """Main orchestration. Returns exit code."""
+    # Setup logging
+    setup_logging(level=config.log_level, log_file=config.log_file)
+
     qb_bin = config.qb_bin
     chats = config.chats
     wait = login_wait if login_wait is not None else config.login_wait

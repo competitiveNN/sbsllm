@@ -17,6 +17,8 @@ from sbsllm.browser import (
     open_tabs,
     run_command,
     run_js,
+    setup_logging,
+    with_retry,
 )
 
 
@@ -70,9 +72,9 @@ class TestIsRunning:
 class TestEnsureQutebrowser:
     def test_already_running(self, capsys):
         with patch("sbsllm.browser.is_running", return_value=True):
-            ensure_qutebrowser("qutebrowser")
-            captured = capsys.readouterr()
-            assert "already running" in captured.out
+            with patch("sbsllm.browser.logger") as mock_logger:
+                ensure_qutebrowser("qutebrowser")
+                mock_logger.info.assert_called_with("qutebrowser is already running.")
 
     def test_launches_when_not_running(self):
         with patch("sbsllm.browser.is_running") as mock_running:
@@ -207,3 +209,59 @@ class TestInjectAndSubmit:
                     result = inject_and_submit("qutebrowser", 1, "inject_js", "submit_js")
                     assert result["inject"] == "OK"
                     assert result["submit"] == "NO_BUTTON"
+
+
+class TestSetupLogging:
+    def test_default_logging(self):
+        with patch("sbsllm.browser.logging.basicConfig") as mock_config:
+            setup_logging()
+            mock_config.assert_called_once()
+            call_kwargs = mock_config.call_args[1]
+            assert call_kwargs["level"] == 20  # INFO
+
+    def test_debug_logging(self):
+        with patch("sbsllm.browser.logging.basicConfig") as mock_config:
+            setup_logging(level="DEBUG")
+            call_kwargs = mock_config.call_args[1]
+            assert call_kwargs["level"] == 10  # DEBUG
+
+    def test_with_log_file(self, tmp_path):
+        log_file = tmp_path / "test.log"
+        with patch("sbsllm.browser.logging.basicConfig") as mock_config:
+            setup_logging(log_file=str(log_file))
+            call_kwargs = mock_config.call_args[1]
+            handlers = call_kwargs["handlers"]
+            assert len(handlers) == 2  # StreamHandler + FileHandler
+
+
+class TestWithRetry:
+    def test_succeeds_first_try(self):
+        mock_func = MagicMock(return_value="success")
+        decorated = with_retry(mock_func, max_retries=3, delay=0.1)
+        result = decorated()
+        assert result == "success"
+        assert mock_func.call_count == 1
+
+    def test_retries_on_exception(self):
+        mock_func = MagicMock(
+            side_effect=[subprocess.TimeoutExpired("x", 1), "success"]
+        )
+        decorated = with_retry(mock_func, max_retries=3, delay=0.01)
+        result = decorated()
+        assert result == "success"
+        assert mock_func.call_count == 2
+
+    def test_raises_after_max_retries(self):
+        mock_func = MagicMock(
+            side_effect=subprocess.TimeoutExpired("x", 1)
+        )
+        decorated = with_retry(mock_func, max_retries=2, delay=0.01)
+        with pytest.raises(subprocess.TimeoutExpired):
+            decorated()
+        assert mock_func.call_count == 3  # initial + 2 retries
+
+    def test_no_retry_on_success(self):
+        mock_func = MagicMock(return_value="ok")
+        decorated = with_retry(mock_func, max_retries=5, delay=0.01)
+        decorated()
+        assert mock_func.call_count == 1

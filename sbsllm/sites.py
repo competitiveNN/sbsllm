@@ -220,6 +220,87 @@ SITES: dict[str, dict] = {
             })()
         """,
     },
+    "perplexity": {
+        "url": "https://www.perplexity.ai/",
+        "inject": """
+            (() => {
+                const ta = document.querySelector('textarea[placeholder*="Ask"]')
+                    || document.querySelector('textarea[placeholder*="Search"]')
+                    || document.querySelector('textarea');
+                if (!ta) return 'NO_INPUT';
+                const nativeSetter = Object.getOwnPropertyDescriptor(
+                    window.HTMLTextAreaElement.prototype, 'value'
+                ).set;
+                nativeSetter.call(ta, `PROMPT_PLACEHOLDER`);
+                ta.dispatchEvent(new Event('input', { bubbles: true }));
+                ta.dispatchEvent(new Event('change', { bubbles: true }));
+                return 'OK';
+            })()
+        """,
+        "submit_js": """
+            (() => {
+                const btn = document.querySelector('button[aria-label*="Submit"]')
+                    || document.querySelector('button[aria-label*="Send"]')
+                    || document.querySelector('textarea')?.closest('form')?.querySelector('button');
+                if (btn) { btn.click(); return 'OK'; }
+                return 'NO_BUTTON';
+            })()
+        """,
+    },
+    "poe": {
+        "url": "https://poe.com/",
+        "inject": """
+            (() => {
+                const ta = document.querySelector('textarea[placeholder*="Message"]')
+                    || document.querySelector('textarea[placeholder*="Ask"]')
+                    || document.querySelector('textarea');
+                if (!ta) return 'NO_INPUT';
+                const nativeSetter = Object.getOwnPropertyDescriptor(
+                    window.HTMLTextAreaElement.prototype, 'value'
+                ).set;
+                nativeSetter.call(ta, `PROMPT_PLACEHOLDER`);
+                ta.dispatchEvent(new Event('input', { bubbles: true }));
+                ta.dispatchEvent(new Event('change', { bubbles: true }));
+                return 'OK';
+            })()
+        """,
+        "submit_js": """
+            (() => {
+                const btn = document.querySelector('button[aria-label*="Send"]')
+                    || document.querySelector('button[class*="send"]')
+                    || document.querySelector('textarea')?.closest('form')?.querySelector('button');
+                if (btn) { btn.click(); return 'OK'; }
+                return 'NO_BUTTON';
+            })()
+        """,
+    },
+    "cohere": {
+        "url": "https://cohere.com/chat",
+        "inject": """
+            (() => {
+                const ta = document.querySelector('textarea[placeholder*="Message"]')
+                    || document.querySelector('textarea[placeholder*="Ask"]')
+                    || document.querySelector('textarea');
+                if (!ta) return 'NO_INPUT';
+                const nativeSetter = Object.getOwnPropertyDescriptor(
+                    window.HTMLTextAreaElement.prototype, 'value'
+                ).set;
+                nativeSetter.call(ta, `PROMPT_PLACEHOLDER`);
+                ta.dispatchEvent(new Event('input', { bubbles: true }));
+                ta.dispatchEvent(new Event('change', { bubbles: true }));
+                return 'OK';
+            })()
+        """,
+        "submit_js": """
+            (() => {
+                const btn = document.querySelector('button[aria-label*="Send"]')
+                    || document.querySelector('button[type="submit"]')
+                    || document.querySelector('textarea')?.closest('form')?.querySelector('button');
+                if (btn) { btn.click(); return 'OK'; }
+                return 'NO_BUTTON';
+            })()
+        """,
+    },
 }
 
 

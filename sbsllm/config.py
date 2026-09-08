@@ -3,19 +3,47 @@
 from __future__ import annotations
 
 import sys
-from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import yaml
+from pydantic import BaseModel, Field, field_validator
 
 from .sites import list_sites
 
 
-@dataclass
-class Config:
-    chats: list[str]
-    login_wait: int
-    qutebrowser_bin: str | None
+class Config(BaseModel):
+    """Configuration for sbsllm."""
+
+    chats: list[str] = Field(..., min_length=1, description="List of chat sites to open")
+    login_wait: int = Field(default=30, ge=0, description="Seconds to wait for login")
+    qutebrowser_bin: str | None = Field(default=None, description="Path to qutebrowser binary")
+    log_level: str = Field(default="INFO", description="Logging level (DEBUG, INFO, WARNING, ERROR)")
+    log_file: str | None = Field(default=None, description="Path to log file (optional)")
+    retry_count: int = Field(default=3, ge=0, description="Number of retries for failed operations")
+    retry_delay: float = Field(default=1.0, ge=0, description="Delay between retries in seconds")
+
+    @field_validator("chats")
+    @classmethod
+    def validate_chats(cls, v: list[str]) -> list[str]:
+        """Validate that all chat sites exist."""
+        available = set(list_sites())
+        invalid = [c for c in v if c not in available]
+        if invalid:
+            raise ValueError(
+                f"Unknown chats: {invalid}. Available: {sorted(available)}"
+            )
+        return v
+
+    @field_validator("log_level")
+    @classmethod
+    def validate_log_level(cls, v: str) -> str:
+        """Validate log level."""
+        valid_levels = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
+        upper = v.upper()
+        if upper not in valid_levels:
+            raise ValueError(f"Invalid log level: {v}. Must be one of: {valid_levels}")
+        return upper
 
     @property
     def qb_bin(self) -> str:
@@ -56,33 +84,10 @@ def load_config(path: Path | None = None) -> Config:
     return parse_config(data, path)
 
 
-def parse_config(data: dict, source: Path | None = None) -> Config:
-    """Validate raw config dict and return Config dataclass."""
-    available = list_sites()
-
-    raw_chats = data.get("chats")
-    if not raw_chats:
-        chats_str = ", ".join(available)
-        print(
-            f"Config error: 'chats' is empty or missing. Available: {chats_str}",
-            file=sys.stderr,
-        )
+def parse_config(data: dict[str, Any], source: Path | None = None) -> Config:
+    """Validate raw config dict and return Config."""
+    try:
+        return Config(**data)
+    except Exception as e:
+        print(f"Config error: {e}", file=sys.stderr)
         sys.exit(1)
-
-    invalid = [c for c in raw_chats if c not in available]
-    if invalid:
-        chats_str = ", ".join(available)
-        print(
-            f"Config error: unknown chats: {invalid}. Available: {chats_str}",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    login_wait = data.get("login_wait", 30)
-    qutebrowser_bin = data.get("qutebrowser_bin") or None
-
-    return Config(
-        chats=raw_chats,
-        login_wait=int(login_wait),
-        qutebrowser_bin=qutebrowser_bin,
-    )

@@ -9,7 +9,7 @@ import yaml
 from sbsllm.config import Config, load_config, parse_config
 
 
-class TestConfigDataclass:
+class TestConfigModel:
     def test_creation(self):
         config = Config(chats=["chatgpt"], login_wait=30, qutebrowser_bin=None)
         assert config.chats == ["chatgpt"]
@@ -23,6 +23,44 @@ class TestConfigDataclass:
     def test_qb_bin_custom(self):
         config = Config(chats=["chatgpt"], login_wait=30, qutebrowser_bin="/usr/bin/qutebrowser")
         assert config.qb_bin == "/usr/bin/qutebrowser"
+
+    def test_default_log_level(self):
+        config = Config(chats=["chatgpt"])
+        assert config.log_level == "INFO"
+
+    def test_custom_log_level(self):
+        config = Config(chats=["chatgpt"], log_level="DEBUG")
+        assert config.log_level == "DEBUG"
+
+    def test_log_level_case_insensitive(self):
+        config = Config(chats=["chatgpt"], log_level="debug")
+        assert config.log_level == "DEBUG"
+
+    def test_invalid_log_level_raises(self):
+        with pytest.raises(ValueError, match="Invalid log level"):
+            Config(chats=["chatgpt"], log_level="INVALID")
+
+    def test_default_retry_values(self):
+        config = Config(chats=["chatgpt"])
+        assert config.retry_count == 3
+        assert config.retry_delay == 1.0
+
+    def test_custom_retry_values(self):
+        config = Config(chats=["chatgpt"], retry_count=5, retry_delay=2.5)
+        assert config.retry_count == 5
+        assert config.retry_delay == 2.5
+
+    def test_negative_login_wait_raises(self):
+        with pytest.raises(ValueError):
+            Config(chats=["chatgpt"], login_wait=-1)
+
+    def test_negative_retry_count_raises(self):
+        with pytest.raises(ValueError):
+            Config(chats=["chatgpt"], retry_count=-1)
+
+    def test_negative_retry_delay_raises(self):
+        with pytest.raises(ValueError):
+            Config(chats=["chatgpt"], retry_delay=-0.5)
 
 
 class TestParseConfig:
@@ -47,25 +85,25 @@ class TestParseConfig:
         with pytest.raises(SystemExit):
             parse_config({"chats": []})
         captured = capsys.readouterr()
-        assert "empty or missing" in captured.err
+        assert "Config error" in captured.err
 
     def test_missing_chats_exits(self, capsys):
         with pytest.raises(SystemExit):
             parse_config({})
         captured = capsys.readouterr()
-        assert "empty or missing" in captured.err
+        assert "Config error" in captured.err
 
     def test_invalid_chat_exits(self, capsys):
         with pytest.raises(SystemExit):
             parse_config({"chats": ["nonexistent"]})
         captured = capsys.readouterr()
-        assert "unknown chats" in captured.err
+        assert "Config error" in captured.err
 
     def test_partial_invalid_chat_exits(self, capsys):
         with pytest.raises(SystemExit):
             parse_config({"chats": ["chatgpt", "nonexistent"]})
         captured = capsys.readouterr()
-        assert "unknown chats" in captured.err
+        assert "Config error" in captured.err
 
     def test_multiple_chats(self):
         data = {"chats": ["chatgpt", "claude", "deepseek"]}
@@ -77,6 +115,28 @@ class TestParseConfig:
         config = parse_config(data)
         assert config.login_wait == 45
         assert isinstance(config.login_wait, int)
+
+    def test_all_new_sites_valid(self):
+        """Verify all newly added sites are accepted."""
+        data = {"chats": ["perplexity", "poe", "cohere"]}
+        config = parse_config(data)
+        assert config.chats == ["perplexity", "poe", "cohere"]
+
+    def test_log_level_config(self):
+        data = {"chats": ["chatgpt"], "log_level": "DEBUG"}
+        config = parse_config(data)
+        assert config.log_level == "DEBUG"
+
+    def test_log_file_config(self):
+        data = {"chats": ["chatgpt"], "log_file": "/tmp/sbsllm.log"}
+        config = parse_config(data)
+        assert config.log_file == "/tmp/sbsllm.log"
+
+    def test_retry_config(self):
+        data = {"chats": ["chatgpt"], "retry_count": 5, "retry_delay": 2.0}
+        config = parse_config(data)
+        assert config.retry_count == 5
+        assert config.retry_delay == 2.0
 
 
 class TestLoadConfig:
