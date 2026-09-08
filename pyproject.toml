@@ -1,0 +1,18 @@
+[project]
+name = "sbsllm"
+version = "0.1.0"
+description = "Side-by-side LLM testing app — test prompts against multiple AI chats simultaneously"
+requires-python = ">=3.10"
+dependencies = [
+    "pyyaml>=6.0",
+]
+
+[project.scripts]
+sbsllm = "sbsllm.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["sbsllm"]

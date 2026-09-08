@@ -1,0 +1,11 @@
+# List of chats to open. Each must match a key in sites.py.
+chats:
+  - chatgpt
+  - claude
+  - deepseek
+
+# Seconds to wait for user to log in before prompting for the prompt
+login_wait: 30
+
+# Path to qutebrowser binary (auto-detected if omitted)
+# qutebrowser_bin: /usr/bin/qutebrowser
