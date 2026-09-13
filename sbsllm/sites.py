@@ -301,16 +301,122 @@ SITES: dict[str, dict] = {
             })()
         """,
     },
+    "zai": {
+        "url": "https://chat.z.ai/auth",
+        "inject": """
+            (() => {
+                const ta = document.querySelector('textarea[placeholder*="Ask"]')
+                    || document.querySelector('textarea[placeholder*="Message"]')
+                    || document.querySelector('textarea');
+                if (!ta) return 'NO_INPUT';
+                const nativeSetter = Object.getOwnPropertyDescriptor(
+                    window.HTMLTextAreaElement.prototype, 'value'
+                ).set;
+                nativeSetter.call(ta, `PROMPT_PLACEHOLDER`);
+                ta.dispatchEvent(new Event('input', { bubbles: true }));
+                ta.dispatchEvent(new Event('change', { bubbles: true }));
+                return 'OK';
+            })()
+        """,
+        "submit_js": """
+            (() => {
+                const btn = document.querySelector('button[aria-label*="Send"]')
+                    || document.querySelector('button[class*="send"]')
+                    || document.querySelector('textarea')?.closest('form')?.querySelector('button');
+                if (btn) { btn.click(); return 'OK'; }
+                return 'NO_BUTTON';
+            })()
+        """,
+    },
+    "meta": {
+        "url": "https://meta.ai/",
+        "inject": """
+            (() => {
+                const ta = document.querySelector('textarea[placeholder*="Ask"]')
+                    || document.querySelector('textarea[placeholder*="Message"]')
+                    || document.querySelector('textarea');
+                if (!ta) return 'NO_INPUT';
+                const nativeSetter = Object.getOwnPropertyDescriptor(
+                    window.HTMLTextAreaElement.prototype, 'value'
+                ).set;
+                nativeSetter.call(ta, `PROMPT_PLACEHOLDER`);
+                ta.dispatchEvent(new Event('input', { bubbles: true }));
+                ta.dispatchEvent(new Event('change', { bubbles: true }));
+                return 'OK';
+            })()
+        """,
+        "submit_js": """
+            (() => {
+                const btn = document.querySelector('button[aria-label*="Send"]')
+                    || document.querySelector('button[class*="send"]')
+                    || document.querySelector('textarea')?.closest('form')?.querySelector('button');
+                if (btn) { btn.click(); return 'OK'; }
+                return 'NO_BUTTON';
+            })()
+        """,
+    },
+    "huggingface": {
+        "url": "https://huggingface.co/chat",
+        "inject": """
+            (() => {
+                const ta = document.querySelector('textarea[placeholder*="Message"]')
+                    || document.querySelector('textarea[placeholder*="Ask"]')
+                    || document.querySelector('textarea');
+                if (!ta) return 'NO_INPUT';
+                const nativeSetter = Object.getOwnPropertyDescriptor(
+                    window.HTMLTextAreaElement.prototype, 'value'
+                ).set;
+                nativeSetter.call(ta, `PROMPT_PLACEHOLDER`);
+                ta.dispatchEvent(new Event('input', { bubbles: true }));
+                ta.dispatchEvent(new Event('change', { bubbles: true }));
+                return 'OK';
+            })()
+        """,
+        "submit_js": """
+            (() => {
+                const btn = document.querySelector('button[aria-label*="Send"]')
+                    || document.querySelector('button[aria-label*="Submit"]')
+                    || document.querySelector('button[class*="send"]')
+                    || document.querySelector('textarea')?.closest('form')?.querySelector('button');
+                if (btn) { btn.click(); return 'OK'; }
+                return 'NO_BUTTON';
+            })()
+        """,
+    },
+    "tencent": {
+        "url": "https://aistudio.tencent.ai/",
+        "inject": """
+            (() => {
+                const ta = document.querySelector('textarea[placeholder*="Ask"]')
+                    || document.querySelector('textarea[placeholder*="Message"]')
+                    || document.querySelector('textarea');
+                if (!ta) return 'NO_INPUT';
+                const nativeSetter = Object.getOwnPropertyDescriptor(
+                    window.HTMLTextAreaElement.prototype, 'value'
+                ).set;
+                nativeSetter.call(ta, `PROMPT_PLACEHOLDER`);
+                ta.dispatchEvent(new Event('input', { bubbles: true }));
+                ta.dispatchEvent(new Event('change', { bubbles: true }));
+                return 'OK';
+            })()
+        """,
+        "submit_js": """
+            (() => {
+                const btn = document.querySelector('button[aria-label*="Send"]')
+                    || document.querySelector('button[class*="send"]')
+                    || document.querySelector('textarea')?.closest('form')?.querySelector('button');
+                if (btn) { btn.click(); return 'OK'; }
+                return 'NO_BUTTON';
+            })()
+        """,
+    },
 }
 
 
 def get_site(site_id: str) -> dict:
     """Get site config by ID. Raises ValueError if not found."""
     if site_id not in SITES:
-        raise ValueError(
-            f"Unknown site: {site_id!r}. "
-            f"Available: {', '.join(SITES)}"
-        )
+        raise ValueError(f"Unknown site: {site_id!r}. Available: {', '.join(SITES)}")
     return SITES[site_id]
 
 

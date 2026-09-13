@@ -4,21 +4,19 @@ chats:
   - chatgpt
   - claude
   - deepseek
+  - zai
+  - meta
+  - huggingface
+  - tencent
 
 # Seconds to wait for user to log in before prompting for the prompt
 login_wait: 30
 
-# Path to qutebrowser binary (auto-detected if omitted)
-# qutebrowser_bin: /usr/bin/qutebrowser
+# Path to Chrome/Chromium binary (auto-detected if omitted)
+# chrome_bin: /usr/bin/google-chrome
 
 # Logging level: DEBUG, INFO, WARNING, ERROR, CRITICAL (default: INFO)
 # log_level: INFO
 
 # Path to log file (optional, logs to stdout if omitted)
 # log_file: /tmp/sbsllm.log
-
-# Number of retries for failed browser operations (default: 3)
-# retry_count: 3
-
-# Delay between retries in seconds (default: 1.0)
-# retry_delay: 1.0
