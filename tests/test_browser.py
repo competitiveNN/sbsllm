@@ -81,7 +81,7 @@ class TestEnsureBrowser:
             )
             # JavaScript is enabled
             call_kwargs = mock_instance.chromium.launch_persistent_context.call_args[1]
-            assert call_kwargs.get("javascript_enabled") is True
+            assert call_kwargs.get("java_script_enabled") is True
 
     def test_uses_channel_when_no_system_chromium(self):
         mock_context, _ = self._mock_context()
