@@ -73,6 +73,7 @@ def ensure_browser(chrome_bin: str | None = None) -> BrowserContext:
 
         launch_args: dict[str, Any] = {
             "headless": False,
+            "javascript_enabled": True,
             "args": [
                 "--no-first-run",
                 "--no-default-browser-check",
