@@ -80,6 +80,39 @@ class TestEnsureBrowser:
                 mock_instance.chromium.launch_persistent_context.call_args
             )
 
+    def test_uses_channel_when_no_system_chromium(self):
+        mock_context, _ = self._mock_context()
+        with (
+            patch("sbsllm.browser.sync_playwright") as mock_pw,
+            patch("sbsllm.browser._find_system_chromium", return_value=False),
+        ):
+            mock_instance = MagicMock()
+            mock_pw.return_value.start.return_value = mock_instance
+            mock_instance.chromium.launch_persistent_context.return_value = mock_context
+
+            ensure_browser()
+
+            call_kwargs = mock_instance.chromium.launch_persistent_context.call_args[1]
+            assert "channel" in call_kwargs
+            assert call_kwargs["channel"] == "chromium"
+            assert "executable_path" not in call_kwargs
+
+    def test_auto_detects_system_chromium(self):
+        mock_context, _ = self._mock_context()
+        with (
+            patch("sbsllm.browser.sync_playwright") as mock_pw,
+            patch("sbsllm.browser._find_system_chromium", return_value=True),
+        ):
+            mock_instance = MagicMock()
+            mock_pw.return_value.start.return_value = mock_instance
+            mock_instance.chromium.launch_persistent_context.return_value = mock_context
+
+            ensure_browser()
+
+            call_kwargs = mock_instance.chromium.launch_persistent_context.call_args[1]
+            assert call_kwargs["executable_path"] == "/usr/bin/chromium-browser"
+            assert "channel" not in call_kwargs
+
     def test_reuses_existing_browser(self):
         mock_context, _ = self._mock_context()
         with patch("sbsllm.browser.sync_playwright") as mock_pw:

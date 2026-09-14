@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from typing import Any
 
@@ -41,6 +42,11 @@ def setup_logging(level: str = "INFO", log_file: str | None = None) -> None:
     )
 
 
+def _find_system_chromium() -> bool:
+    """Check if a system Chromium binary is available."""
+    return os.path.isfile("/usr/bin/chromium-browser")
+
+
 def ensure_browser(chrome_bin: str | None = None) -> BrowserContext:
     """Ensure Chromium is running. Launch if not.
 
@@ -67,7 +73,6 @@ def ensure_browser(chrome_bin: str | None = None) -> BrowserContext:
 
         launch_args: dict[str, Any] = {
             "headless": False,
-            "channel": "chromium",
             "args": [
                 "--no-first-run",
                 "--no-default-browser-check",
@@ -75,6 +80,10 @@ def ensure_browser(chrome_bin: str | None = None) -> BrowserContext:
         }
         if chrome_bin:
             launch_args["executable_path"] = chrome_bin
+        elif _find_system_chromium():
+            launch_args["executable_path"] = "/usr/bin/chromium-browser"
+        else:
+            launch_args["channel"] = "chromium"
 
         context = playwright_instance.chromium.launch_persistent_context(
             USER_DATA_DIR, **launch_args
