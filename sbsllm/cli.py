@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import argparse
+import logging
+import select
 import sys
 from pathlib import Path
 
 from .browser import (
     BrowserError,
-    ensure_qutebrowser,
+    close_browser,
+    ensure_browser,
     inject_and_submit,
-    open_tabs,
+    open_page,
     setup_logging,
 )
 from .config import load_config
@@ -25,13 +28,15 @@ def build_parser() -> argparse.ArgumentParser:
         description="Side-by-side LLM testing — test prompts against multiple AI chats at once.",
     )
     parser.add_argument(
-        "-c", "--config",
+        "-c",
+        "--config",
         type=Path,
         default=None,
         help="Path to config.yaml (default: ./config.yaml or ~/.config/sbsllm/config.yaml)",
     )
     parser.add_argument(
-        "-p", "--prompt",
+        "-p",
+        "--prompt",
         type=str,
         default=None,
         help="Prompt to send (if omitted, you'll be prompted interactively)",
@@ -64,12 +69,19 @@ def build_parser() -> argparse.ArgumentParser:
         default=8080,
         help="Server port (default: 8080)",
     )
+    parser.add_argument(
+        "--chrome-bin",
+        type=str,
+        default=None,
+        help="Path to Chrome/Chromium binary (auto-detected if omitted)",
+    )
     return parser
 
 
 def list_sites() -> None:
     """Print available sites and exit."""
     from .sites import list_sites as _list
+
     print("Available chat sites:")
     for site_id in _list():
         site = get_site(site_id)
@@ -91,88 +103,121 @@ def get_prompt() -> str:
     return "\n".join(lines)
 
 
-def run(config, prompt: str | None, login_wait: int | None) -> int:
+def wait_for_login(wait: int) -> None:
+    """Wait for login, allowing Enter to continue before the timeout."""
+    print(f"\n{wait} seconds to log in to each chat...")
+    print("Press Enter when ready (or wait for timeout)...")
+
+    if wait <= 0:
+        try:
+            input()
+        except EOFError:
+            pass
+        return
+
+    try:
+        ready, _, _ = select.select([sys.stdin], [], [], wait)
+        if ready:
+            try:
+                input()
+            except EOFError:
+                pass
+    except (OSError, ValueError) as e:
+        try:
+            input()
+        except EOFError:
+            pass
+        logger = logging.getLogger(__name__)
+        logger.debug(f"stdin is not selectable; waiting for login interactively: {e}")
+
+
+def run(
+    config, prompt: str | None, login_wait: int | None, chrome_bin: str | None = None
+) -> int:
     """Main orchestration. Returns exit code."""
     # Setup logging
     setup_logging(level=config.log_level, log_file=config.log_file)
 
-    qb_bin = config.qb_bin
     chats = config.chats
     wait = login_wait if login_wait is not None else config.login_wait
+    browser_bin = chrome_bin or config.chrome_bin
 
-    # Step 1: Ensure qutebrowser is running
     try:
-        ensure_qutebrowser(qb_bin)
-    except BrowserError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        return 1
-
-    # Step 2: Open tabs
-    urls = [get_site(chat)["url"] for chat in chats]
-    print(f"Opening {len(urls)} tabs...")
-    results = open_tabs(qb_bin, urls)
-
-    for chat, url, ok in zip(chats, urls, results):
-        status = "OK" if ok else "FAILED"
-        print(f"  [{status}] {chat}: {url}")
-
-    if not all(results):
-        print("\nSome tabs failed to open. Continue anyway? [y/N]", end=" ")
-        if input().lower() != "y":
+        # Step 1: Ensure browser is running
+        try:
+            ensure_browser(browser_bin)
+        except BrowserError as e:
+            print(f"Error: {e}", file=sys.stderr)
             return 1
 
-    # Step 3: Wait for login
-    print(f"\n{wait} seconds to log in to each chat...")
-    print("Press Enter when ready (or wait for timeout)...")
+        # Step 2: Open tabs
+        urls = [get_site(chat)["url"] for chat in chats]
+        print(f"Opening {len(urls)} tabs...")
 
-    # Simple input with timeout would require threading; for now just use input
-    # A more robust version could use select or signal
-    try:
-        input()
-    except EOFError:
-        pass
+        pages = []
+        for chat, url in zip(chats, urls):
+            try:
+                page = open_page(url, browser_bin)
+                pages.append(page)
+                print(f"  [OK] {chat}: {url}")
+            except Exception as e:  # noqa: BLE001
+                print(f"  [FAILED] {chat}: {url} - {e}", file=sys.stderr)
+                pages.append(None)
 
-    # Step 4: Get prompt if not provided
-    if prompt is None:
-        prompt = get_prompt()
+        if any(p is None for p in pages):
+            print("\nSome tabs failed to open. Continue anyway? [y/N]", end=" ")
+            if input().lower() != "y":
+                return 1
+        # Step 3: Wait for login
+        wait_for_login(wait)
 
-    if not prompt.strip():
-        print("No prompt provided. Exiting.", file=sys.stderr)
-        return 1
+        # Step 4: Get prompt if not provided
+        if prompt is None:
+            prompt = get_prompt()
 
-    # Step 5: Fan out prompt to all tabs
-    print(f"\nSending prompt to {len(chats)} chats...\n")
+        if not prompt.strip():
+            print("No prompt provided. Exiting.", file=sys.stderr)
+            return 1
 
-    for i, chat in enumerate(chats, start=1):
-        print(f"[{i}/{len(chats)}] {chat}...", end=" ", flush=True)
+        # Step 5: Fan out prompt to all tabs
+        print(f"\nSending prompt to {len(chats)} chats...\n")
 
-        inject_js = inject_prompt(chat, prompt)
-        submit_js_val = submit_js(chat)
+        for i, (chat, page) in enumerate(zip(chats, pages), start=1):
+            if page is None:
+                print(f"[{i}/{len(chats)}] {chat}... SKIPPED")
+                continue
 
-        status = inject_and_submit(qb_bin, i, inject_js, submit_js_val)
+            print(f"[{i}/{len(chats)}] {chat}...", end=" ", flush=True)
 
-        inject_ok = status["inject"] == "OK"
-        submit_ok = status["submit"] == "OK"
+            inject_js = inject_prompt(chat, prompt)
+            submit_js_val = submit_js(chat)
 
-        if inject_ok and submit_ok:
-            print("OK")
-        elif not inject_ok:
-            print(f"INJECT FAILED: {status['inject']}")
-        else:
-            print(f"SUBMIT FAILED: {status['submit']}")
+            status = inject_and_submit(page, inject_js, submit_js_val, i)
 
-    print("\nDone! Check qutebrowser for responses.")
-    return 0
+            inject_ok = status["inject"] == "OK"
+            submit_ok = status["submit"] == "OK"
+
+            if inject_ok and submit_ok:
+                print("OK")
+            elif not inject_ok:
+                print(f"INJECT FAILED: {status['inject']}")
+            else:
+                print(f"SUBMIT FAILED: {status['submit']}")
+
+        print("\nDone! Prompts sent; responses may still be loading.")
+        return 0
+    finally:
+        close_browser()
 
 
-def run_server(config, host: str, port: int) -> int:
+def run_server(config, host: str, port: int, chrome_bin: str | None = None) -> int:
     """Run the OpenAI-compatible server."""
-    qb_bin = config.qb_bin
     chats = config.chats
+    browser_bin = chrome_bin or config.chrome_bin
 
-    # Ensure qutebrowser is running
+    # Ensure browser is running
     try:
-        ensure_qutebrowser(qb_bin)
+        ensure_browser(browser_bin)
     except BrowserError as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1
@@ -180,37 +225,45 @@ def run_server(config, host: str, port: int) -> int:
     # Open tabs
     urls = [get_site(chat)["url"] for chat in chats]
     print(f"Opening {len(urls)} tabs...")
-    results = open_tabs(qb_bin, urls)
 
-    for chat, url, ok in zip(chats, urls, results):
-        status = "OK" if ok else "FAILED"
-        print(f"  [{status}] {chat}: {url}")
+    pages = []
+    for chat, url in zip(chats, urls):
+        try:
+            page = open_page(url, browser_bin)
+            pages.append(page)
+            print(f"  [OK] {chat}: {url}")
+        except Exception as e:  # noqa: BLE001
+            print(f"  [FAILED] {chat}: {url} - {e}", file=sys.stderr)
+            pages.append(None)
 
-    # Build model map: model name -> site_id
-    # Use site_id as model name by default
+    # Build model map: model name -> site_id + page reference
     model_map = {chat: chat for chat in chats}
-    tab_map = {chat: i for i, chat in enumerate(chats, start=1)}
+    tab_map = {chat: page for chat, page in zip(chats, pages) if page is not None}
 
     # Create and start server
     server = create_server(
-        qb_bin=qb_bin,
         model_map=model_map,
         tab_map=tab_map,
         host=host,
         port=port,
     )
 
-    print(f"\nServer ready! Send requests to:")
+    print("\nServer ready! Send requests to:")
     print(f"  POST http://{host}:{port}/v1/chat/completions")
     print(f"  GET  http://{host}:{port}/v1/models")
-    print(f"\nExample:")
-    print(f'  curl -X POST http://{host}:{port}/v1/chat/completions \\')
-    print(f'    -H "Content-Type: application/json" \\')
-    print(f'    -d \'{{"model": "{chats[0]}", "messages": [{{"role": "user", "content": "Hello!"}}]}}\'')
+    print("\nExample:")
+    print(f"  curl -X POST http://{host}:{port}/v1/chat/completions \\")
+    print('    -H "Content-Type: application/json" \\')
+    print(
+        f'    -d \'{{"model": "{chats[0]}", "messages": [{{"role": "user", "content": "Hello!"}}]}}\''
+    )
     print()
 
-    server.start()
-    return 0
+    try:
+        server.start()
+        return 0
+    finally:
+        close_browser()
 
 
 def main() -> None:
@@ -224,9 +277,9 @@ def main() -> None:
     config = load_config(args.config)
 
     if args.server:
-        exit_code = run_server(config, args.host, args.port)
+        exit_code = run_server(config, args.host, args.port, args.chrome_bin)
     else:
-        exit_code = run(config, args.prompt, args.login_wait)
+        exit_code = run(config, args.prompt, args.login_wait, args.chrome_bin)
 
     sys.exit(exit_code)
 

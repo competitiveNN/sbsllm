@@ -9,12 +9,11 @@ from __future__ import annotations
 import json
 import time
 import uuid
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from typing import Any
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from typing import Any, ClassVar
 
-from .browser import BrowserError, ensure_qutebrowser, inject_and_submit
+from .browser import BrowserError, inject_and_submit
 from .inject import inject_prompt, submit_js
-from .sites import get_site, list_sites
 
 # Default server settings
 DEFAULT_HOST = "127.0.0.1"
@@ -25,13 +24,11 @@ class OpenAIHandler(BaseHTTPRequestHandler):
     """Handler for OpenAI-compatible chat completion requests."""
 
     # Class-level config (set by Server)
-    qb_bin: str = "qutebrowser"
-    model_map: dict[str, str] = {}
-    tab_map: dict[str, int] = {}
+    model_map: ClassVar[dict[str, str]] = {}
+    tab_map: ClassVar[dict[str, object]] = {}
 
     def log_message(self, format: str, *args: Any) -> None:
         """Suppress default logging to keep output clean."""
-        pass
 
     def _send_json(self, status: int, data: dict) -> None:
         """Send a JSON response."""
@@ -40,16 +37,21 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(json.dumps(data).encode("utf-8"))
 
-    def _send_error(self, status: int, message: str, error_type: str = "invalid_request_error") -> None:
+    def _send_error(
+        self, status: int, message: str, error_type: str = "invalid_request_error"
+    ) -> None:
         """Send an error response in OpenAI format."""
-        self._send_json(status, {
-            "error": {
-                "message": message,
-                "type": error_type,
-                "param": None,
-                "code": None,
-            }
-        })
+        self._send_json(
+            status,
+            {
+                "error": {
+                    "message": message,
+                    "type": error_type,
+                    "param": None,
+                    "code": None,
+                }
+            },
+        )
 
     def do_GET(self) -> None:
         """Handle GET requests."""
@@ -71,28 +73,32 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         """Return available models."""
         models = []
         for model_id, site_id in self.model_map.items():
-            models.append({
-                "id": model_id,
-                "object": "model",
-                "created": int(time.time()),
-                "owned_by": "sbsllm",
-                "permission": [{
-                    "id": f"modelperm-{model_id}",
-                    "object": "model_permission",
+            models.append(
+                {
+                    "id": model_id,
+                    "object": "model",
                     "created": int(time.time()),
-                    "allow_create_engine": False,
-                    "allow_sampling": True,
-                    "allow_logprobs": False,
-                    "allow_search_indices": False,
-                    "allow_view": True,
-                    "allow_fine_tuning": False,
-                    "organization": "*",
-                    "group": None,
-                    "is_blocking": False,
-                }],
-                "root": site_id,
-                "parent": None,
-            })
+                    "owned_by": "sbsllm",
+                    "permission": [
+                        {
+                            "id": f"modelperm-{model_id}",
+                            "object": "model_permission",
+                            "created": int(time.time()),
+                            "allow_create_engine": False,
+                            "allow_sampling": True,
+                            "allow_logprobs": False,
+                            "allow_search_indices": False,
+                            "allow_view": True,
+                            "allow_fine_tuning": False,
+                            "organization": "*",
+                            "group": None,
+                            "is_blocking": False,
+                        }
+                    ],
+                    "root": site_id,
+                    "parent": None,
+                }
+            )
         self._send_json(200, {"object": "list", "data": models})
 
     def _handle_chat_completions(self) -> None:
@@ -139,19 +145,36 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             self._send_error(400, "No user message content found")
             return
 
-        # Get tab index for this model
-        tab_index = self.tab_map.get(model, 1)
+        # Get page for this model
+        page = self.tab_map.get(model)
+        if page is None:
+            self._send_error(502, f"No browser tab for model: {model}", "server_error")
+            return
+        tab_index = list(self.model_map.keys()).index(model) + 1
 
         # Send prompt to chat site
         try:
             inject_js = inject_prompt(site_id, prompt)
             submit_js_val = submit_js(site_id)
-            status = inject_and_submit(self.qb_bin, tab_index, inject_js, submit_js_val)
+            status = inject_and_submit(page, inject_js, submit_js_val, tab_index)
         except BrowserError as e:
             self._send_error(502, f"Browser error: {e}", "server_error")
             return
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             self._send_error(500, f"Internal error: {e}", "server_error")
+            return
+
+        browser_error = next(
+            (
+                status[field]
+                for field in ("inject", "submit")
+                if isinstance(status.get(field), str)
+                and status[field].startswith("BROWSER_ERROR:")
+            ),
+            None,
+        )
+        if browser_error:
+            self._send_error(502, f"Browser error: {browser_error}", "server_error")
             return
 
         # Build response
@@ -167,14 +190,16 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             "object": "chat.completion",
             "created": int(time.time()),
             "model": model,
-            "choices": [{
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": content,
-                },
-                "finish_reason": "stop",
-            }],
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": content,
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
             "usage": {
                 "prompt_tokens": 0,
                 "completion_tokens": 0,
@@ -211,13 +236,11 @@ class Server:
 
     def __init__(
         self,
-        qb_bin: str = "qutebrowser",
         model_map: dict[str, str] | None = None,
-        tab_map: dict[str, int] | None = None,
+        tab_map: dict[str, object] | None = None,
         host: str = DEFAULT_HOST,
         port: int = DEFAULT_PORT,
     ):
-        self.qb_bin = qb_bin
         self.model_map = model_map or {}
         self.tab_map = tab_map or {}
         self.host = host
@@ -227,7 +250,6 @@ class Server:
     def start(self) -> None:
         """Start the server."""
         # Configure handler class
-        OpenAIHandler.qb_bin = self.qb_bin
         OpenAIHandler.model_map = self.model_map
         OpenAIHandler.tab_map = self.tab_map
 
@@ -249,15 +271,13 @@ class Server:
 
 
 def create_server(
-    qb_bin: str = "qutebrowser",
     model_map: dict[str, str] | None = None,
-    tab_map: dict[str, int] | None = None,
+    tab_map: dict[str, object] | None = None,
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
 ) -> Server:
     """Create a new server instance."""
     return Server(
-        qb_bin=qb_bin,
         model_map=model_map or {},
         tab_map=tab_map or {},
         host=host,

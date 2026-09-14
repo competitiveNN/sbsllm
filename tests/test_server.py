@@ -5,8 +5,6 @@ import threading
 import time
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 from sbsllm.server import (
     DEFAULT_HOST,
     DEFAULT_PORT,
@@ -23,23 +21,21 @@ class TestCreateServer:
 
     def test_default_values(self):
         server = create_server()
-        assert server.qb_bin == "qutebrowser"
         assert server.model_map == {}
         assert server.tab_map == {}
         assert server.host == DEFAULT_HOST
         assert server.port == DEFAULT_PORT
 
     def test_custom_values(self):
+        tab = object()
         server = create_server(
-            qb_bin="/usr/bin/qb",
             model_map={"gpt-4": "chatgpt"},
-            tab_map={"gpt-4": 1},
+            tab_map={"gpt-4": tab},
             host="0.0.0.0",
             port=9000,
         )
-        assert server.qb_bin == "/usr/bin/qb"
         assert server.model_map == {"gpt-4": "chatgpt"}
-        assert server.tab_map == {"gpt-4": 1}
+        assert server.tab_map == {"gpt-4": tab}
         assert server.host == "0.0.0.0"
         assert server.port == 9000
 
@@ -90,15 +86,19 @@ class TestOpenAIHandlerModels:
 
 
 class TestOpenAIHandlerChatCompletions:
-    def _make_handler(self, request_body: bytes, content_length: int = None, prompt_result: str = "Hello!"):
+    def _make_handler(
+        self,
+        request_body: bytes,
+        content_length: int | None = None,
+        prompt_result: str = "Hello!",
+    ):
         """Create a mock handler with the given request body."""
         handler = MagicMock(spec=OpenAIHandler)
         handler.headers = {"Content-Length": str(content_length or len(request_body))}
         handler.rfile = MagicMock()
         handler.rfile.read.return_value = request_body
         handler.model_map = {"gpt-4": "chatgpt", "claude-3": "claude"}
-        handler.tab_map = {"gpt-4": 1, "claude-3": 2}
-        handler.qb_bin = "qutebrowser"
+        handler.tab_map = {"gpt-4": MagicMock(), "claude-3": MagicMock()}
         handler._build_prompt.return_value = prompt_result
         return handler
 
@@ -120,10 +120,9 @@ class TestOpenAIHandlerChatCompletions:
         handler._send_error.assert_called_once_with(400, "Missing 'model' field")
 
     def test_unknown_model(self):
-        body = json.dumps({
-            "model": "unknown-model",
-            "messages": [{"role": "user", "content": "hi"}]
-        }).encode()
+        body = json.dumps(
+            {"model": "unknown-model", "messages": [{"role": "user", "content": "hi"}]}
+        ).encode()
         handler = self._make_handler(body)
         OpenAIHandler._handle_chat_completions(handler)
         handler._send_error.assert_called_once()
@@ -136,19 +135,34 @@ class TestOpenAIHandlerChatCompletions:
         handler._send_error.assert_called_once_with(400, "Missing 'messages' field")
 
     def test_empty_user_content(self):
-        body = json.dumps({
-            "model": "gpt-4",
-            "messages": [{"role": "user", "content": "  "}]
-        }).encode()
+        body = json.dumps(
+            {"model": "gpt-4", "messages": [{"role": "user", "content": "  "}]}
+        ).encode()
         handler = self._make_handler(body, prompt_result="  ")
         OpenAIHandler._handle_chat_completions(handler)
-        handler._send_error.assert_called_once_with(400, "No user message content found")
+        handler._send_error.assert_called_once_with(
+            400, "No user message content found"
+        )
+
+    def test_missing_browser_tab(self):
+        body = json.dumps(
+            {"model": "gpt-4", "messages": [{"role": "user", "content": "Hello!"}]}
+        ).encode()
+        handler = self._make_handler(body)
+        handler.tab_map = {}
+
+        OpenAIHandler._handle_chat_completions(handler)
+
+        handler._send_error.assert_called_once_with(
+            502,
+            "No browser tab for model: gpt-4",
+            "server_error",
+        )
 
     def test_successful_completion(self):
-        body = json.dumps({
-            "model": "gpt-4",
-            "messages": [{"role": "user", "content": "Hello!"}]
-        }).encode()
+        body = json.dumps(
+            {"model": "gpt-4", "messages": [{"role": "user", "content": "Hello!"}]}
+        ).encode()
         handler = self._make_handler(body)
 
         with patch("sbsllm.server.inject_and_submit") as mock_submit:
@@ -169,10 +183,9 @@ class TestOpenAIHandlerChatCompletions:
         assert "sent to chatgpt" in data["choices"][0]["message"]["content"]
 
     def test_inject_failure(self):
-        body = json.dumps({
-            "model": "gpt-4",
-            "messages": [{"role": "user", "content": "Hello!"}]
-        }).encode()
+        body = json.dumps(
+            {"model": "gpt-4", "messages": [{"role": "user", "content": "Hello!"}]}
+        ).encode()
         handler = self._make_handler(body)
 
         with patch("sbsllm.server.inject_and_submit") as mock_submit:
@@ -187,10 +200,9 @@ class TestOpenAIHandlerChatCompletions:
         assert "Failed to inject" in data["choices"][0]["message"]["content"]
 
     def test_submit_failure(self):
-        body = json.dumps({
-            "model": "gpt-4",
-            "messages": [{"role": "user", "content": "Hello!"}]
-        }).encode()
+        body = json.dumps(
+            {"model": "gpt-4", "messages": [{"role": "user", "content": "Hello!"}]}
+        ).encode()
         handler = self._make_handler(body)
 
         with patch("sbsllm.server.inject_and_submit") as mock_submit:
@@ -207,13 +219,38 @@ class TestOpenAIHandlerChatCompletions:
     def test_browser_error(self):
         from sbsllm.browser import BrowserError
 
-        body = json.dumps({
-            "model": "gpt-4",
-            "messages": [{"role": "user", "content": "Hello!"}]
-        }).encode()
+        body = json.dumps(
+            {"model": "gpt-4", "messages": [{"role": "user", "content": "Hello!"}]}
+        ).encode()
         handler = self._make_handler(body)
 
-        with patch("sbsllm.server.inject_and_submit", side_effect=BrowserError("fail")):
+        with (
+            patch("sbsllm.server.inject_and_submit", side_effect=BrowserError("fail")),
+            patch("sbsllm.server.inject_prompt") as mock_inject,
+        ):
+            mock_inject.return_value = "inject_js"
+            with (
+                patch("sbsllm.server.submit_js") as mock_submit_js,
+            ):
+                mock_submit_js.return_value = "submit_js"
+                OpenAIHandler._handle_chat_completions(handler)
+
+        handler._send_error.assert_called_once()
+        assert "Browser error" in handler._send_error.call_args[0][1]
+
+    def test_browser_page_error_returns_502(self):
+        """A stale/closed page fields a PlaywrightError as status, not a 200."""
+        body = json.dumps(
+            {"model": "gpt-4", "messages": [{"role": "user", "content": "Hello!"}]}
+        ).encode()
+        handler = self._make_handler(body)
+
+        with patch("sbsllm.server.inject_and_submit") as mock_submit:
+            mock_submit.return_value = {
+                "tab": 1,
+                "inject": "BROWSER_ERROR: page lost",
+                "submit": None,
+            }
             with patch("sbsllm.server.inject_prompt") as mock_inject:
                 mock_inject.return_value = "inject_js"
                 with patch("sbsllm.server.submit_js") as mock_submit_js:
@@ -221,21 +258,23 @@ class TestOpenAIHandlerChatCompletions:
                     OpenAIHandler._handle_chat_completions(handler)
 
         handler._send_error.assert_called_once()
+        assert handler._send_error.call_args[0][0] == 502
         assert "Browser error" in handler._send_error.call_args[0][1]
 
     def test_internal_error(self):
-        body = json.dumps({
-            "model": "gpt-4",
-            "messages": [{"role": "user", "content": "Hello!"}]
-        }).encode()
+        body = json.dumps(
+            {"model": "gpt-4", "messages": [{"role": "user", "content": "Hello!"}]}
+        ).encode()
         handler = self._make_handler(body)
 
-        with patch("sbsllm.server.inject_and_submit", side_effect=RuntimeError("boom")):
-            with patch("sbsllm.server.inject_prompt") as mock_inject:
-                mock_inject.return_value = "inject_js"
-                with patch("sbsllm.server.submit_js") as mock_submit_js:
-                    mock_submit_js.return_value = "submit_js"
-                    OpenAIHandler._handle_chat_completions(handler)
+        with (
+            patch("sbsllm.server.inject_and_submit", side_effect=RuntimeError("boom")),
+            patch("sbsllm.server.inject_prompt") as mock_inject,
+            patch("sbsllm.server.submit_js") as mock_submit_js,
+        ):
+            mock_inject.return_value = "inject_js"
+            mock_submit_js.return_value = "submit_js"
+            OpenAIHandler._handle_chat_completions(handler)
 
         handler._send_error.assert_called_once()
         assert "Internal error" in handler._send_error.call_args[0][1]
@@ -263,13 +302,15 @@ class TestBuildPrompt:
 
     def test_multi_part_content(self):
         handler = MagicMock(spec=OpenAIHandler)
-        messages = [{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": "Part 1"},
-                {"type": "text", "text": "Part 2"},
-            ]
-        }]
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Part 1"},
+                    {"type": "text", "text": "Part 2"},
+                ],
+            }
+        ]
         result = OpenAIHandler._build_prompt(handler, messages)
         assert "Part 1" in result
         assert "Part 2" in result
@@ -299,7 +340,9 @@ class TestHTTPMethods:
         handler = MagicMock(spec=OpenAIHandler)
         handler.path = "/unknown"
         OpenAIHandler.do_GET(handler)
-        handler._send_error.assert_called_once_with(404, "Not found: /unknown", "not_found")
+        handler._send_error.assert_called_once_with(
+            404, "Not found: /unknown", "not_found"
+        )
 
     def test_do_post_chat_completions(self):
         handler = MagicMock(spec=OpenAIHandler)
@@ -311,7 +354,9 @@ class TestHTTPMethods:
         handler = MagicMock(spec=OpenAIHandler)
         handler.path = "/unknown"
         OpenAIHandler.do_POST(handler)
-        handler._send_error.assert_called_once_with(404, "Not found: /unknown", "not_found")
+        handler._send_error.assert_called_once_with(
+            404, "Not found: /unknown", "not_found"
+        )
 
 
 class TestHandlerHelpers:

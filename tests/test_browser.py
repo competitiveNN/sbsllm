@@ -1,214 +1,30 @@
 """Tests for browser.py."""
 
-import subprocess
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+import sbsllm.browser as browser_module
 from sbsllm.browser import (
-    BASEDIR,
+    USER_DATA_DIR,
     BrowserError,
-    ensure_qutebrowser,
-    focus_tab,
+    close_browser,
+    ensure_browser,
     inject_and_submit,
     is_running,
-    open_tab,
-    open_tabs,
-    run_command,
+    open_page,
     run_js,
     setup_logging,
-    with_retry,
 )
 
 
-class TestRunCommand:
-    def test_returns_completed_process(self):
-        with patch("sbsllm.browser.subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0, stdout="ok", stderr="")
-            result = run_command("qutebrowser", ":jseval", "1")
-            assert result.returncode == 0
-
-    def test_passes_basedir(self):
-        with patch("sbsllm.browser.subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
-            run_command("qutebrowser", ":jseval", "1")
-            call_args = mock_run.call_args[0][0]
-            assert "--basedir" in call_args
-            assert str(BASEDIR) in call_args
-
-    def test_passes_correct_arguments(self):
-        with patch("sbsllm.browser.subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
-            run_command("qutebrowser", ":open", "-t", "https://example.com")
-            call_args = mock_run.call_args[0][0]
-            assert ":open" in call_args
-            assert "-t" in call_args
-            assert "https://example.com" in call_args
-
-
-class TestIsRunning:
-    def test_returns_true_when_running(self):
-        with patch("sbsllm.browser.run_command") as mock_cmd:
-            mock_cmd.return_value = MagicMock(returncode=0)
-            assert is_running("qutebrowser") is True
-
-    def test_returns_false_when_not_running(self):
-        with patch("sbsllm.browser.run_command") as mock_cmd:
-            mock_cmd.return_value = MagicMock(returncode=1)
-            assert is_running("qutebrowser") is False
-
-    def test_returns_false_on_timeout(self):
-        with patch("sbsllm.browser.run_command") as mock_cmd:
-            mock_cmd.side_effect = subprocess.TimeoutExpired(cmd="x", timeout=2)
-            assert is_running("qutebrowser") is False
-
-    def test_returns_false_on_file_not_found(self):
-        with patch("sbsllm.browser.run_command") as mock_cmd:
-            mock_cmd.side_effect = FileNotFoundError()
-            assert is_running("qutebrowser") is False
-
-
-class TestEnsureQutebrowser:
-    def test_already_running(self, capsys):
-        with patch("sbsllm.browser.is_running", return_value=True):
-            with patch("sbsllm.browser.logger") as mock_logger:
-                ensure_qutebrowser("qutebrowser")
-                mock_logger.info.assert_called_with("qutebrowser is already running.")
-
-    def test_launches_when_not_running(self):
-        with patch("sbsllm.browser.is_running") as mock_running:
-            # First call returns False, then True after launch
-            mock_running.side_effect = [False, True, True]
-            with patch("sbsllm.browser.subprocess.Popen") as mock_popen:
-                ensure_qutebrowser("qutebrowser")
-                mock_popen.assert_called_once()
-
-    def test_raises_on_timeout(self):
-        with patch("sbsllm.browser.is_running", return_value=False):
-            with patch("sbsllm.browser.time.sleep"):  # Don't actually sleep
-                with patch("sbsllm.browser.subprocess.Popen"):
-                    with pytest.raises(BrowserError, match="did not start"):
-                        ensure_qutebrowser("qutebrowser")
-
-
-class TestOpenTab:
-    def test_returns_true_on_success(self):
-        with patch("sbsllm.browser.run_command") as mock_cmd:
-            mock_cmd.return_value = MagicMock(returncode=0, stderr="")
-            assert open_tab("qutebrowser", "https://example.com") is True
-
-    def test_returns_false_on_failure(self, capsys):
-        with patch("sbsllm.browser.run_command") as mock_cmd:
-            mock_cmd.return_value = MagicMock(returncode=1, stderr="error")
-            assert open_tab("qutebrowser", "https://example.com") is False
-
-    def test_sends_correct_command(self):
-        with patch("sbsllm.browser.run_command") as mock_cmd:
-            mock_cmd.return_value = MagicMock(returncode=0, stderr="")
-            open_tab("qutebrowser", "https://chatgpt.com/")
-            call_args = mock_cmd.call_args[0]
-            assert call_args[1] == ":open"
-            assert call_args[2] == "-t"
-            assert call_args[3] == "https://chatgpt.com/"
-
-
-class TestOpenTabs:
-    def test_opens_multiple_tabs(self):
-        with patch("sbsllm.browser.run_command") as mock_cmd:
-            mock_cmd.return_value = MagicMock(returncode=0, stderr="")
-            with patch("sbsllm.browser.time.sleep"):
-                results = open_tabs("qutebrowser", ["https://a.com", "https://b.com"])
-                assert len(results) == 2
-                assert all(results)
-
-    def test_returns_mixed_results(self):
-        with patch("sbsllm.browser.run_command") as mock_cmd:
-            mock_cmd.side_effect = [
-                MagicMock(returncode=0, stderr=""),
-                MagicMock(returncode=1, stderr="fail"),
-            ]
-            with patch("sbsllm.browser.time.sleep"):
-                results = open_tabs("qutebrowser", ["https://a.com", "https://b.com"])
-                assert results == [True, False]
-
-
-class TestFocusTab:
-    def test_returns_true_on_success(self):
-        with patch("sbsllm.browser.run_command") as mock_cmd:
-            mock_cmd.return_value = MagicMock(returncode=0)
-            assert focus_tab("qutebrowser", 1) is True
-
-    def test_returns_false_on_failure(self):
-        with patch("sbsllm.browser.run_command") as mock_cmd:
-            mock_cmd.return_value = MagicMock(returncode=1)
-            assert focus_tab("qutebrowser", 2) is False
-
-    def test_sends_correct_index(self):
-        with patch("sbsllm.browser.run_command") as mock_cmd:
-            mock_cmd.return_value = MagicMock(returncode=0)
-            focus_tab("qutebrowser", 3)
-            call_args = mock_cmd.call_args[0]
-            assert call_args[1] == ":tab-focus"
-            assert call_args[2] == "3"
-
-
-class TestRunJs:
-    def test_returns_stdout(self):
-        with patch("sbsllm.browser.run_command") as mock_cmd:
-            mock_cmd.return_value = MagicMock(returncode=0, stdout="  result  \n")
-            result = run_js("qutebrowser", "1+1")
-            assert result == "result"
-
-    def test_quiet_by_default(self):
-        with patch("sbsllm.browser.run_command") as mock_cmd:
-            mock_cmd.return_value = MagicMock(returncode=0, stdout="")
-            run_js("qutebrowser", "1+1")
-            call_args = mock_cmd.call_args[0]
-            assert "--quiet" in call_args
-
-    def test_no_quiet_when_false(self):
-        with patch("sbsllm.browser.run_command") as mock_cmd:
-            mock_cmd.return_value = MagicMock(returncode=0, stdout="")
-            run_js("qutebrowser", "1+1", quiet=False)
-            call_args = mock_cmd.call_args[0]
-            assert "--quiet" not in call_args
-
-
-class TestInjectAndSubmit:
-    def test_successful_flow(self):
-        with patch("sbsllm.browser.focus_tab", return_value=True):
-            with patch("sbsllm.browser.run_js") as mock_js:
-                mock_js.side_effect = ["OK", "OK"]
-                with patch("sbsllm.browser.time.sleep"):
-                    result = inject_and_submit("qutebrowser", 1, "inject_js", "submit_js")
-                    assert result["tab"] == 1
-                    assert result["inject"] == "OK"
-                    assert result["submit"] == "OK"
-
-    def test_tab_focus_fails(self):
-        with patch("sbsllm.browser.focus_tab", return_value=False):
-            result = inject_and_submit("qutebrowser", 1, "inject_js", "submit_js")
-            assert result["inject"] == "FAILED_TAB_FOCUS"
-            assert result["submit"] is None
-
-    def test_inject_fails(self):
-        with patch("sbsllm.browser.focus_tab", return_value=True):
-            with patch("sbsllm.browser.run_js") as mock_js:
-                mock_js.return_value = "NO_INPUT"
-                with patch("sbsllm.browser.time.sleep"):
-                    result = inject_and_submit("qutebrowser", 1, "inject_js", "submit_js")
-                    assert result["inject"] == "NO_INPUT"
-                    assert result["submit"] is None
-
-    def test_submit_fails(self):
-        with patch("sbsllm.browser.focus_tab", return_value=True):
-            with patch("sbsllm.browser.run_js") as mock_js:
-                mock_js.side_effect = ["OK", "NO_BUTTON"]
-                with patch("sbsllm.browser.time.sleep"):
-                    result = inject_and_submit("qutebrowser", 1, "inject_js", "submit_js")
-                    assert result["inject"] == "OK"
-                    assert result["submit"] == "NO_BUTTON"
+@pytest.fixture(autouse=True)
+def _reset_browser_globals():
+    browser_module._context = None
+    browser_module._playwright_instance = None
+    yield
+    browser_module._context = None
+    browser_module._playwright_instance = None
 
 
 class TestSetupLogging:
@@ -234,34 +50,321 @@ class TestSetupLogging:
             assert len(handlers) == 2  # StreamHandler + FileHandler
 
 
-class TestWithRetry:
-    def test_succeeds_first_try(self):
-        mock_func = MagicMock(return_value="success")
-        decorated = with_retry(mock_func, max_retries=3, delay=0.1)
-        result = decorated()
-        assert result == "success"
-        assert mock_func.call_count == 1
+class TestEnsureBrowser:
+    def _mock_context(self):
+        """Build a persistent-context mock with a connected browser."""
+        mock_browser = MagicMock()
+        mock_browser.is_connected.return_value = True
+        mock_context = MagicMock()
+        mock_context.browser = mock_browser
+        return mock_context, mock_browser
 
-    def test_retries_on_exception(self):
-        mock_func = MagicMock(
-            side_effect=[subprocess.TimeoutExpired("x", 1), "success"]
+    def test_launches_browser(self):
+        mock_context, _ = self._mock_context()
+        with patch("sbsllm.browser.sync_playwright") as mock_pw:
+            mock_instance = MagicMock()
+            mock_pw.return_value.start.return_value = mock_instance
+            mock_instance.chromium.launch_persistent_context.return_value = mock_context
+
+            context = ensure_browser()
+
+            assert context == mock_context
+            mock_instance.chromium.launch_persistent_context.assert_called_once()
+            # user_data_dir is the first positional arg
+            assert (
+                mock_instance.chromium.launch_persistent_context.call_args[0][0]
+                == USER_DATA_DIR
+            )
+            # profile is passed via user_data_dir, not a --user-data-dir arg
+            assert "--user-data-dir=" not in str(
+                mock_instance.chromium.launch_persistent_context.call_args
+            )
+
+    def test_reuses_existing_browser(self):
+        mock_context, _ = self._mock_context()
+        with patch("sbsllm.browser.sync_playwright") as mock_pw:
+            mock_instance = MagicMock()
+            mock_pw.return_value.start.return_value = mock_instance
+            mock_instance.chromium.launch_persistent_context.return_value = mock_context
+
+            context1 = ensure_browser()
+            context2 = ensure_browser()
+
+            assert context1 == context2
+            mock_instance.chromium.launch_persistent_context.assert_called_once()
+
+    def test_disconnected_browser_is_cleaned_before_relaunch(self):
+        stale_context, stale_browser = self._mock_context()
+        stale_browser.is_connected.return_value = False
+        new_context, _ = self._mock_context()
+        stale_instance = MagicMock()
+
+        with (
+            patch("sbsllm.browser._context", stale_context),
+            patch("sbsllm.browser._playwright_instance", stale_instance),
+            patch("sbsllm.browser.close_browser") as mock_close,
+            patch("sbsllm.browser.sync_playwright") as mock_pw,
+        ):
+            mock_instance = MagicMock()
+            mock_pw.return_value.start.return_value = mock_instance
+            mock_instance.chromium.launch_persistent_context.return_value = new_context
+
+            context = ensure_browser()
+
+        assert context == new_context
+        mock_close.assert_called_once()
+
+    def test_custom_chrome_bin(self):
+        mock_context, _ = self._mock_context()
+        with patch("sbsllm.browser.sync_playwright") as mock_pw:
+            mock_instance = MagicMock()
+            mock_pw.return_value.start.return_value = mock_instance
+            mock_instance.chromium.launch_persistent_context.return_value = mock_context
+
+            ensure_browser(chrome_bin="/usr/bin/google-chrome")
+
+            call_kwargs = mock_instance.chromium.launch_persistent_context.call_args[1]
+            assert call_kwargs["executable_path"] == "/usr/bin/google-chrome"
+
+
+class TestOpenPage:
+    def test_reuses_initial_page(self):
+        with patch("sbsllm.browser.ensure_browser") as mock_ensure:
+            mock_browser = MagicMock()
+            mock_ensure.return_value = mock_browser
+            blank_page = MagicMock()
+            blank_page.url = "about:blank"
+            mock_browser.pages = [blank_page]
+            mock_page = MagicMock()
+            mock_browser.new_page.return_value = mock_page
+
+            page = open_page("https://example.com")
+
+            assert page == blank_page
+            blank_page.close.assert_not_called()
+            mock_browser.new_page.assert_not_called()
+            blank_page.goto.assert_called_once_with("https://example.com")
+
+    def test_creates_page_when_no_initial_page_exists(self):
+        with patch("sbsllm.browser.ensure_browser") as mock_ensure:
+            mock_browser = MagicMock()
+            mock_ensure.return_value = mock_browser
+            mock_browser.pages = []
+            mock_page = MagicMock()
+            mock_browser.new_page.return_value = mock_page
+
+            page = open_page("https://example.com")
+
+            assert page == mock_page
+            mock_browser.new_page.assert_called_once()
+            mock_page.goto.assert_called_once_with("https://example.com")
+
+    def test_closes_page_after_goto_failure(self):
+        with patch("sbsllm.browser.ensure_browser") as mock_ensure:
+            mock_browser = MagicMock()
+            mock_ensure.return_value = mock_browser
+            mock_browser.pages = []
+            mock_page = MagicMock()
+            mock_browser.new_page.return_value = mock_page
+            from playwright.sync_api import Error as PlaywrightError
+
+            mock_page.goto.side_effect = PlaywrightError("navigation failed")
+
+            with pytest.raises(BrowserError, match="navigation failed"):
+                open_page("https://example.com")
+
+            mock_page.close.assert_called_once()
+
+    def test_recreates_context_after_new_page_failure(self):
+        from playwright.sync_api import Error as PlaywrightError
+
+        first_browser = MagicMock()
+        first_browser.new_page.side_effect = PlaywrightError(
+            "Target.createTarget failed"
         )
-        decorated = with_retry(mock_func, max_retries=3, delay=0.01)
-        result = decorated()
-        assert result == "success"
-        assert mock_func.call_count == 2
+        second_browser = MagicMock()
+        second_browser.pages = []
+        page = MagicMock()
+        second_browser.new_page.return_value = page
 
-    def test_raises_after_max_retries(self):
-        mock_func = MagicMock(
-            side_effect=subprocess.TimeoutExpired("x", 1)
-        )
-        decorated = with_retry(mock_func, max_retries=2, delay=0.01)
-        with pytest.raises(subprocess.TimeoutExpired):
-            decorated()
-        assert mock_func.call_count == 3  # initial + 2 retries
+        with (
+            patch(
+                "sbsllm.browser.ensure_browser",
+                side_effect=[first_browser, second_browser],
+            ) as mock_ensure,
+            patch("sbsllm.browser.close_browser") as mock_close,
+        ):
+            result = open_page("https://example.com")
 
-    def test_no_retry_on_success(self):
-        mock_func = MagicMock(return_value="ok")
-        decorated = with_retry(mock_func, max_retries=5, delay=0.01)
-        decorated()
-        assert mock_func.call_count == 1
+        assert result == page
+        assert mock_ensure.call_count == 2
+        mock_close.assert_called_once()
+        page.goto.assert_called_once_with("https://example.com")
+
+    def test_closes_context_after_new_page_retry_failure(self):
+        from playwright.sync_api import Error as PlaywrightError
+
+        first_browser = MagicMock()
+        first_browser.new_page.side_effect = PlaywrightError("first failure")
+        second_browser = MagicMock()
+        second_browser.new_page.side_effect = PlaywrightError("second failure")
+
+        with (
+            patch(
+                "sbsllm.browser.ensure_browser",
+                side_effect=[first_browser, second_browser],
+            ),
+            patch("sbsllm.browser.close_browser") as mock_close,
+            pytest.raises(BrowserError, match="second failure"),
+        ):
+            open_page("https://example.com")
+
+        assert mock_close.call_count == 2
+
+
+class TestIsRunning:
+    def test_true_when_browser_connected(self):
+        mock_browser = MagicMock()
+        mock_browser.is_connected.return_value = True
+        mock_context = MagicMock()
+        mock_context.browser = mock_browser
+
+        with patch("sbsllm.browser._context", mock_context):
+            assert is_running() is True
+
+    def test_false_when_no_browser(self):
+        with patch("sbsllm.browser._context", None):
+            assert is_running() is False
+
+    def test_false_when_disconnected(self):
+        mock_browser = MagicMock()
+        mock_browser.is_connected.return_value = False
+        mock_context = MagicMock()
+        mock_context.browser = mock_browser
+
+        with patch("sbsllm.browser._context", mock_context):
+            assert is_running() is False
+
+
+class TestRunJs:
+    def test_executes_js(self):
+        mock_page = MagicMock()
+        mock_page.evaluate.return_value = "result"
+
+        result = run_js(mock_page, "1+1")
+
+        assert result == "result"
+        mock_page.evaluate.assert_called_once_with("1+1")
+
+    def test_returns_empty_string_for_none(self):
+        mock_page = MagicMock()
+        mock_page.evaluate.return_value = None
+
+        result = run_js(mock_page, "null")
+
+        assert result == ""
+
+    def test_handles_error(self):
+        from playwright.sync_api import Error as PlaywrightError
+
+        mock_page = MagicMock()
+        mock_page.evaluate.side_effect = PlaywrightError("eval failed")
+
+        result = run_js(mock_page, "invalid()")
+
+        assert "ERROR" in result
+
+
+class TestInjectAndSubmit:
+    def test_successful_flow(self):
+        mock_page = MagicMock()
+        mock_page.evaluate.side_effect = ["OK", "OK"]
+
+        with patch("sbsllm.browser.time.sleep"):
+            result = inject_and_submit(mock_page, "inject_js", "submit_js", 1)
+
+        assert result["tab"] == 1
+        assert result["inject"] == "OK"
+        assert result["submit"] == "OK"
+        mock_page.bring_to_front.assert_called_once()
+
+    def test_inject_fails(self):
+        mock_page = MagicMock()
+        mock_page.evaluate.return_value = "NO_INPUT"
+
+        with patch("sbsllm.browser.time.sleep"):
+            result = inject_and_submit(mock_page, "inject_js", "submit_js", 1)
+
+        assert result["inject"] == "NO_INPUT"
+        assert result["submit"] is None
+
+    def test_submit_fails(self):
+        mock_page = MagicMock()
+        mock_page.evaluate.side_effect = ["OK", "NO_BUTTON"]
+
+        with patch("sbsllm.browser.time.sleep"):
+            result = inject_and_submit(mock_page, "inject_js", "submit_js", 1)
+
+        assert result["inject"] == "OK"
+        assert result["submit"] == "NO_BUTTON"
+
+    def test_browser_error(self):
+        from playwright.sync_api import Error as PlaywrightError
+
+        mock_page = MagicMock()
+        mock_page.evaluate.side_effect = PlaywrightError("connection lost")
+
+        with patch("sbsllm.browser.time.sleep"):
+            result = inject_and_submit(mock_page, "inject_js", "submit_js", 1)
+
+        assert "BROWSER_ERROR" in result["inject"]
+
+    def test_bring_to_front_error(self):
+        from playwright.sync_api import Error as PlaywrightError
+
+        mock_page = MagicMock()
+        mock_page.bring_to_front.side_effect = PlaywrightError("page lost")
+
+        result = inject_and_submit(mock_page, "inject_js", "submit_js", 1)
+
+        assert result["inject"] == "BROWSER_ERROR: page lost"
+        assert result["submit"] is None
+
+
+class TestCloseBrowser:
+    def test_closes_browser(self):
+        mock_context = MagicMock()
+        mock_instance = MagicMock()
+
+        with (
+            patch("sbsllm.browser._context", mock_context),
+            patch("sbsllm.browser._playwright_instance", mock_instance),
+        ):
+            close_browser()
+
+        mock_context.close.assert_called_once()
+        mock_instance.stop.assert_called_once()
+
+    def test_handles_close_errors(self):
+        from playwright.sync_api import Error as PlaywrightError
+
+        mock_context = MagicMock()
+        mock_context.close.side_effect = PlaywrightError("close failed")
+        mock_instance = MagicMock()
+        mock_instance.stop.side_effect = PlaywrightError("stop failed")
+
+        with (
+            patch("sbsllm.browser._context", mock_context),
+            patch("sbsllm.browser._playwright_instance", mock_instance),
+        ):
+            close_browser()
+
+        mock_context.close.assert_called_once()
+        mock_instance.stop.assert_called_once()
+
+    def test_handles_no_browser(self):
+        with (
+            patch("sbsllm.browser._context", None),
+            patch("sbsllm.browser._playwright_instance", None),
+        ):
+            close_browser()  # Should not raise

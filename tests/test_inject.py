@@ -2,7 +2,7 @@
 
 import pytest
 
-from sbsllm.inject import PLACEHOLDER, escape_prompt, inject_prompt, submit_js
+from sbsllm.inject import escape_prompt, inject_prompt, submit_js
 
 
 class TestEscapePrompt:
@@ -22,7 +22,7 @@ class TestEscapePrompt:
         assert escape_prompt("${}") == "\\${}"
 
     def test_escape_all_special_chars(self):
-        result = escape_prompt('path\\to`file${var}')
+        result = escape_prompt("path\\to`file${var}")
         assert result == "path\\\\to\\`file\\${var}"
 
     def test_multiline_prompt(self):
@@ -66,6 +66,7 @@ class TestInjectPrompt:
 
     def test_works_for_all_sites(self):
         from sbsllm.sites import list_sites
+
         for site_id in list_sites():
             result = inject_prompt(site_id, "test")
             assert "PROMPT_PLACEHOLDER" not in result
@@ -96,6 +97,7 @@ class TestSubmitJs:
 
     def test_works_for_all_sites(self):
         from sbsllm.sites import list_sites
+
         for site_id in list_sites():
             result = submit_js(site_id)
             assert isinstance(result, str)

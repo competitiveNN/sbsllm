@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from .sites import list_sites
 
@@ -15,13 +15,21 @@ from .sites import list_sites
 class Config(BaseModel):
     """Configuration for sbsllm."""
 
-    chats: list[str] = Field(..., min_length=1, description="List of chat sites to open")
+    model_config = ConfigDict(extra="forbid")
+
+    chats: list[str] = Field(
+        ..., min_length=1, description="List of chat sites to open"
+    )
     login_wait: int = Field(default=30, ge=0, description="Seconds to wait for login")
-    qutebrowser_bin: str | None = Field(default=None, description="Path to qutebrowser binary")
-    log_level: str = Field(default="INFO", description="Logging level (DEBUG, INFO, WARNING, ERROR)")
-    log_file: str | None = Field(default=None, description="Path to log file (optional)")
-    retry_count: int = Field(default=3, ge=0, description="Number of retries for failed operations")
-    retry_delay: float = Field(default=1.0, ge=0, description="Delay between retries in seconds")
+    chrome_bin: str | None = Field(
+        default=None, description="Path to Chrome/Chromium binary"
+    )
+    log_level: str = Field(
+        default="INFO", description="Logging level (DEBUG, INFO, WARNING, ERROR)"
+    )
+    log_file: str | None = Field(
+        default=None, description="Path to log file (optional)"
+    )
 
     @field_validator("chats")
     @classmethod
@@ -44,10 +52,6 @@ class Config(BaseModel):
         if upper not in valid_levels:
             raise ValueError(f"Invalid log level: {v}. Must be one of: {valid_levels}")
         return upper
-
-    @property
-    def qb_bin(self) -> str:
-        return self.qutebrowser_bin or "qutebrowser"
 
 
 def load_config(path: Path | None = None) -> Config:
@@ -88,6 +92,6 @@ def parse_config(data: dict[str, Any], source: Path | None = None) -> Config:
     """Validate raw config dict and return Config."""
     try:
         return Config(**data)
-    except Exception as e:
+    except ValidationError as e:
         print(f"Config error: {e}", file=sys.stderr)
         sys.exit(1)

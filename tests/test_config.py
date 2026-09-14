@@ -1,8 +1,5 @@
 """Tests for config.py."""
 
-import tempfile
-from pathlib import Path
-
 import pytest
 import yaml
 
@@ -11,18 +8,20 @@ from sbsllm.config import Config, load_config, parse_config
 
 class TestConfigModel:
     def test_creation(self):
-        config = Config(chats=["chatgpt"], login_wait=30, qutebrowser_bin=None)
+        config = Config(chats=["chatgpt"], login_wait=30, chrome_bin=None)
         assert config.chats == ["chatgpt"]
         assert config.login_wait == 30
-        assert config.qutebrowser_bin is None
+        assert config.chrome_bin is None
 
-    def test_qb_bin_default(self):
-        config = Config(chats=["chatgpt"], login_wait=30, qutebrowser_bin=None)
-        assert config.qb_bin == "qutebrowser"
+    def test_chrome_bin_default(self):
+        config = Config(chats=["chatgpt"], login_wait=30, chrome_bin=None)
+        assert config.chrome_bin is None
 
-    def test_qb_bin_custom(self):
-        config = Config(chats=["chatgpt"], login_wait=30, qutebrowser_bin="/usr/bin/qutebrowser")
-        assert config.qb_bin == "/usr/bin/qutebrowser"
+    def test_chrome_bin_custom(self):
+        config = Config(
+            chats=["chatgpt"], login_wait=30, chrome_bin="/usr/bin/google-chrome"
+        )
+        assert config.chrome_bin == "/usr/bin/google-chrome"
 
     def test_default_log_level(self):
         config = Config(chats=["chatgpt"])
@@ -40,27 +39,9 @@ class TestConfigModel:
         with pytest.raises(ValueError, match="Invalid log level"):
             Config(chats=["chatgpt"], log_level="INVALID")
 
-    def test_default_retry_values(self):
-        config = Config(chats=["chatgpt"])
-        assert config.retry_count == 3
-        assert config.retry_delay == 1.0
-
-    def test_custom_retry_values(self):
-        config = Config(chats=["chatgpt"], retry_count=5, retry_delay=2.5)
-        assert config.retry_count == 5
-        assert config.retry_delay == 2.5
-
     def test_negative_login_wait_raises(self):
         with pytest.raises(ValueError):
             Config(chats=["chatgpt"], login_wait=-1)
-
-    def test_negative_retry_count_raises(self):
-        with pytest.raises(ValueError):
-            Config(chats=["chatgpt"], retry_count=-1)
-
-    def test_negative_retry_delay_raises(self):
-        with pytest.raises(ValueError):
-            Config(chats=["chatgpt"], retry_delay=-0.5)
 
 
 class TestParseConfig:
@@ -69,17 +50,17 @@ class TestParseConfig:
         config = parse_config(data)
         assert config.chats == ["chatgpt", "claude"]
         assert config.login_wait == 60
-        assert config.qutebrowser_bin is None
+        assert config.chrome_bin is None
 
     def test_default_login_wait(self):
         data = {"chats": ["chatgpt"]}
         config = parse_config(data)
         assert config.login_wait == 30
 
-    def test_custom_qutebrowser_bin(self):
-        data = {"chats": ["chatgpt"], "qutebrowser_bin": "/custom/path"}
+    def test_custom_chrome_bin(self):
+        data = {"chats": ["chatgpt"], "chrome_bin": "/custom/path"}
         config = parse_config(data)
-        assert config.qutebrowser_bin == "/custom/path"
+        assert config.chrome_bin == "/custom/path"
 
     def test_empty_chats_exits(self, capsys):
         with pytest.raises(SystemExit):
@@ -131,12 +112,6 @@ class TestParseConfig:
         data = {"chats": ["chatgpt"], "log_file": "/tmp/sbsllm.log"}
         config = parse_config(data)
         assert config.log_file == "/tmp/sbsllm.log"
-
-    def test_retry_config(self):
-        data = {"chats": ["chatgpt"], "retry_count": 5, "retry_delay": 2.0}
-        config = parse_config(data)
-        assert config.retry_count == 5
-        assert config.retry_delay == 2.0
 
 
 class TestLoadConfig:

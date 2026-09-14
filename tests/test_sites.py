@@ -12,7 +12,19 @@ class TestListSites:
 
     def test_contains_all_expected_sites(self):
         sites = list_sites()
-        expected = ["chatgpt", "claude", "deepseek", "qwen", "grok", "google", "mistral", "kimi", "perplexity", "poe", "cohere"]
+        expected = [
+            "chatgpt",
+            "claude",
+            "deepseek",
+            "qwen",
+            "grok",
+            "google",
+            "mistral",
+            "kimi",
+            "perplexity",
+            "poe",
+            "cohere",
+        ]
         for site in expected:
             assert site in sites, f"Missing site: {site}"
 
@@ -76,9 +88,13 @@ class TestSiteStructure:
     def test_inject_is_valid_js_iife(self, site_id):
         inject = SITES[site_id]["inject"]
         # Should be an IIFE
-        assert inject.strip().startswith("(() =>") or inject.strip().startswith("(function")
+        assert inject.strip().startswith("(() =>") or inject.strip().startswith(
+            "(function"
+        )
 
     @pytest.mark.parametrize("site_id", list(SITES.keys()))
     def test_submit_is_valid_js_iife(self, site_id):
         submit = SITES[site_id]["submit_js"]
-        assert submit.strip().startswith("(() =>") or submit.strip().startswith("(function")
+        assert submit.strip().startswith("(() =>") or submit.strip().startswith(
+            "(function"
+        )
