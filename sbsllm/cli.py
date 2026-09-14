@@ -6,6 +6,7 @@ import argparse
 import logging
 import select
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from .browser import (
@@ -131,6 +132,31 @@ def wait_for_login(wait: int) -> None:
         logger.debug(f"stdin is not selectable; waiting for login interactively: {e}")
 
 
+def _open_tabs(chats: list[str], urls: list[str], browser_bin: str | None) -> list:
+    """Open all tabs in parallel using a thread pool."""
+    pages: list = [None] * len(chats)
+
+    def _open_one(idx: int, chat: str, url: str) -> tuple[int, object | None]:
+        try:
+            page = open_page(url, browser_bin)
+            print(f"  [OK] {chat}: {url}")
+            return idx, page
+        except Exception as e:  # noqa: BLE001
+            print(f"  [FAILED] {chat}: {url} - {e}", file=sys.stderr)
+            return idx, None
+
+    with ThreadPoolExecutor(max_workers=len(chats)) as executor:
+        futures = {
+            executor.submit(_open_one, i, chat, url): i
+            for i, (chat, url) in enumerate(zip(chats, urls))
+        }
+        for future in as_completed(futures):
+            idx, page = future.result()
+            pages[idx] = page
+
+    return pages
+
+
 def run(
     config, prompt: str | None, login_wait: int | None, chrome_bin: str | None = None
 ) -> int:
@@ -154,15 +180,7 @@ def run(
         urls = [get_site(chat)["url"] for chat in chats]
         print(f"Opening {len(urls)} tabs...")
 
-        pages = []
-        for chat, url in zip(chats, urls):
-            try:
-                page = open_page(url, browser_bin)
-                pages.append(page)
-                print(f"  [OK] {chat}: {url}")
-            except Exception as e:  # noqa: BLE001
-                print(f"  [FAILED] {chat}: {url} - {e}", file=sys.stderr)
-                pages.append(None)
+        pages = _open_tabs(chats, urls, browser_bin)
 
         if any(p is None for p in pages):
             print("\nSome tabs failed to open. Continue anyway? [y/N]", end=" ")
@@ -226,15 +244,7 @@ def run_server(config, host: str, port: int, chrome_bin: str | None = None) -> i
     urls = [get_site(chat)["url"] for chat in chats]
     print(f"Opening {len(urls)} tabs...")
 
-    pages = []
-    for chat, url in zip(chats, urls):
-        try:
-            page = open_page(url, browser_bin)
-            pages.append(page)
-            print(f"  [OK] {chat}: {url}")
-        except Exception as e:  # noqa: BLE001
-            print(f"  [FAILED] {chat}: {url} - {e}", file=sys.stderr)
-            pages.append(None)
+    pages = _open_tabs(chats, urls, browser_bin)
 
     # Build model map: model name -> site_id + page reference
     model_map = {chat: chat for chat in chats}

@@ -77,6 +77,7 @@ def ensure_browser(chrome_bin: str | None = None) -> BrowserContext:
             "args": [
                 "--no-first-run",
                 "--no-default-browser-check",
+                "--disable-blink-features=AutomationControlled",
             ],
         }
         if chrome_bin:
