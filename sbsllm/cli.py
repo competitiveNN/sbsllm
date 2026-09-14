@@ -6,7 +6,6 @@ import argparse
 import logging
 import select
 import sys
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from .browser import (
@@ -133,27 +132,16 @@ def wait_for_login(wait: int) -> None:
 
 
 def _open_tabs(chats: list[str], urls: list[str], browser_bin: str | None) -> list:
-    """Open all tabs in parallel using a thread pool."""
+    """Open all tabs sequentially."""
     pages: list = [None] * len(chats)
-
-    def _open_one(idx: int, chat: str, url: str) -> tuple[int, object | None]:
+    for i, (chat, url) in enumerate(zip(chats, urls)):
         try:
             page = open_page(url, browser_bin)
+            pages[i] = page
             print(f"  [OK] {chat}: {url}")
-            return idx, page
         except Exception as e:  # noqa: BLE001
             print(f"  [FAILED] {chat}: {url} - {e}", file=sys.stderr)
-            return idx, None
-
-    with ThreadPoolExecutor(max_workers=len(chats)) as executor:
-        futures = {
-            executor.submit(_open_one, i, chat, url): i
-            for i, (chat, url) in enumerate(zip(chats, urls))
-        }
-        for future in as_completed(futures):
-            idx, page = future.result()
-            pages[idx] = page
-
+            pages[i] = None
     return pages
 
 
@@ -186,6 +174,7 @@ def run(
             print("\nSome tabs failed to open. Continue anyway? [y/N]", end=" ")
             if input().lower() != "y":
                 return 1
+
         # Step 3: Wait for login
         wait_for_login(wait)
 
