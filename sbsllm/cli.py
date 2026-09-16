@@ -6,6 +6,7 @@ import argparse
 import logging
 import select
 import sys
+import threading
 from pathlib import Path
 
 from .browser import (
@@ -138,7 +139,7 @@ def _open_tabs(chats: list[str], urls: list[str], browser_bin: str | None) -> li
         try:
             page = open_page(url, browser_bin)
             pages[i] = page
-            print(f"  [OK] {chat}: {url}")
+            print(f"  [OK] {chat}: {url}", flush=True)
         except Exception as e:  # noqa: BLE001
             print(f"  [FAILED] {chat}: {url} - {e}", file=sys.stderr)
             pages[i] = None
@@ -146,7 +147,12 @@ def _open_tabs(chats: list[str], urls: list[str], browser_bin: str | None) -> li
 
 
 def run(
-    config, prompt: str | None, login_wait: int | None, chrome_bin: str | None = None
+    config,
+    prompt: str | None,
+    login_wait: int | None,
+    chrome_bin: str | None = None,
+    host: str = "127.0.0.1",
+    port: int = 8080,
 ) -> int:
     """Main orchestration. Returns exit code."""
     # Setup logging
@@ -211,8 +217,25 @@ def run(
             else:
                 print(f"SUBMIT FAILED: {status['submit']}")
 
-        print("\nDone! Prompts sent; responses may still be loading.")
-        return 0
+        # Step 6: Start OpenAI-compatible server so responses remain accessible
+        server = create_server(
+            model_map={chat: chat for chat in chats},
+            tab_map={chat: page for chat, page in zip(chats, pages) if page is not None},
+            host=host,
+            port=port,
+        )
+        server_thread = threading.Thread(target=server.start, daemon=True)
+        server_thread.start()
+        print(f"\nOpenAI-compatible server URL: http://{host}:{port}/", flush=True)
+        print(f"Server listening on http://{host}:{port}", flush=True)
+        print("Responses are open in the browser.", flush=True)
+
+        try:
+            server_thread.join()
+            return 0
+        except KeyboardInterrupt:
+            print("\nShutting down server...")
+            return 0
     finally:
         close_browser()
 
@@ -231,7 +254,7 @@ def run_server(config, host: str, port: int, chrome_bin: str | None = None) -> i
 
     # Open tabs
     urls = [get_site(chat)["url"] for chat in chats]
-    print(f"Opening {len(urls)} tabs...")
+    print(f"Opening {len(urls)} tabs...", flush=True)
 
     pages = _open_tabs(chats, urls, browser_bin)
 
@@ -247,16 +270,18 @@ def run_server(config, host: str, port: int, chrome_bin: str | None = None) -> i
         port=port,
     )
 
-    print("\nServer ready! Send requests to:")
-    print(f"  POST http://{host}:{port}/v1/chat/completions")
-    print(f"  GET  http://{host}:{port}/v1/models")
-    print("\nExample:")
-    print(f"  curl -X POST http://{host}:{port}/v1/chat/completions \\")
-    print('    -H "Content-Type: application/json" \\')
+    print(f"\nOpenAI-compatible server URL: http://{host}:{port}/", flush=True)
+    print("Server ready! Send requests to:", flush=True)
+    print(f"  POST http://{host}:{port}/v1/chat/completions", flush=True)
+    print(f"  GET  http://{host}:{port}/v1/models", flush=True)
+    print("\nExample:", flush=True)
+    print(f"  curl -X POST http://{host}:{port}/v1/chat/completions \\", flush=True)
+    print('    -H "Content-Type: application/json" \\', flush=True)
     print(
-        f'    -d \'{{"model": "{chats[0]}", "messages": [{{"role": "user", "content": "Hello!"}}]}}\''
+        f'    -d \'{{"model": "{chats[0]}", "messages": [{{"role": "user", "content": "Hello!"}}]}}\'',
+        flush=True,
     )
-    print()
+    print(flush=True)
 
     try:
         server.start()

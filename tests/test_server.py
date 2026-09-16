@@ -61,6 +61,32 @@ class TestServerStartStop:
         server.stop()  # Should not raise
 
 
+class TestServerStartupOutput:
+    """Server startup output must flush so it appears in redirected stdout."""
+
+    def test_start_logs_and_flushes(self):
+        server = create_server(host="127.0.0.1", port=9090)
+        mock_http_server = MagicMock()
+
+        with (
+            patch("sbsllm.server.HTTPServer", return_value=mock_http_server),
+            patch("builtins.print") as mock_print,
+        ):
+            thread = threading.Thread(target=server.start, daemon=True)
+            thread.start()
+            time.sleep(0.1)
+            server.stop()
+            thread.join(timeout=2)
+
+        calls = [
+            call
+            for call in mock_print.call_args_list
+            if "OpenAI-compatible server URL: http://127.0.0.1:9090/" in str(call)
+        ]
+        assert calls
+        assert calls[0].kwargs.get("flush") is True
+
+
 class TestOpenAIHandlerModels:
     def test_models_empty(self):
         handler = MagicMock(spec=OpenAIHandler)

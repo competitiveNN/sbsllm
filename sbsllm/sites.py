@@ -61,9 +61,11 @@ SITES: dict[str, dict] = {
         "url": "https://chat.deepseek.com/",
         "inject": """
             (() => {
-                const ta = document.querySelector('#chat-input')
-                    || document.querySelector('textarea[placeholder*="Ask"]')
-                    || document.querySelector('textarea');
+                const ta = document.querySelector('textarea')
+                    || document.querySelector('#chat-input')
+                    || document.querySelector('div[contenteditable="true"]')
+                    || document.querySelector('[contenteditable]')
+                    || document.querySelector('textarea[placeholder*="Ask"]');
                 if (!ta) return 'NO_INPUT';
                 const nativeSetter = Object.getOwnPropertyDescriptor(
                     window.HTMLTextAreaElement.prototype, 'value'
@@ -76,9 +78,13 @@ SITES: dict[str, dict] = {
         """,
         "submit_js": """
             (() => {
-                const btn = document.querySelector('button[aria-label="Send"]')
+                const btn = document.querySelector('button[data-testid="send-button"]')
+                    || document.querySelector('button[aria-label="Send"]')
+                    || document.querySelector('button[aria-label="Submit"]')
                     || document.querySelector('.send-btn')
                     || document.querySelector('button[class*="send"]')
+                    || document.querySelector('button[class*="Send"]')
+                    || document.querySelector('button[type="submit"]')
                     || document.querySelector('textarea')?.parentElement?.querySelector('button');
                 if (btn) { btn.click(); return 'OK'; }
                 return 'NO_BUTTON';
@@ -142,9 +148,11 @@ SITES: dict[str, dict] = {
         "url": "https://aistudio.google.com/",
         "inject": """
             (() => {
-                const ta = document.querySelector('textarea[placeholder*="Enter"]')
+                const ta = document.querySelector('textarea')
+                    || document.querySelector('textarea[placeholder*="Enter"]')
                     || document.querySelector('textarea[placeholder*="prompt"]')
-                    || document.querySelector('textarea');
+                    || document.querySelector('div[contenteditable="true"]')
+                    || document.querySelector('[contenteditable]');
                 if (!ta) return 'NO_INPUT';
                 const nativeSetter = Object.getOwnPropertyDescriptor(
                     window.HTMLTextAreaElement.prototype, 'value'
@@ -159,7 +167,12 @@ SITES: dict[str, dict] = {
             (() => {
                 const btn = document.querySelector('button[aria-label*="Run"]')
                     || document.querySelector('button[aria-label*="run"]')
+                    || document.querySelector('button[aria-label="Send"]')
+                    || document.querySelector('button[aria-label="Submit"]')
                     || document.querySelector('button[class*="run"]')
+                    || document.querySelector('button[class*="send"]')
+                    || document.querySelector('button[class*="Send"]')
+                    || document.querySelector('button[type="submit"]')
                     || document.querySelector('textarea')?.closest('form')?.querySelector('button');
                 if (btn) { btn.click(); return 'OK'; }
                 return 'NO_BUTTON';
@@ -197,9 +210,12 @@ SITES: dict[str, dict] = {
         "url": "https://www.kimi.com/",
         "inject": """
             (() => {
-                const ta = document.querySelector('textarea[placeholder*="输入"]')
+                const ta = document.querySelector('textarea')
+                    || document.querySelector('textarea[placeholder*="输入"]')
                     || document.querySelector('textarea[placeholder*="Ask"]')
-                    || document.querySelector('textarea');
+                    || document.querySelector('div[contenteditable="true"]')
+                    || document.querySelector('[contenteditable]')
+                    || document.querySelector('input[type="text"]');
                 if (!ta) return 'NO_INPUT';
                 const nativeSetter = Object.getOwnPropertyDescriptor(
                     window.HTMLTextAreaElement.prototype, 'value'
@@ -212,8 +228,12 @@ SITES: dict[str, dict] = {
         """,
         "submit_js": """
             (() => {
-                const btn = document.querySelector('button[aria-label*="Send"]')
+                const btn = document.querySelector('button[data-testid="send-button"]')
+                    || document.querySelector('button[aria-label="Send"]')
+                    || document.querySelector('button[aria-label="Submit"]')
                     || document.querySelector('button[class*="send"]')
+                    || document.querySelector('button[class*="Send"]')
+                    || document.querySelector('button[type="submit"]')
                     || document.querySelector('textarea')?.closest('form')?.querySelector('button');
                 if (btn) { btn.click(); return 'OK'; }
                 return 'NO_BUTTON';
@@ -387,9 +407,11 @@ SITES: dict[str, dict] = {
         "url": "https://aistudio.tencent.ai/",
         "inject": """
             (() => {
-                const ta = document.querySelector('textarea[placeholder*="Ask"]')
+                const ta = document.querySelector('textarea')
+                    || document.querySelector('textarea[placeholder*="Ask"]')
                     || document.querySelector('textarea[placeholder*="Message"]')
-                    || document.querySelector('textarea');
+                    || document.querySelector('div[contenteditable="true"]')
+                    || document.querySelector('[contenteditable]');
                 if (!ta) return 'NO_INPUT';
                 const nativeSetter = Object.getOwnPropertyDescriptor(
                     window.HTMLTextAreaElement.prototype, 'value'
@@ -402,8 +424,12 @@ SITES: dict[str, dict] = {
         """,
         "submit_js": """
             (() => {
-                const btn = document.querySelector('button[aria-label*="Send"]')
+                const btn = document.querySelector('button[data-testid="send-button"]')
+                    || document.querySelector('button[aria-label="Send"]')
+                    || document.querySelector('button[aria-label="Submit"]')
                     || document.querySelector('button[class*="send"]')
+                    || document.querySelector('button[class*="Send"]')
+                    || document.querySelector('button[type="submit"]')
                     || document.querySelector('textarea')?.closest('form')?.querySelector('button');
                 if (btn) { btn.click(); return 'OK'; }
                 return 'NO_BUTTON';

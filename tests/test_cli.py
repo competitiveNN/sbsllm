@@ -124,6 +124,8 @@ class TestRun:
             ),
             patch("builtins.input", side_effect=["y", ""]),
             patch("sbsllm.cli.inject_and_submit") as mock_inject,
+            patch("sbsllm.cli.create_server"),
+            patch("sbsllm.cli.close_browser"),
         ):
             mock_inject.return_value = {
                 "tab": 1,
@@ -143,6 +145,8 @@ class TestRun:
             ),
             patch("builtins.input", side_effect=["y", ""]),
             patch("sbsllm.cli.inject_and_submit") as mock_inject,
+            patch("sbsllm.cli.create_server"),
+            patch("sbsllm.cli.close_browser"),
         ):
             mock_inject.return_value = {
                 "tab": 1,
@@ -176,6 +180,8 @@ class TestRun:
             patch("sbsllm.cli.open_page", side_effect=[MagicMock()]),
             patch("builtins.input", side_effect=EOFError()),
             patch("sbsllm.cli.inject_and_submit") as mock_inject,
+            patch("sbsllm.cli.create_server"),
+            patch("sbsllm.cli.close_browser"),
         ):
             mock_inject.return_value = {
                 "tab": 1,
@@ -192,6 +198,8 @@ class TestRun:
             patch("sbsllm.cli.open_page", side_effect=[MagicMock()]),
             patch("builtins.input"),
             patch("sbsllm.cli.inject_and_submit") as mock_inject,
+            patch("sbsllm.cli.create_server"),
+            patch("sbsllm.cli.close_browser"),
         ):
             mock_inject.return_value = {
                 "tab": 1,
@@ -210,6 +218,8 @@ class TestRun:
             patch("sbsllm.cli.open_page", side_effect=[MagicMock()]),
             patch("builtins.input"),
             patch("sbsllm.cli.inject_and_submit") as mock_inject,
+            patch("sbsllm.cli.create_server"),
+            patch("sbsllm.cli.close_browser"),
         ):
             mock_inject.return_value = {
                 "tab": 1,
@@ -238,6 +248,7 @@ class TestRun:
             patch("sbsllm.cli.open_page", side_effect=[MagicMock()]),
             patch("sbsllm.cli.inject_and_submit") as mock_inject,
             patch("builtins.input"),  # Skip login wait
+            patch("sbsllm.cli.create_server"),
             patch("sbsllm.cli.close_browser") as mock_close,
         ):
             mock_inject.return_value = {
@@ -257,6 +268,8 @@ class TestRun:
             patch("sbsllm.cli.open_page", side_effect=[MagicMock()]),
             patch("sbsllm.cli.inject_and_submit") as mock_inject,
             patch("builtins.input"),
+            patch("sbsllm.cli.create_server"),
+            patch("sbsllm.cli.close_browser"),
         ):
             mock_inject.return_value = {
                 "tab": 1,
@@ -317,6 +330,7 @@ class TestRunServer:
             patch("sbsllm.cli.ensure_browser"),
             patch("sbsllm.cli.open_page", side_effect=pages),
             patch("sbsllm.cli.create_server") as mock_create,
+            patch("builtins.print") as mock_print,
         ):
             mock_server = MagicMock()
             mock_create.return_value = mock_server
@@ -329,6 +343,15 @@ class TestRunServer:
                 port=8080,
             )
             mock_server.start.assert_called_once()
+            url_calls = [
+                call
+                for call in mock_print.call_args_list
+                if "http://127.0.0.1:8080/v1/chat/completions" in str(call)
+                or "OpenAI-compatible server URL: http://127.0.0.1:8080/" in str(call)
+            ]
+            assert url_calls
+            for call in url_calls:
+                assert call.kwargs.get("flush") is True
 
 
 class TestMain:

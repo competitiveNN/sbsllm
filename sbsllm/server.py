@@ -254,12 +254,15 @@ class Server:
         OpenAIHandler.tab_map = self.tab_map
 
         self._server = HTTPServer((self.host, self.port), OpenAIHandler)
-        print(f"sbsllm server listening on http://{self.host}:{self.port}")
-        print(f"Models: {list(self.model_map.keys())}")
+        print(f"sbsllm server listening on http://{self.host}:{self.port}", flush=True)
+        print(
+            f"OpenAI-compatible server URL: http://{self.host}:{self.port}/", flush=True
+        )
+        print(f"Models: {list(self.model_map.keys())}", flush=True)
         try:
             self._server.serve_forever()
         except KeyboardInterrupt:
-            print("\nShutting down server...")
+            print("\nShutting down server...", flush=True)
         finally:
             self.stop()
 
