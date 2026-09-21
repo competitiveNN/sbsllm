@@ -36,11 +36,12 @@ sbsllm
 ## Usage
 
 ```bash
-sbsllm                          # Interactive mode
-sbsllm -p "Hello, world!"       # Prompt via CLI
-sbsllm -c myconfig.yaml         # Custom config
-sbsllm --chrome-bin /usr/bin/chromium  # Use a specific browser binary
-sbsllm --list-sites             # List available chats
+sbsllm                                      # Interactive mode
+sbsllm -p "Hello, world!"                  # Prompt via CLI
+sbsllm -c myconfig.yaml                    # Custom config
+sbsllm --login-wait 60                     # Override the login wait
+sbsllm --chrome-bin /usr/bin/chromium      # Use a specific browser binary
+sbsllm --list-sites                        # List available chats
 ```
 
 ## Config
@@ -48,10 +49,30 @@ sbsllm --list-sites             # List available chats
 | Key | Default | Description |
 |-----|---------|-------------|
 | `chats` | (required) | List of chat site IDs to open |
-| `login_wait` | `30` | Seconds to wait for login |
-| `chrome_bin` | managed Chromium | Path to Chrome/Chromium binary (uses Playwright-managed Chromium if omitted) |
+| `login_wait` | `30` | Seconds to wait for login; `0` waits for Enter |
+| `chrome_bin` | Playwright Chromium | Path to Chrome/Chromium binary (auto-detected if omitted) |
 | `log_level` | `INFO` | Logging level: DEBUG, INFO, WARNING, ERROR, CRITICAL |
 | `log_file` | stdout | Path to log file (optional) |
+
+## OpenAI-Compatible Server
+
+Start server mode with:
+
+```bash
+sbsllm --server --host 127.0.0.1 --port 8080
+```
+
+The browser tabs open first, and the server URL is printed before login or
+prompt collection begins. Use `--port 0` to let the operating system choose an
+available port; the printed URL contains the actual bound port.
+
+Endpoints:
+
+- `GET /v1/models`
+- `POST /v1/chat/completions`
+- `GET /health`
+
+The server runs until interrupted. Stopping it also closes the Chromium pages.
 
 ## Supported Chats
 

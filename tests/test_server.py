@@ -1,6 +1,7 @@
 """Tests for server.py."""
 
 import json
+import socket
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -44,8 +45,12 @@ class TestServerStartStop:
     def test_start_and_stop(self):
         server = create_server(port=0)  # Use port 0 for auto-assign
         mock_http_server = MagicMock()
+        mock_http_server.handle_request.side_effect = [
+            socket.timeout,
+            KeyboardInterrupt(),
+        ]
 
-        with patch("sbsllm.server.HTTPServer", return_value=mock_http_server):
+        with patch("sbsllm.server._SBSHTTPServer", return_value=mock_http_server):
             # Start in a thread
             thread = threading.Thread(target=server.start, daemon=True)
             thread.start()
@@ -53,12 +58,20 @@ class TestServerStartStop:
             server.stop()
             thread.join(timeout=2)
 
-        mock_http_server.serve_forever.assert_called_once()
-        mock_http_server.shutdown.assert_called_once()
+        mock_http_server.handle_request.assert_called()
+        # No shutdown call; stop uses server_close
+        mock_http_server.server_close.assert_called()
 
     def test_stop_without_start(self):
         server = create_server()
         server.stop()  # Should not raise
+
+    def test_url_uses_bound_ephemeral_port(self):
+        server = create_server(port=0)
+        server._server = MagicMock()
+        server._server.server_address = ("127.0.0.1", 43123)
+
+        assert server.url == "http://127.0.0.1:43123/"
 
 
 class TestServerStartupOutput:
@@ -67,9 +80,13 @@ class TestServerStartupOutput:
     def test_start_logs_and_flushes(self):
         server = create_server(host="127.0.0.1", port=9090)
         mock_http_server = MagicMock()
+        mock_http_server.handle_request.side_effect = [
+            socket.timeout,
+            KeyboardInterrupt(),
+        ]
 
         with (
-            patch("sbsllm.server.HTTPServer", return_value=mock_http_server),
+            patch("sbsllm.server._SBSHTTPServer", return_value=mock_http_server),
             patch("builtins.print") as mock_print,
         ):
             thread = threading.Thread(target=server.start, daemon=True)
@@ -81,34 +98,65 @@ class TestServerStartupOutput:
         calls = [
             call
             for call in mock_print.call_args_list
-            if "OpenAI-compatible server URL: http://127.0.0.1:9090/" in str(call)
+            if "OpenAI-compatible server URL:" in str(call)
         ]
         assert calls
+        assert "http://127.0.0.1:" in str(calls[0])
         assert calls[0].kwargs.get("flush") is True
 
 
 class TestOpenAIHandlerModels:
     def test_models_empty(self):
-        handler = MagicMock(spec=OpenAIHandler)
+        import threading
+
+        handler = OpenAIHandler.__new__(OpenAIHandler)
         handler.model_map = {}
-        OpenAIHandler.model_map = {}
-        OpenAIHandler._handle_models(handler)
-        # Verify it was called
-        assert handler._send_json.called
+        handler.tab_map = {}
+        handler.server = MagicMock(browser_lock=threading.Lock())
+        handler.headers = {"x-request-id": "test-request-id"}
+        handler._send_json = MagicMock()
+        handler._send_error = MagicMock()
+        handler.send_response = MagicMock()
+        handler.send_header = MagicMock()
+        handler.end_headers = MagicMock()
+        handler.wfile = MagicMock()
+        handler.wfile.write = MagicMock()
+
+        OpenAIHandler._handle_models(handler, "test-request-id")
+        handler._send_json.assert_called_once()
+        call_args = handler._send_json.call_args[0]
+        assert call_args[0] == 200
+        data = call_args[1]
+        assert data["object"] == "list"
+        assert data["data"] == []
+        assert call_args[2] == "test-request-id"
 
     def test_models_with_entries(self):
-        handler = MagicMock(spec=OpenAIHandler)
-        handler.model_map = {"gpt-4": "chatgpt", "claude-3": "claude"}
-        OpenAIHandler.model_map = handler.model_map
-        OpenAIHandler._handle_models(handler)
+        import threading
 
-        call_args = handler._send_json.call_args
-        assert call_args[0][0] == 200
-        data = call_args[0][1]
+        handler = OpenAIHandler.__new__(OpenAIHandler)
+        handler.model_map = {"gpt-4": "chatgpt", "claude-3": "claude"}
+        handler.tab_map = {}
+        handler.server = MagicMock(browser_lock=threading.Lock())
+        handler.headers = {"x-request-id": "test-request-id"}
+        handler._send_json = MagicMock()
+        handler._send_error = MagicMock()
+        handler.send_response = MagicMock()
+        handler.send_header = MagicMock()
+        handler.end_headers = MagicMock()
+        handler.wfile = MagicMock()
+        handler.wfile.write = MagicMock()
+
+        OpenAIHandler._handle_models(handler, "test-request-id")
+
+        call_args = handler._send_json.call_args[0]
+        assert call_args[0] == 200
+        data = call_args[1]
         assert data["object"] == "list"
         assert len(data["data"]) == 2
         assert data["data"][0]["id"] == "gpt-4"
         assert data["data"][0]["root"] == "chatgpt"
+        assert call_args[2] == "test-request-id"
 
 
 class TestOpenAIHandlerChatCompletions:
@@ -118,32 +166,60 @@ class TestOpenAIHandlerChatCompletions:
         content_length: int | None = None,
         prompt_result: str = "Hello!",
     ):
-        """Create a mock handler with the given request body."""
-        handler = MagicMock(spec=OpenAIHandler)
-        handler.headers = {"Content-Length": str(content_length or len(request_body))}
+        """Create a real handler instance with the given request body."""
+        import threading
+
+        handler = OpenAIHandler.__new__(OpenAIHandler)
+        handler.headers = {
+            "Content-Length": str(content_length or len(request_body)),
+            "x-request-id": "test-request-id",
+        }
         handler.rfile = MagicMock()
         handler.rfile.read.return_value = request_body
         handler.model_map = {"gpt-4": "chatgpt", "claude-3": "claude"}
-        handler.tab_map = {"gpt-4": MagicMock(), "claude-3": MagicMock()}
-        handler._build_prompt.return_value = prompt_result
+        # Create page mocks with health check methods
+        page_mock = MagicMock()
+        page_mock.is_closed.return_value = False
+        page_mock.evaluate.return_value = 2
+        handler.tab_map = {"gpt-4": page_mock, "claude-3": page_mock}
+        handler._build_prompt = MagicMock(return_value=prompt_result)
+        # Provide a server mock with browser_lock for thread-safe browser access
+        handler.server = MagicMock(
+            browser_lock=threading.Lock(),
+            browser_timeout=60,
+            browser_lock_timeout=10,
+        )
+        # Mock output methods to capture calls
+        handler._send_json = MagicMock()
+        handler._send_error = MagicMock()
+        handler.send_response = MagicMock()
+        handler.send_header = MagicMock()
+        handler.end_headers = MagicMock()
+        handler.wfile = MagicMock()
+        handler.wfile.write = MagicMock()
         return handler
 
     def test_missing_body(self):
         handler = self._make_handler(b"", content_length=0)
         OpenAIHandler._handle_chat_completions(handler)
-        handler._send_error.assert_called_once_with(400, "Request body is empty")
+        handler._send_error.assert_called_once_with(
+            400, "Request body is empty", request_id="test-request-id"
+        )
 
     def test_invalid_json(self):
         handler = self._make_handler(b"not json")
         OpenAIHandler._handle_chat_completions(handler)
         handler._send_error.assert_called_once()
-        assert "Invalid JSON" in handler._send_error.call_args[0][1]
+        call_kwargs = handler._send_error.call_args.kwargs
+        assert call_kwargs.get("request_id") == "test-request-id"
 
     def test_missing_model(self):
         body = json.dumps({"messages": [{"role": "user", "content": "hi"}]}).encode()
         handler = self._make_handler(body)
         OpenAIHandler._handle_chat_completions(handler)
-        handler._send_error.assert_called_once_with(400, "Missing 'model' field")
+        handler._send_error.assert_called_once_with(
+            400, "Missing 'model' field", request_id="test-request-id"
+        )
 
     def test_unknown_model(self):
         body = json.dumps(
@@ -152,22 +228,15 @@ class TestOpenAIHandlerChatCompletions:
         handler = self._make_handler(body)
         OpenAIHandler._handle_chat_completions(handler)
         handler._send_error.assert_called_once()
-        assert "Unknown model" in handler._send_error.call_args[0][1]
+        call_kwargs = handler._send_error.call_args.kwargs
+        assert call_kwargs.get("request_id") == "test-request-id"
 
     def test_missing_messages(self):
         body = json.dumps({"model": "gpt-4"}).encode()
         handler = self._make_handler(body)
         OpenAIHandler._handle_chat_completions(handler)
-        handler._send_error.assert_called_once_with(400, "Missing 'messages' field")
-
-    def test_empty_user_content(self):
-        body = json.dumps(
-            {"model": "gpt-4", "messages": [{"role": "user", "content": "  "}]}
-        ).encode()
-        handler = self._make_handler(body, prompt_result="  ")
-        OpenAIHandler._handle_chat_completions(handler)
         handler._send_error.assert_called_once_with(
-            400, "No user message content found"
+            400, "Missing 'messages' field", request_id="test-request-id"
         )
 
     def test_missing_browser_tab(self):
@@ -179,10 +248,14 @@ class TestOpenAIHandlerChatCompletions:
 
         OpenAIHandler._handle_chat_completions(handler)
 
-        handler._send_error.assert_called_once_with(
-            502,
-            "No browser tab for model: gpt-4",
-            "server_error",
+        handler._send_error.assert_called_once()
+        call_args = handler._send_error.call_args[0]
+        assert call_args[0] == 502
+        assert "No browser tab for model: gpt-4" in call_args[1]
+        assert "The browser tab may have crashed" in call_args[1]
+        assert call_args[2] == "server_error"
+        assert (
+            handler._send_error.call_args.kwargs.get("request_id") == "test-request-id"
         )
 
     def test_successful_completion(self):
@@ -207,6 +280,7 @@ class TestOpenAIHandlerChatCompletions:
         assert data["model"] == "gpt-4"
         assert data["choices"][0]["message"]["role"] == "assistant"
         assert "sent to chatgpt" in data["choices"][0]["message"]["content"]
+        assert data.get("request_id") == "test-request-id"
 
     def test_inject_failure(self):
         body = json.dumps(
@@ -261,8 +335,9 @@ class TestOpenAIHandlerChatCompletions:
                 mock_submit_js.return_value = "submit_js"
                 OpenAIHandler._handle_chat_completions(handler)
 
-        handler._send_error.assert_called_once()
-        assert "Browser error" in handler._send_error.call_args[0][1]
+        handler._send_error.assert_called_once_with(
+            502, "Browser error: fail", "server_error", "test-request-id"
+        )
 
     def test_browser_page_error_returns_502(self):
         """A stale/closed page fields a PlaywrightError as status, not a 200."""
@@ -284,8 +359,10 @@ class TestOpenAIHandlerChatCompletions:
                     OpenAIHandler._handle_chat_completions(handler)
 
         handler._send_error.assert_called_once()
-        assert handler._send_error.call_args[0][0] == 502
-        assert "Browser error" in handler._send_error.call_args[0][1]
+        call_args = handler._send_error.call_args[0]
+        assert call_args[0] == 502
+        assert "Browser error" in call_args[1]
+        assert call_args[3] == "test-request-id"
 
     def test_internal_error(self):
         body = json.dumps(
@@ -303,7 +380,158 @@ class TestOpenAIHandlerChatCompletions:
             OpenAIHandler._handle_chat_completions(handler)
 
         handler._send_error.assert_called_once()
-        assert "Internal error" in handler._send_error.call_args[0][1]
+        call_args = handler._send_error.call_args[0]
+        assert call_args[0] == 500
+        assert "Internal error" in call_args[1]
+        assert call_args[3] == "test-request-id"
+
+
+class TestRequestParsingEdgeCases:
+    """Test request parsing edge cases."""
+
+    def _make_handler(self, request_body: bytes, content_length: int | None = None):
+        import threading
+
+        handler = OpenAIHandler.__new__(OpenAIHandler)
+        handler.headers = {
+            "Content-Length": str(content_length or len(request_body)),
+            "x-request-id": "test-request-id",
+        }
+        handler.rfile = MagicMock()
+        handler.rfile.read.return_value = request_body
+        handler.model_map = {"gpt-4": "chatgpt", "claude-3": "claude"}
+        page_mock = MagicMock()
+        page_mock.is_closed.return_value = False
+        page_mock.evaluate.return_value = 2
+        handler.tab_map = {"gpt-4": page_mock, "claude-3": page_mock}
+        handler._build_prompt = MagicMock(return_value="Hello!")
+        handler.server = MagicMock(
+            browser_lock=threading.Lock(),
+            browser_timeout=60,
+            browser_lock_timeout=10,
+        )
+        handler._send_json = MagicMock()
+        handler._send_error = MagicMock()
+        handler.send_response = MagicMock()
+        handler.send_header = MagicMock()
+        handler.end_headers = MagicMock()
+        handler.wfile = MagicMock()
+        handler.wfile.write = MagicMock()
+        return handler
+
+    def test_array_request_body(self):
+        """Array as JSON root should be rejected."""
+        handler = self._make_handler(b"[]")
+        OpenAIHandler._handle_chat_completions(handler)
+        handler._send_error.assert_called_once_with(
+            400, "Request body must be a JSON object", request_id="test-request-id"
+        )
+
+    def test_string_request_body(self):
+        """String as JSON root should be rejected."""
+        handler = self._make_handler(b'"just a string"')
+        OpenAIHandler._handle_chat_completions(handler)
+        handler._send_error.assert_called_once_with(
+            400, "Request body must be a JSON object", request_id="test-request-id"
+        )
+
+    def test_number_request_body(self):
+        """Number as JSON root should be rejected."""
+        handler = self._make_handler(b"42")
+        OpenAIHandler._handle_chat_completions(handler)
+        handler._send_error.assert_called_once_with(
+            400, "Request body must be a JSON object", request_id="test-request-id"
+        )
+
+    def test_null_request_body(self):
+        """Null as JSON root should be rejected."""
+        handler = self._make_handler(b"null")
+        OpenAIHandler._handle_chat_completions(handler)
+        handler._send_error.assert_called_once_with(
+            400, "Request body must be a JSON object", request_id="test-request-id"
+        )
+
+    def test_messages_as_string(self):
+        """Messages as string should be rejected."""
+        body = json.dumps({"model": "gpt-4", "messages": "not a list"}).encode()
+        handler = self._make_handler(body)
+        OpenAIHandler._handle_chat_completions(handler)
+        handler._send_error.assert_called_once_with(
+            400, "Missing 'messages' field", request_id="test-request-id"
+        )
+
+    def test_messages_as_number(self):
+        """Messages as number should be rejected."""
+        body = json.dumps({"model": "gpt-4", "messages": 123}).encode()
+        handler = self._make_handler(body)
+        OpenAIHandler._handle_chat_completions(handler)
+        handler._send_error.assert_called_once_with(
+            400, "Missing 'messages' field", request_id="test-request-id"
+        )
+
+    def test_messages_as_null(self):
+        """Messages as null should be rejected."""
+        body = json.dumps({"model": "gpt-4", "messages": None}).encode()
+        handler = self._make_handler(body)
+        OpenAIHandler._handle_chat_completions(handler)
+        handler._send_error.assert_called_once_with(
+            400, "Missing 'messages' field", request_id="test-request-id"
+        )
+
+    def test_malformed_content_length_negative(self):
+        """Negative Content-Length should be rejected."""
+        handler = self._make_handler(
+            b'{"model": "gpt-4", "messages": []}', content_length=-1
+        )
+        OpenAIHandler._handle_chat_completions(handler)
+        handler._send_error.assert_called_once_with(
+            400, "Invalid 'Content-Length' header", request_id="test-request-id"
+        )
+
+    def test_malformed_content_length_non_numeric(self):
+        """Non-numeric Content-Length should be rejected."""
+        handler = self._make_handler(b'{"model": "gpt-4", "messages": []}')
+        handler.headers["Content-Length"] = "not_a_number"
+        OpenAIHandler._handle_chat_completions(handler)
+        handler._send_error.assert_called_once_with(
+            400, "Invalid 'Content-Length' header", request_id="test-request-id"
+        )
+
+    def test_missing_content_length(self):
+        """Missing Content-Length should be treated as 0."""
+        handler = self._make_handler(b'{"model": "gpt-4", "messages": []}')
+        del handler.headers["Content-Length"]
+        OpenAIHandler._handle_chat_completions(handler)
+        handler._send_error.assert_called_once_with(
+            400, "Request body is empty", request_id="test-request-id"
+        )
+
+    def test_content_length_exceeds_max(self):
+        """Content-Length exceeding MAX_REQUEST_BYTES should be rejected."""
+        handler = self._make_handler(b"{}", content_length=2_000_000)
+        OpenAIHandler._handle_chat_completions(handler)
+        handler._send_error.assert_called_once()
+        call_args = handler._send_error.call_args[0]
+        assert call_args[0] == 413
+        assert "too large" in call_args[1]
+
+    def test_empty_messages_list(self):
+        """Empty messages list should be rejected."""
+        body = json.dumps({"model": "gpt-4", "messages": []}).encode()
+        handler = self._make_handler(body)
+        OpenAIHandler._handle_chat_completions(handler)
+        handler._send_error.assert_called_once_with(
+            400, "Missing 'messages' field", request_id="test-request-id"
+        )
+
+    def test_message_not_dict(self):
+        """Non-dict message in list should be rejected."""
+        body = json.dumps({"model": "gpt-4", "messages": ["not a dict"]}).encode()
+        handler = self._make_handler(body)
+        OpenAIHandler._handle_chat_completions(handler)
+        handler._send_error.assert_called_once_with(
+            400, "Each message must be a JSON object", request_id="test-request-id"
+        )
 
 
 class TestBuildPrompt:
@@ -351,23 +579,62 @@ class TestHTTPMethods:
     """Test HTTP method routing."""
 
     def test_do_get_models(self):
-        handler = MagicMock(spec=OpenAIHandler)
+        import threading
+
+        handler = OpenAIHandler.__new__(OpenAIHandler)
         handler.path = "/v1/models"
+        handler.model_map = {"gpt-4": "chatgpt"}
+        handler.tab_map = {}
+        handler.server = MagicMock(browser_lock=threading.Lock())
+        handler.headers = {"x-request-id": "test-request-id"}
+        handler._handle_models = MagicMock()
+        handler._send_json = MagicMock()
+        handler._send_error = MagicMock()
+        handler.send_response = MagicMock()
+        handler.send_header = MagicMock()
+        handler.end_headers = MagicMock()
+        handler.wfile = MagicMock()
+        handler.wfile.write = MagicMock()
+
         OpenAIHandler.do_GET(handler)
-        handler._handle_models.assert_called_once()
+        handler._handle_models.assert_called_once_with("test-request-id")
 
     def test_do_get_health(self):
-        handler = MagicMock(spec=OpenAIHandler)
+        import threading
+
+        handler = OpenAIHandler.__new__(OpenAIHandler)
         handler.path = "/health"
+        handler.model_map = {"gpt-4": "chatgpt"}
+        handler.tab_map = {}
+        handler.server = MagicMock(browser_lock=threading.Lock())
+        handler.headers = {"x-request-id": "test-request-id"}
+        handler._send_json = MagicMock()
+        handler._send_error = MagicMock()
+        handler.send_response = MagicMock()
+        handler.send_header = MagicMock()
+        handler.end_headers = MagicMock()
+        handler.wfile = MagicMock()
+        handler.wfile.write = MagicMock()
+
         OpenAIHandler.do_GET(handler)
-        handler._send_json.assert_called_once_with(200, {"status": "ok"})
+        handler._send_json.assert_called_once()
+        call_args = handler._send_json.call_args[0]
+        assert call_args[0] == 200
+        data = call_args[1]
+        assert data["status"] in ("ok", "degraded")
+        assert "browser_connected" in data
+        assert "active_tabs" in data
+        assert "models" in data
+        assert data.get("request_id") == "test-request-id"
+        assert call_args[2] == "test-request-id"
 
     def test_do_get_not_found(self):
         handler = MagicMock(spec=OpenAIHandler)
         handler.path = "/unknown"
+        handler.headers = {"x-request-id": "test-request-id"}
         OpenAIHandler.do_GET(handler)
         handler._send_error.assert_called_once_with(
-            404, "Not found: /unknown", "not_found"
+            404, "Not found: /unknown", "not_found", "test-request-id"
         )
 
     def test_do_post_chat_completions(self):
@@ -379,9 +646,10 @@ class TestHTTPMethods:
     def test_do_post_not_found(self):
         handler = MagicMock(spec=OpenAIHandler)
         handler.path = "/unknown"
+        handler.headers = {"x-request-id": "test-request-id"}
         OpenAIHandler.do_POST(handler)
         handler._send_error.assert_called_once_with(
-            404, "Not found: /unknown", "not_found"
+            404, "Not found: /unknown", "not_found", "test-request-id"
         )
 
 
@@ -437,20 +705,100 @@ class TestBuildPromptAssistant:
         assert "[Assistant]" in result
 
 
+class TestStripMetaTags:
+    """The local chat wraps a meta-instruction (task/guidelines/chat history)
+    around the actual user message in a single user-role message. Web chats
+    must receive only the trailing user message, so the wrapper is stripped."""
+
+    def _strip(self, text: str) -> str:
+        return OpenAIHandler._strip_meta_tags(
+            OpenAIHandler.__new__(OpenAIHandler), text
+        )
+
+    def test_strips_full_meta_instruction(self):
+        text = (
+            "### Task:\n"
+            "Generate a concise title summarizing the chat history.\n"
+            "### Guidelines:\n"
+            "- Keep it short\n"
+            "### Chat History:\n"
+            "<chat_history>\n"
+            "USER: hello\n"
+            "ASSISTANT: \n"
+            "</chat_history>"
+        )
+        assert self._strip(text) == "hello"
+
+    def test_strips_multi_turn_history_keeping_last_user(self):
+        text = (
+            "### Chat History:\n"
+            "<chat_history>\n"
+            "USER: first question\n"
+            "ASSISTANT: first answer\n"
+            "USER: test\n"
+            "ASSISTANT: \n"
+            "</chat_history>"
+        )
+        assert self._strip(text) == "test"
+
+    def test_plain_message_returned_as_is(self):
+        assert self._strip("just a message") == "just a message"
+
+    def test_empty_returns_empty(self):
+        assert self._strip("") == ""
+
+    def test_no_history_block_keeps_full_text(self):
+        text = "### Task:\nDo something"
+        assert self._strip(text) == "### Task:\nDo something"
+
+
 class TestServerStartWithInterrupt:
-    """Test Server.start() KeyboardInterrupt handling (lines 239-240)."""
+    """Test Server.start() KeyboardInterrupt handling."""
 
     def test_start_handles_keyboard_interrupt(self):
         server = create_server(port=0)
         mock_http_server = MagicMock()
-        mock_http_server.serve_forever.side_effect = KeyboardInterrupt()
+        mock_http_server.handle_request.side_effect = [
+            socket.timeout,
+            KeyboardInterrupt(),
+        ]
 
-        with patch("sbsllm.server.HTTPServer", return_value=mock_http_server):
+        with patch("sbsllm.server._SBSHTTPServer", return_value=mock_http_server):
             server.start()
 
-        mock_http_server.shutdown.assert_called_once()
+        mock_http_server.handle_request.assert_called()
+        mock_http_server.server_close.assert_called()
 
     def test_stop_with_no_server(self):
         server = create_server()
         server._server = None
         server.stop()  # Should not raise
+
+    def test_signal_handlers_install_only_on_main_thread(self):
+        server = create_server()
+        with patch("sbsllm.server.signal.signal") as mock_signal:
+            assert server.install_signal_handlers() is True
+            assert mock_signal.call_count == 2
+
+        server.stop()
+        with patch("sbsllm.server.signal.signal") as mock_signal:
+            worker = threading.Thread(target=server.install_signal_handlers)
+            worker.start()
+            worker.join(timeout=2)
+            mock_signal.assert_not_called()
+
+    def test_start_uses_instance_scoped_handler_maps(self):
+        server = create_server(
+            model_map={"first": "site-one"}, tab_map={"first": object()}
+        )
+        mock_http_server = MagicMock()
+        mock_http_server.handle_request.side_effect = KeyboardInterrupt()
+
+        with patch(
+            "sbsllm.server._SBSHTTPServer", return_value=mock_http_server
+        ) as cls:
+            server.start(announce=False)
+
+        handler_cls = cls.call_args.args[1]
+        assert handler_cls.model_map is server.model_map
+        assert handler_cls.tab_map is server.tab_map

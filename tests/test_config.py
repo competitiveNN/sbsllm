@@ -99,9 +99,19 @@ class TestParseConfig:
 
     def test_all_new_sites_valid(self):
         """Verify all newly added sites are accepted."""
-        data = {"chats": ["perplexity", "poe", "cohere"]}
+        data = {
+            "chats": [
+                "perplexity",
+                "poe",
+                "cohere",
+                "zai",
+                "meta",
+                "huggingface",
+                "tencent",
+            ]
+        }
         config = parse_config(data)
-        assert config.chats == ["perplexity", "poe", "cohere"]
+        assert config.chats == data["chats"]
 
     def test_log_level_config(self):
         data = {"chats": ["chatgpt"], "log_level": "DEBUG"}
@@ -162,3 +172,17 @@ class TestLoadConfig:
         config_file.write_text("# just a comment\n")
         with pytest.raises(SystemExit):
             load_config(config_file)
+
+    @pytest.mark.parametrize("content", ["- chatgpt\n", "chatgpt\n", "42\n"])
+    def test_yaml_root_must_be_mapping(self, tmp_path, content):
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(content)
+        with pytest.raises(SystemExit):
+            load_config(config_file)
+
+    def test_malformed_yaml_exits(self, tmp_path, capsys):
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text("chats: [unterminated\n")
+        with pytest.raises(SystemExit):
+            load_config(config_file)
+        assert "invalid YAML" in capsys.readouterr().err

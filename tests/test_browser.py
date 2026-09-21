@@ -1,5 +1,7 @@
 """Tests for browser.py."""
 
+import threading
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -8,11 +10,13 @@ import sbsllm.browser as browser_module
 from sbsllm.browser import (
     USER_DATA_DIR,
     BrowserError,
+    check_page_health,
     close_browser,
     ensure_browser,
     inject_and_submit,
     is_running,
     open_page,
+    run_in_browser_thread,
     run_js,
     setup_logging,
 )
@@ -20,9 +24,11 @@ from sbsllm.browser import (
 
 @pytest.fixture(autouse=True)
 def _reset_browser_globals():
+    browser_module._stop_browser_worker()
     browser_module._context = None
     browser_module._playwright_instance = None
     yield
+    browser_module._stop_browser_worker()
     browser_module._context = None
     browser_module._playwright_instance = None
 
@@ -104,7 +110,9 @@ class TestEnsureBrowser:
         mock_context, _ = self._mock_context()
         with (
             patch("sbsllm.browser.sync_playwright") as mock_pw,
-            patch("sbsllm.browser._find_system_chromium", return_value=True),
+            patch(
+                "sbsllm.browser._find_system_chromium", return_value="/usr/bin/chromium"
+            ),
         ):
             mock_instance = MagicMock()
             mock_pw.return_value.start.return_value = mock_instance
@@ -113,7 +121,7 @@ class TestEnsureBrowser:
             ensure_browser()
 
             call_kwargs = mock_instance.chromium.launch_persistent_context.call_args[1]
-            assert call_kwargs["executable_path"] == "/usr/bin/chromium-browser"
+            assert call_kwargs["executable_path"] == "/usr/bin/chromium"
             assert "channel" not in call_kwargs
 
     def test_reuses_existing_browser(self):
@@ -314,6 +322,7 @@ class TestRunJs:
 class TestInjectAndSubmit:
     def test_successful_flow(self):
         mock_page = MagicMock()
+        mock_page.is_closed.return_value = False
         mock_page.evaluate.side_effect = ["OK", "OK"]
 
         with patch("sbsllm.browser.time.sleep"):
@@ -326,6 +335,7 @@ class TestInjectAndSubmit:
 
     def test_inject_fails(self):
         mock_page = MagicMock()
+        mock_page.is_closed.return_value = False
         mock_page.evaluate.return_value = "NO_INPUT"
 
         with patch("sbsllm.browser.time.sleep"):
@@ -336,6 +346,7 @@ class TestInjectAndSubmit:
 
     def test_submit_fails(self):
         mock_page = MagicMock()
+        mock_page.is_closed.return_value = False
         mock_page.evaluate.side_effect = ["OK", "NO_BUTTON"]
 
         with patch("sbsllm.browser.time.sleep"):
@@ -348,6 +359,7 @@ class TestInjectAndSubmit:
         from playwright.sync_api import Error as PlaywrightError
 
         mock_page = MagicMock()
+        mock_page.is_closed.return_value = False
         mock_page.evaluate.side_effect = PlaywrightError("connection lost")
 
         with patch("sbsllm.browser.time.sleep"):
@@ -359,6 +371,7 @@ class TestInjectAndSubmit:
         from playwright.sync_api import Error as PlaywrightError
 
         mock_page = MagicMock()
+        mock_page.is_closed.return_value = False
         mock_page.bring_to_front.side_effect = PlaywrightError("page lost")
 
         result = inject_and_submit(mock_page, "inject_js", "submit_js", 1)
@@ -404,3 +417,142 @@ class TestCloseBrowser:
             patch("sbsllm.browser._playwright_instance", None),
         ):
             close_browser()  # Should not raise
+
+
+class TestBrowserQueue:
+    """Tests for the run_in_browser_thread queue mechanism."""
+
+    def test_run_in_browser_thread_runs_function(self):
+        result_holder: list[int] = []
+
+        def append_val(x: int) -> int:
+            result_holder.append(x)
+            return x * 2
+
+        result = run_in_browser_thread(append_val, 21)
+        assert result == 42
+        assert result_holder == [21]
+
+    def test_run_in_browser_thread_passes_kwargs(self):
+        result = run_in_browser_thread(lambda a, b=0: a + b, 10, b=5)
+        assert result == 15
+
+    def test_run_in_browser_thread_propagates_exception(self):
+        def raise_error() -> None:
+            raise ValueError("test error")
+
+        with pytest.raises(ValueError, match="test error"):
+            run_in_browser_thread(raise_error)
+
+    def test_run_in_browser_thread_returns_none(self):
+        result = run_in_browser_thread(lambda: None)
+        assert result is None
+
+    def test_run_in_browser_thread_with_page_mock(self):
+        mock_page = MagicMock()
+        mock_page.is_closed.return_value = False
+        mock_page.evaluate.return_value = True
+
+        def _check(page: MagicMock) -> bool:
+            if page.is_closed():
+                return False
+            page.evaluate("1 + 1")
+            return True
+
+        result = run_in_browser_thread(_check, mock_page)
+        assert result is True
+        mock_page.is_closed.assert_called_once()
+        mock_page.evaluate.assert_called_once_with("1 + 1")
+
+    def test_inject_and_submit_uses_queue(self):
+        mock_page = MagicMock()
+        mock_page.is_closed.return_value = False
+        mock_page.evaluate.side_effect = ["OK", "OK"]
+
+        with patch("sbsllm.browser.time.sleep"):
+            result = inject_and_submit(mock_page, "inject_js", "submit_js", 1)
+
+        assert result["tab"] == 1
+        assert result["inject"] == "OK"
+        assert result["submit"] == "OK"
+
+    def test_check_page_health_returns_true(self):
+        mock_page = MagicMock()
+        mock_page.is_closed.return_value = False
+        mock_page.evaluate.return_value = True
+        assert check_page_health(mock_page) is True
+
+    def test_check_page_health_returns_false_when_closed(self):
+        mock_page = MagicMock()
+        mock_page.is_closed.return_value = True
+        assert check_page_health(mock_page) is False
+
+    def test_is_running_true(self):
+        mock_browser = MagicMock()
+        mock_browser.is_connected.return_value = True
+        mock_context = MagicMock()
+        mock_context.browser = mock_browser
+        with patch("sbsllm.browser._context", mock_context):
+            assert is_running() is True
+
+    def test_is_running_false_when_none(self):
+        with patch("sbsllm.browser._context", None):
+            assert is_running() is False
+
+    def test_is_running_false_on_exception(self):
+        mock_context = MagicMock()
+        mock_context.browser = MagicMock()
+        mock_context.browser.is_connected.side_effect = RuntimeError("greenlet")
+        with patch("sbsllm.browser._context", mock_context):
+            assert is_running() is False
+
+    def test_run_in_browser_thread_runs_on_separate_thread(self):
+        thread_ids: list[int | None] = []
+
+        def capture_thread_id() -> int:
+            thread_ids.append(threading.current_thread().ident)
+            return thread_ids[-1]
+
+        # Start a worker thread via run_in_browser_thread
+        result = run_in_browser_thread(capture_thread_id)
+
+        # At least one call should have run on a different thread
+        # (the browser worker thread)
+        assert len(thread_ids) == 1
+        # The main thread ID should differ from the worker thread ID
+        main_thread_id = threading.current_thread().ident
+        assert result == thread_ids[0]
+        assert result != main_thread_id
+
+    def test_close_browser_from_browser_thread(self):
+        """close_browser called from the browser thread should run directly."""
+        mock_context = MagicMock()
+        mock_instance = MagicMock()
+        with (
+            patch("sbsllm.browser._context", mock_context),
+            patch("sbsllm.browser._playwright_instance", mock_instance),
+        ):
+            run_in_browser_thread(close_browser)
+
+        mock_context.close.assert_called_once()
+        mock_instance.stop.assert_called_once()
+
+    def test_nested_browser_dispatch_runs_inline(self):
+        def nested() -> int:
+            return run_in_browser_thread(lambda: 7)
+
+        assert run_in_browser_thread(nested) == 7
+
+    def test_browser_operation_timeout(self):
+        with (
+            patch("sbsllm.browser.BROWSER_OPERATION_TIMEOUT", 0.01),
+            pytest.raises(RuntimeError, match="timed out"),
+        ):
+            run_in_browser_thread(time.sleep, 0.2)
+
+    def test_run_js_dispatches_to_browser_thread(self):
+        mock_page = MagicMock()
+        mock_page.evaluate.return_value = "result"
+
+        assert run_js(mock_page, "return 'result'") == "result"
+        mock_page.evaluate.assert_called_once_with("return 'result'")

@@ -20,3 +20,6 @@ login_wait: 30
 
 # Path to log file (optional, logs to stdout if omitted)
 # log_file: /tmp/sbsllm.log
+
+# Output logs in JSON format for structured logging (default: false)
+# json_log_format: false

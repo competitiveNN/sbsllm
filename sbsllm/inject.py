@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .sites import get_site
+from .sites import _response_js, get_site
 
 # Template placeholder used in injection JS
 PLACEHOLDER = "PROMPT_PLACEHOLDER"
@@ -32,3 +32,15 @@ def submit_js(site_id: str) -> str:
     """Get the submit JS for a site."""
     site = get_site(site_id)
     return site["submit_js"]
+
+
+def extract_js(site_id: str) -> str | None:
+    """Get the response extraction JS for a site, if supported."""
+    site = get_site(site_id)
+    if "response_selectors" not in site:
+        return None
+    return _response_js(
+        site.get("response_selectors"),
+        site.get("thinking_selectors"),
+        site.get("loading_selectors"),
+    )

@@ -11,6 +11,10 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 from .sites import list_sites
 
+MAX_LOGIN_WAIT = 24 * 60 * 60  # 24 hours
+MAX_BROWSER_TIMEOUT = 300  # 5 minutes
+MAX_BROWSER_LOCK_TIMEOUT = 60  # 1 minute
+
 
 class Config(BaseModel):
     """Configuration for sbsllm."""
@@ -20,7 +24,9 @@ class Config(BaseModel):
     chats: list[str] = Field(
         ..., min_length=1, description="List of chat sites to open"
     )
-    login_wait: int = Field(default=30, ge=0, description="Seconds to wait for login")
+    login_wait: int = Field(
+        default=30, ge=0, le=MAX_LOGIN_WAIT, description="Seconds to wait for login"
+    )
     chrome_bin: str | None = Field(
         default=None, description="Path to Chrome/Chromium binary"
     )
@@ -29,6 +35,21 @@ class Config(BaseModel):
     )
     log_file: str | None = Field(
         default=None, description="Path to log file (optional)"
+    )
+    browser_timeout: int = Field(
+        default=60,
+        ge=1,
+        le=MAX_BROWSER_TIMEOUT,
+        description="Browser operation timeout (seconds)",
+    )
+    browser_lock_timeout: int = Field(
+        default=10,
+        ge=1,
+        le=MAX_BROWSER_LOCK_TIMEOUT,
+        description="Browser lock acquisition timeout (seconds)",
+    )
+    json_log_format: bool = Field(
+        default=False, description="Output logs in JSON format"
     )
 
     @field_validator("chats")
@@ -83,15 +104,28 @@ def load_config(path: Path | None = None) -> Config:
             sys.exit(1)
 
     with open(path, "r") as f:
-        data = yaml.safe_load(f) or {}
+        try:
+            data = yaml.safe_load(f)
+        except yaml.YAMLError as e:
+            print(f"Config error: invalid YAML in {path}: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
+        print(f"Config error: {path} must contain a YAML mapping", file=sys.stderr)
+        sys.exit(1)
 
     return parse_config(data, path)
 
 
 def parse_config(data: dict[str, Any], source: Path | None = None) -> Config:
     """Validate raw config dict and return Config."""
+    if not isinstance(data, dict):
+        print("Config error: expected a YAML mapping", file=sys.stderr)
+        sys.exit(1)
     try:
         return Config(**data)
-    except ValidationError as e:
+    except (ValidationError, TypeError) as e:
         print(f"Config error: {e}", file=sys.stderr)
         sys.exit(1)
