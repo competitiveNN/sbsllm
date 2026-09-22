@@ -25,6 +25,7 @@ from .browser import (
     wait_for_response,
 )
 from .inject import extract_js, inject_prompt, submit_js
+from .sites import get_site
 
 # Default server settings
 DEFAULT_HOST = "127.0.0.1"
@@ -295,6 +296,28 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             )
         self._send_json(200, {"object": "list", "data": models}, request_id)
 
+    def _recover_page(self, model: str, site_id: str) -> object | None:
+        """Attempt to recover a crashed/stale browser tab.
+
+        Opens a fresh page for the site URL and updates the server's tab_map
+        so subsequent requests use the new page. Returns the new page or None.
+        """
+        from sbsllm.browser import recover_page
+
+        site = get_site(site_id)
+        url = site["url"] if site else None
+        if not url:
+            return None
+        logger = logging.getLogger(__name__)
+        logger.info(
+            "recovering page for model=%s site=%s url=%s",
+            model, site_id, url,
+        )
+        new_page = recover_page(url)
+        if new_page is not None and self.server is not None:
+            self.server.tab_map[model] = new_page
+        return new_page
+
     def _inject_and_submit(
         self, page, site_id: str, prompt: str, tab_index: int
     ) -> dict:
@@ -312,6 +335,39 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             }
 
         return inject_and_submit(page, inject_js, submit_js_val, tab_index)
+
+    def _inject_and_submit_with_recovery(
+        self,
+        page,
+        model: str,
+        site_id: str,
+        prompt: str,
+        tab_index: int,
+        max_retries: int = 1,
+    ) -> tuple[dict, object | None]:
+        """Inject and submit, recovering the page if it is unhealthy.
+
+        Returns (status_dict, final_page). When recovery succeeds the returned
+        page is the new page and the caller should update its local reference.
+        """
+        status = self._inject_and_submit(page, site_id, prompt, tab_index)
+
+        # Only attempt recovery if the page was unhealthy to begin with.
+        if (
+            status.get("inject") == "BROWSER_ERROR: page unhealthy"
+            and max_retries > 0
+        ):
+            logger = logging.getLogger(__name__)
+            logger.warning(
+                "Page unhealthy for model=%s; attempting recovery", model
+            )
+            new_page = self._recover_page(model, site_id)
+            if new_page is not None:
+                page = new_page
+                status = self._inject_and_submit(
+                    page, site_id, prompt, tab_index
+                )
+        return status, page
 
     def _message_text(self, message: dict) -> str:
         """Extract text from an OpenAI message, including multipart content."""
@@ -449,7 +505,9 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                 _update_metrics(time.monotonic() - request_start, error=True, error_type="extraction_unsupported")
                 return
             baseline = capture_response(page, extraction)
-            status = self._inject_and_submit(page, site_id, prompt, tab_index)
+            status, page = self._inject_and_submit_with_recovery(
+                page, model, site_id, prompt, tab_index
+            )
             if not isinstance(status, dict):
                 logger.error(
                     "chat_completion invalid_status",
@@ -947,7 +1005,9 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         try:
             extraction = extract_js(site_id)
             baseline = capture_response(page, extraction) if extraction else None
-            status = self._inject_and_submit(page, site_id, prompt, tab_index)
+            status, page = self._inject_and_submit_with_recovery(
+                page, model, site_id, prompt, tab_index
+            )
             if (
                 isinstance(status, dict)
                 and status.get("inject") == "OK"

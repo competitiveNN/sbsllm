@@ -754,6 +754,116 @@ class TestStripMetaTags:
         assert self._strip(text) == "### Task:\nDo something"
 
 
+class TestPageRecovery:
+    """Test _inject_and_submit_with_recovery and _recover_page."""
+
+    def _make_handler(self):
+        import threading
+
+        handler = OpenAIHandler.__new__(OpenAIHandler)
+        handler.model_map = {"gpt-4": "chatgpt", "claude-3": "claude"}
+        page_mock = MagicMock()
+        page_mock.is_closed.return_value = False
+        page_mock.evaluate.return_value = 2
+        handler.tab_map = {"gpt-4": page_mock, "claude-3": page_mock}
+        handler.server = MagicMock(
+            browser_lock=threading.Lock(),
+            browser_timeout=60,
+            browser_lock_timeout=10,
+        )
+        handler._send_json = MagicMock()
+        handler._send_error = MagicMock()
+        handler.send_response = MagicMock()
+        handler.send_header = MagicMock()
+        handler.end_headers = MagicMock()
+        handler.wfile = MagicMock()
+        handler.wfile.write = MagicMock()
+        return handler
+
+    def test_no_recovery_when_healthy(self):
+        """A healthy page should be passed straight through."""
+        handler = self._make_handler()
+        page = handler.tab_map["gpt-4"]
+        with (
+            patch("sbsllm.server.check_page_health", return_value=True),
+            patch("sbsllm.server.inject_and_submit") as mock_submit,
+        ):
+            mock_submit.return_value = {"tab": 1, "inject": "OK", "submit": "OK"}
+            status, final_page = handler._inject_and_submit_with_recovery(
+                page, "gpt-4", "chatgpt", "Hello!", 1
+            )
+        assert status == {"tab": 1, "inject": "OK", "submit": "OK"}
+        assert final_page is page
+        mock_submit.assert_called_once()
+
+    def test_recovery_on_unhealthy_page(self):
+        """An unhealthy page should trigger recovery and retry."""
+        handler = self._make_handler()
+        old_page = handler.tab_map["gpt-4"]
+        new_page = MagicMock()
+        new_page.is_closed.return_value = False
+        new_page.evaluate.return_value = 2
+
+        health_calls = []
+
+        def fake_health(page):
+            health_calls.append(page)
+            # Return False for the old page, True for the new page.
+            return page is new_page
+
+        submit_calls = []
+
+        def fake_submit(page, *args, **kwargs):
+            submit_calls.append(page)
+            return {"tab": 1, "inject": "OK", "submit": "OK"}
+
+        with (
+            patch("sbsllm.server.check_page_health", side_effect=fake_health),
+            patch("sbsllm.server.inject_and_submit", side_effect=fake_submit),
+            patch.object(handler, "_recover_page", return_value=new_page) as mock_recover,
+        ):
+            status, final_page = handler._inject_and_submit_with_recovery(
+                old_page, "gpt-4", "chatgpt", "Hello!", 1
+            )
+        mock_recover.assert_called_once_with("gpt-4", "chatgpt")
+        assert final_page is new_page
+        assert status == {"tab": 1, "inject": "OK", "submit": "OK"}
+        # inject_and_submit should only be called on the recovered page.
+        assert submit_calls == [new_page]
+
+    def test_recovery_failure_propagates_unhealthy_status(self):
+        """If recovery fails, the unhealthy status is returned."""
+        handler = self._make_handler()
+        old_page = handler.tab_map["gpt-4"]
+
+        with (
+            patch("sbsllm.server.check_page_health", return_value=False),
+            patch.object(handler, "_recover_page", return_value=None) as mock_recover,
+        ):
+            status, final_page = handler._inject_and_submit_with_recovery(
+                old_page, "gpt-4", "chatgpt", "Hello!", 1
+            )
+        mock_recover.assert_called_once()
+        assert status.get("inject") == "BROWSER_ERROR: page unhealthy"
+        assert final_page is old_page
+
+    def test_recovery_not_attempted_on_non_health_error(self):
+        """Recovery only triggers for 'page unhealthy' errors."""
+        handler = self._make_handler()
+        page = handler.tab_map["gpt-4"]
+        with (
+            patch("sbsllm.server.check_page_health", return_value=True),
+            patch("sbsllm.server.inject_and_submit") as mock_submit,
+            patch.object(handler, "_recover_page") as mock_recover,
+        ):
+            mock_submit.return_value = {"tab": 1, "inject": "NO_INPUT", "submit": None}
+            status, final_page = handler._inject_and_submit_with_recovery(
+                page, "gpt-4", "chatgpt", "Hello!", 1
+            )
+        mock_recover.assert_not_called()
+        assert status.get("inject") == "NO_INPUT"
+
+
 class TestServerStartWithInterrupt:
     """Test Server.start() KeyboardInterrupt handling."""
 
