@@ -35,6 +35,8 @@ MAX_REQUEST_BYTES = 1_000_000
 DEFAULT_BROWSER_TIMEOUT = 60
 # Default timeout for acquiring browser lock (seconds)
 DEFAULT_BROWSER_LOCK_TIMEOUT = 10
+# Default interval for periodic health checks (seconds)
+DEFAULT_HEALTH_INTERVAL = 30
 # Request ID header name
 REQUEST_ID_HEADER = "X-Request-ID"
 
@@ -1267,6 +1269,28 @@ class OpenAIHandler(BaseHTTPRequestHandler):
 class Server:
     """OpenAI-compatible HTTP server."""
 
+    def _recover_page(self, model: str, site_id: str) -> object | None:
+        """Attempt to recover a crashed/stale browser tab.
+
+        Opens a fresh page for the site URL and updates the server's tab_map
+        so subsequent requests use the new page. Returns the new page or None.
+        """
+        from sbsllm.browser import recover_page
+
+        site = get_site(site_id)
+        url = site["url"] if site else None
+        if not url:
+            return None
+        logger = logging.getLogger(__name__)
+        logger.info(
+            "recovering page for model=%s site=%s url=%s",
+            model, site_id, url,
+        )
+        new_page = recover_page(url)
+        if new_page is not None:
+            self.tab_map[model] = new_page
+        return new_page
+
     def __init__(
         self,
         model_map: dict[str, str] | None = None,
@@ -1275,6 +1299,7 @@ class Server:
         port: int = DEFAULT_PORT,
         browser_timeout: int = DEFAULT_BROWSER_TIMEOUT,
         browser_lock_timeout: int = DEFAULT_BROWSER_LOCK_TIMEOUT,
+        health_interval: float = DEFAULT_HEALTH_INTERVAL,
     ):
         self.model_map = model_map or {}
         self.tab_map = tab_map or {}
@@ -1282,6 +1307,7 @@ class Server:
         self.port = port
         self.browser_timeout = browser_timeout
         self.browser_lock_timeout = browser_lock_timeout
+        self.health_interval = max(float(health_interval), 1.0)
         self._server: _SBSHTTPServer | None = None
         self._ready = threading.Event()
         self._startup_error: BaseException | None = None
@@ -1289,6 +1315,7 @@ class Server:
         self._stop_requested = threading.Event()
         self._state_lock = threading.Lock()
         self.browser_lock = threading.Lock()
+        self._health_thread: threading.Thread | None = None
         self._shutdown_initiated = False
         self._signal_handler_installed = False
         self._previous_signal_handlers: dict[int, Any] = {}
@@ -1347,6 +1374,7 @@ class Server:
         self._startup_error = None
         self._shutdown_initiated = False
         self._serve_thread = threading.current_thread()
+        self._start_health_monitor()
         try:
             # Handler instances receive this server's maps without mutating shared
             # class state, so concurrent or restarted servers cannot cross routes.
@@ -1435,6 +1463,62 @@ class Server:
                 )
         self._restore_signal_handlers()
 
+    def _start_health_monitor(self) -> None:
+        """Start a background thread that periodically checks tab health."""
+        if self._health_thread is not None and self._health_thread.is_alive():
+            return
+        self._health_thread = threading.Thread(
+            target=self._health_monitor_loop, daemon=True, name="health-monitor"
+        )
+        self._health_thread.start()
+
+    def _stop_health_monitor(self) -> None:
+        """Signal the health monitor thread to stop."""
+        self._stop_requested.set()
+        ht = self._health_thread
+        if ht is not None and ht is not threading.current_thread() and ht.is_alive():
+            ht.join(timeout=2)
+
+    def _health_monitor_loop(self) -> None:
+        """Periodically check every tab's health and recover unhealthy ones."""
+        logger = logging.getLogger(__name__)
+        while not self._stop_requested.is_set():
+            try:
+                self._check_tab_health_once(logger)
+            except Exception:  # noqa: BLE001
+                logger.debug("Health monitor iteration failed", exc_info=True)
+            self._stop_requested.wait(timeout=self.health_interval)
+
+    def _check_tab_health_once(self, logger) -> None:
+        """Check health of all known tabs; recover unhealthy ones."""
+        from sbsllm.browser import check_page_health, is_running
+
+        if not is_running():
+            logger.warning("Health monitor: browser not running")
+            return
+        with self._state_lock:
+            tab_items = list(self.tab_map.items())
+        for model, page in tab_items:
+            if page is None:
+                continue
+            try:
+                healthy = check_page_health(page)
+            except Exception:  # noqa: BLE001
+                healthy = False
+            if not healthy:
+                logger.warning(
+                    "Health monitor: tab for model=%s unhealthy; recovering",
+                    model,
+                )
+                site_id = self.model_map.get(model)
+                if site_id:
+                    new_page = self._recover_page(model, site_id)
+                    if new_page is not None:
+                        logger.info(
+                            "Health monitor: recovered tab for model=%s",
+                            model,
+                        )
+
 
 def create_server(
     model_map: dict[str, str] | None = None,
@@ -1443,6 +1527,7 @@ def create_server(
     port: int = DEFAULT_PORT,
     browser_timeout: int = DEFAULT_BROWSER_TIMEOUT,
     browser_lock_timeout: int = DEFAULT_BROWSER_LOCK_TIMEOUT,
+    health_interval: float = DEFAULT_HEALTH_INTERVAL,
 ) -> Server:
     """Create a new server instance."""
     return Server(
@@ -1452,4 +1537,5 @@ def create_server(
         port=port,
         browser_timeout=browser_timeout,
         browser_lock_timeout=browser_lock_timeout,
+        health_interval=health_interval,
     )
