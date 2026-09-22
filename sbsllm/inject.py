@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .sites import _response_js, get_site
+from .sites import _inject_js, _response_js, _submit_js, get_site
 
 # Template placeholder used in injection JS
 PLACEHOLDER = "PROMPT_PLACEHOLDER"
@@ -23,6 +23,10 @@ def escape_prompt(prompt: str) -> str:
 def inject_prompt(site_id: str, prompt: str) -> str:
     """Get the injection JS for a site with the prompt filled in."""
     site = get_site(site_id)
+    # site["inject"] is already a fully-resolved IIFE (selectors filled in by
+    # _inject_js at config-build time). Only the prompt value still needs
+    # substitution — do NOT re-wrap with _inject_js or you get a nested IIFE
+    # that returns NO_INPUT.
     js = site["inject"]
     escaped = escape_prompt(prompt)
     return js.replace(PLACEHOLDER, escaped)

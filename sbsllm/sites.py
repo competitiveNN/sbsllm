@@ -18,10 +18,8 @@ _INJECT_TEMPLATE = """
         if (!(input instanceof HTMLTextAreaElement || isTextInput || isEditable)) {
             return 'NO_INPUT';
         }
-        // Prevent double submission: clear any previous sbsllm marker
-        if (input.dataset.sbsllmInput === 'true') {
-            return 'OK';
-        }
+        // Always (re)insert the fresh prompt value. Relying on a marker to skip
+        // injection would leave the previous prompt in the box on repeat requests.
         input.focus();
         if (isEditable) {
             try {
@@ -46,6 +44,7 @@ _INJECT_TEMPLATE = """
             if (!setter) return 'NO_INPUT';
             setter.call(input, value);
         }
+        // Mark so the submit step can locate this input, then clean up afterwards.
         input.dataset.sbsllmInput = 'true';
         try {
             input.dispatchEvent(new InputEvent('input', {
@@ -69,6 +68,7 @@ _SUBMIT_TEMPLATE = """
         const form = input?.closest('form');
         // Helper to check if a button looks like a file upload button
         const isUploadButton = (btn) => {
+            if (!btn || typeof btn.getAttribute !== 'function') return false;
             const id = (btn.id || '').toLowerCase();
             const cls = (btn.className || '').toLowerCase();
             const aria = (btn.getAttribute('aria-label') || '').toLowerCase();
@@ -88,35 +88,30 @@ _SUBMIT_TEMPLATE = """
             input?.parentElement?.querySelector('button:not([disabled])'),
         ];
         const btn = candidates.find((candidate) =>
-            candidate && !candidate.disabled && !isUploadButton(candidate)
+            candidate && typeof candidate.click === 'function' && !candidate.disabled
+                && !isUploadButton(candidate)
                 && candidate.getAttribute?.('aria-disabled') !== 'true'
         );
-        if (btn) {
-            // Prevent double submission: mark as submitted and block form events
-            window.sbsllm_submitted = true;
-            // For submit-type buttons in forms, prevent the form's native
-            // submit handler from also firing after the click.
-            // We do this by temporarily disabling the button after click.
+        if (btn && typeof btn.click === 'function') {
+            // Click first so submit-type buttons (e.g. z.ai, meta.ai) still fire
+            // their activation behavior; disabling before click would block it.
+            btn.click();
+            // Temporarily disable to prevent the form's native submit handler
+            // from also firing after the click (double-send on meta.ai).
+            // Restore on next tick so subsequent requests can still find it.
             try {
                 btn.disabled = true;
                 btn.setAttribute('aria-disabled', 'true');
+                window.setTimeout(() => {
+                    try { btn.disabled = false; btn.removeAttribute('aria-disabled'); } catch (_) {}
+                }, 1500);
             } catch (_) {}
-            btn.click();
             return 'OK';
         }
-        // If a button was already clicked, don't fall through to form submit
-        // or Enter key events (prevents double-send on sites like meta.ai
-        // where button click also triggers form submission)
-        if (window.sbsllm_submitted) {
-            return 'OK';
-        }
-        try {
-            if (form?.requestSubmit && !window.sbsllm_submitted) { form.requestSubmit(); return 'OK'; }
-        } catch (_) {}
-        if (input) {
+        if (input && (input.tagName === 'TEXTAREA' || input.tagName === 'INPUT')) {
             try {
                 // Try to submit via form if available
-                if (form && !window.sbsllm_submitted) {
+                if (form) {
                     form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
                     return 'ENTER_SENT';
                 }
@@ -243,6 +238,20 @@ SITES: dict[str, dict] = {
                 || document.querySelector('button[aria-label*="Send"]')
                 || document.querySelector('textarea')?.closest('form')?.querySelector('button')
         """),
+        "response_selectors": [
+            'div[data-message-author-role="assistant"]',
+            '.markdown',
+            'div[data-testid="conversation"] > div > div',
+        ],
+        "thinking_selectors": [
+            '[class*="thinking"]',
+            '[class*="reasoning"]',
+        ],
+        "loading_selectors": [
+            'button[data-testid="stop-button"]',
+            'button[aria-label*="Stop" i]',
+            '[class*="generating"]',
+        ],
     },
     "claude": {
         "url": "https://claude.ai/",
@@ -257,6 +266,20 @@ SITES: dict[str, dict] = {
                 || document.querySelector('button[class*="send"]')
                 || document.querySelector('[contenteditable="true"]')?.closest('form')?.querySelector('button')
         """),
+        "response_selectors": [
+            '[data-message-author-role="assistant"]',
+            '.assistant-message',
+            '[class*="assistant"] .message',
+        ],
+        "thinking_selectors": [
+            '[class*="thinking"]',
+            '[class*="reasoning"]',
+        ],
+        "loading_selectors": [
+            '[class*="loading"]',
+            '[class*="typing"]',
+            'button[aria-label*="Stop" i]',
+        ],
     },
     "deepseek": {
         "url": "https://chat.deepseek.com/",
@@ -265,6 +288,8 @@ SITES: dict[str, dict] = {
                 || document.querySelector('textarea')
                 || document.querySelector('div[contenteditable="true"]')
                 || document.querySelector('[contenteditable]')
+                || document.querySelector('input[type="text"]:not([placeholder*="Phone"]):not([placeholder*="Email"])')
+                || document.querySelector('input[type="text"]')
                 || document.querySelector('textarea[placeholder*="Ask"]')
         """),
         "submit_js": _submit_js(
@@ -279,8 +304,23 @@ SITES: dict[str, dict] = {
                     || document.querySelector('button[type="submit"]:not([disabled])')
                     || input?.parentElement?.querySelector('button:not([disabled])')
             """,
-            "document.querySelector('textarea, #chat-input, [contenteditable]')",
+            "document.querySelector('textarea, #chat-input, [contenteditable], input[type=\"text\"]')",
         ),
+        "response_selectors": [
+            '[data-message-author-role="assistant"]',
+            '.assistant-message',
+            '[class*="assistant"]',
+            'article .markdown',
+        ],
+        "thinking_selectors": [
+            '[class*="thinking"]',
+            '[class*="reasoning"]',
+        ],
+        "loading_selectors": [
+            '[class*="loading"]',
+            '[class*="typing"]',
+            'button[aria-label*="Stop" i]',
+        ],
     },
     "qwen": {
         "url": "https://chat.qwen.ai/",
@@ -295,6 +335,21 @@ SITES: dict[str, dict] = {
                 || document.querySelector('button[class*="send"]:not([disabled])')
                 || document.querySelector('textarea')?.closest('form')?.querySelector('button:not([disabled])')
         """),
+        "response_selectors": [
+            '[data-message-author-role="assistant"]',
+            '.assistant-message',
+            '[class*="assistant"]',
+            'article .markdown',
+        ],
+        "thinking_selectors": [
+            '[class*="thinking"]',
+            '[class*="reasoning"]',
+        ],
+        "loading_selectors": [
+            '[class*="loading"]',
+            '[class*="typing"]',
+            'button[aria-label*="Stop" i]',
+        ],
     },
     "grok": {
         "url": "https://grok.com/",
@@ -382,12 +437,30 @@ SITES: dict[str, dict] = {
             document.querySelector('textarea[placeholder*="Ask"]')
                 || document.querySelector('textarea[placeholder*="Send"]')
                 || document.querySelector('textarea')
+                || document.querySelector('.ProseMirror[contenteditable="true"]')
+                || document.querySelector('[contenteditable="true"]')
         """),
         "submit_js": _submit_js("""
             document.querySelector('button[aria-label*="Send"]')
                 || document.querySelector('button[class*="send"]')
                 || document.querySelector('textarea')?.closest('form')?.querySelector('button')
+                || document.querySelector('.ProseMirror')?.closest('form')?.querySelector('button')
         """),
+        "response_selectors": [
+            '[data-message-author-role="assistant"]',
+            '.assistant-message',
+            '[class*="assistant"]',
+            'article .markdown',
+        ],
+        "thinking_selectors": [
+            '[class*="thinking"]',
+            '[class*="reasoning"]',
+        ],
+        "loading_selectors": [
+            '[class*="loading"]',
+            '[class*="typing"]',
+            'button[aria-label*="Stop" i]',
+        ],
     },
     "kimi": {
         "url": "https://kimi.ai/",
@@ -430,12 +503,28 @@ SITES: dict[str, dict] = {
             document.querySelector('textarea[placeholder*="Ask"]')
                 || document.querySelector('textarea[placeholder*="Search"]')
                 || document.querySelector('textarea')
+                || document.querySelector('[contenteditable="true"]')
         """),
         "submit_js": _submit_js("""
             document.querySelector('button[aria-label*="Submit"]')
                 || document.querySelector('button[aria-label*="Send"]')
                 || document.querySelector('textarea')?.closest('form')?.querySelector('button')
         """),
+        "response_selectors": [
+            '[data-message-author-role="assistant"]',
+            '.assistant-message',
+            '[class*="assistant"]',
+            'article .markdown',
+        ],
+        "thinking_selectors": [
+            '[class*="thinking"]',
+            '[class*="reasoning"]',
+        ],
+        "loading_selectors": [
+            '[class*="loading"]',
+            '[class*="typing"]',
+            'button[aria-label*="Stop" i]',
+        ],
     },
     "poe": {
         "url": "https://poe.com/",
@@ -443,12 +532,28 @@ SITES: dict[str, dict] = {
             document.querySelector('textarea[placeholder*="Message"]')
                 || document.querySelector('textarea[placeholder*="Ask"]')
                 || document.querySelector('textarea')
+                || document.querySelector('[contenteditable="true"]')
         """),
         "submit_js": _submit_js("""
             document.querySelector('button[aria-label*="Send"]')
                 || document.querySelector('button[class*="send"]')
                 || document.querySelector('textarea')?.closest('form')?.querySelector('button')
         """),
+        "response_selectors": [
+            '[data-message-author-role="assistant"]',
+            '.assistant-message',
+            '[class*="assistant"]',
+            'article .markdown',
+        ],
+        "thinking_selectors": [
+            '[class*="thinking"]',
+            '[class*="reasoning"]',
+        ],
+        "loading_selectors": [
+            '[class*="loading"]',
+            '[class*="typing"]',
+            'button[aria-label*="Stop" i]',
+        ],
     },
     "cohere": {
         "url": "https://cohere.com/chat",
@@ -456,12 +561,28 @@ SITES: dict[str, dict] = {
             document.querySelector('textarea[placeholder*="Message"]')
                 || document.querySelector('textarea[placeholder*="Ask"]')
                 || document.querySelector('textarea')
+                || document.querySelector('[contenteditable="true"]')
         """),
         "submit_js": _submit_js("""
             document.querySelector('button[aria-label*="Send"]')
                 || document.querySelector('button[type="submit"]')
                 || document.querySelector('textarea')?.closest('form')?.querySelector('button')
         """),
+        "response_selectors": [
+            '[data-message-author-role="assistant"]',
+            '.assistant-message',
+            '[class*="assistant"]',
+            'article .markdown',
+        ],
+        "thinking_selectors": [
+            '[class*="thinking"]',
+            '[class*="reasoning"]',
+        ],
+        "loading_selectors": [
+            '[class*="loading"]',
+            '[class*="typing"]',
+            'button[aria-label*="Stop" i]',
+        ],
     },
     "zai": {
         "url": "https://chat.z.ai/",
@@ -508,9 +629,13 @@ SITES: dict[str, dict] = {
     "meta": {
         "url": "https://meta.ai/",
         "inject": _inject_js("""
-            document.querySelector('textarea[placeholder*="Ask"]')
-                || document.querySelector('textarea[placeholder*="Message"]')
+            document.querySelector('input[aria-label="Ask Meta AI"]')
+                || document.querySelector('input[placeholder*="Ask Meta AI"]')
+                || document.querySelector('input[placeholder*="Ask"]')
+                || document.querySelector('input[placeholder*="Message"]')
+                || document.querySelector('input[type="text"]')
                 || document.querySelector('textarea')
+                || document.querySelector('[contenteditable="true"]')
         """),
         "submit_js": _submit_js("""
             document.querySelector('button[aria-label*="Send"]')
@@ -542,6 +667,7 @@ SITES: dict[str, dict] = {
             document.querySelector('textarea[placeholder*="Message"]')
                 || document.querySelector('textarea[placeholder*="Ask"]')
                 || document.querySelector('textarea')
+                || document.querySelector('[contenteditable="true"]')
         """),
         "submit_js": _submit_js("""
             document.querySelector('button[aria-label*="Send"]')
@@ -549,6 +675,21 @@ SITES: dict[str, dict] = {
                 || document.querySelector('button[class*="send"]')
                 || document.querySelector('textarea')?.closest('form')?.querySelector('button')
         """),
+        "response_selectors": [
+            '[data-message-author-role="assistant"]',
+            '.assistant-message',
+            '[class*="assistant"]',
+            'article .markdown',
+        ],
+        "thinking_selectors": [
+            '[class*="thinking"]',
+            '[class*="reasoning"]',
+        ],
+        "loading_selectors": [
+            '[class*="loading"]',
+            '[class*="typing"]',
+            'button[aria-label*="Stop" i]',
+        ],
     },
     "tencent": {
         "url": "https://aistudio.tencent.ai/",
@@ -568,6 +709,21 @@ SITES: dict[str, dict] = {
                 || document.querySelector('button[type="submit"]')
                 || document.querySelector('textarea')?.closest('form')?.querySelector('button')
         """),
+        "response_selectors": [
+            '[data-message-author-role="assistant"]',
+            '.assistant-message',
+            '[class*="assistant"]',
+            'article .markdown',
+        ],
+        "thinking_selectors": [
+            '[class*="thinking"]',
+            '[class*="reasoning"]',
+        ],
+        "loading_selectors": [
+            '[class*="loading"]',
+            '[class*="typing"]',
+            'button[aria-label*="Stop" i]',
+        ],
     },
 }
 

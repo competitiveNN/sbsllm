@@ -270,7 +270,9 @@ class TestOpenAIHandlerChatCompletions:
                 mock_inject.return_value = "inject_js"
                 with patch("sbsllm.server.submit_js") as mock_submit_js:
                     mock_submit_js.return_value = "submit_js"
-                    OpenAIHandler._handle_chat_completions(handler)
+                    with patch("sbsllm.server.extract_js") as mock_extract:
+                        mock_extract.return_value = None
+                        OpenAIHandler._handle_chat_completions(handler)
 
         handler._send_json.assert_called_once()
         call_args = handler._send_json.call_args[0]
