@@ -28,9 +28,20 @@ _INJECT_TEMPLATE = """
                 document.execCommand('delete', false, null);
                 document.execCommand('insertText', false, value);
             } catch (_) {}
+            // execCommand may not work on all editors; ensure textContent is set
             if ((input.textContent || '') !== value) {
                 input.textContent = value;
             }
+            // contenteditable divs don't fire `input` events the way
+            // textarea/input do; dispatch both to be safe.
+            try {
+                input.dispatchEvent(new InputEvent('input', {
+                    bubbles: true, inputType: 'insertText', data: value
+                }));
+            } catch (_) {
+                input.dispatchEvent(new Event('input', { bubbles: true }));
+            }
+            input.dispatchEvent(new Event('change', { bubbles: true }));
         } else if (input instanceof HTMLTextAreaElement) {
             const setter = Object.getOwnPropertyDescriptor(
                 HTMLTextAreaElement.prototype, 'value'
@@ -108,8 +119,26 @@ _SUBMIT_TEMPLATE = """
             } catch (_) {}
             return 'OK';
         }
-        if (input && (input.tagName === 'TEXTAREA' || input.tagName === 'INPUT')) {
+        if (input && (input.tagName === 'TEXTAREA' || input.tagName === 'INPUT' || (input.isContentEditable === true) || input.getAttribute?.('contenteditable') === 'true')) {
             try {
+                // For contenteditable editors, dispatch Enter via key events
+                // (no form submit available). For textarea/input, prefer the
+                // form's submit event.
+                if (input.isContentEditable === true || input.getAttribute?.('contenteditable') === 'true') {
+                    input.dispatchEvent(new KeyboardEvent('keydown', {
+                        key: 'Enter', code: 'Enter', keyCode: 13, which: 13,
+                        bubbles: true, cancelable: true
+                    }));
+                    input.dispatchEvent(new KeyboardEvent('keypress', {
+                        key: 'Enter', code: 'Enter', keyCode: 13, which: 13,
+                        bubbles: true, cancelable: true
+                    }));
+                    input.dispatchEvent(new KeyboardEvent('keyup', {
+                        key: 'Enter', code: 'Enter', keyCode: 13, which: 13,
+                        bubbles: true, cancelable: true
+                    }));
+                    return 'ENTER_SENT_UNVERIFIED';
+                }
                 // Try to submit via form if available
                 if (form) {
                     form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
@@ -486,14 +515,16 @@ SITES: dict[str, dict] = {
                 || document.querySelector('textarea[placeholder*="What would you like to know"]')
                 || document.querySelector('textarea[placeholder*="Ask"]')
                 || document.querySelector('textarea')
+                || document.querySelector('div.chat-input-editor[contenteditable="true"]')
                 || document.querySelector('div[contenteditable="true"]')
         """),
         "submit_js": _submit_js("""
             document.querySelector('button[aria-label="Submit"]')
                 || document.querySelector('button.send')
                 || document.querySelector('button[type="submit"]:not([disabled])')
-                || document.querySelector('textarea.ph, textarea[name="message"], textarea')?.closest('form')?.querySelector('button:not([disabled])')
-        """, "document.querySelector('textarea.ph, textarea[name=\"message\"], textarea')"),
+                || document.querySelector('textarea.ph, textarea[name="message"], textarea, div.chat-input-editor')?.closest('form')?.querySelector('button:not([disabled])')
+                || document.querySelector('.chat-input-editor')?.parentElement?.querySelector('button:not([disabled])')
+        """, "document.querySelector('textarea.ph, textarea[name=\"message\"], textarea, div.chat-input-editor')"),
         "response_selectors": [
             '[data-role="assistant"]',
             '[data-message-author-role="assistant"]',
