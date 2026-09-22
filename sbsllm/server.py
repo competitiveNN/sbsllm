@@ -428,7 +428,6 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             "count": 0,
         }
         try:
-            extraction = extract_js(site_id)
             if extraction is None:
                 logger.warning(
                     "chat_completion extraction_unsupported",
