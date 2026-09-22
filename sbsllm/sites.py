@@ -201,7 +201,7 @@ _RESPONSE_TEMPLATE = """
                 }
             } catch (_) {}
         }
-        content = content.replace(/\s+/g, ' ').trim();
+        content = content.replace(/\\s+/g, ' ').trim();
         const workingMatch = content.match(/^Working for \\d+s/);
         const isWorking = workingMatch !== null;
         content = content.replace(/^Working for \\d+s\\s*/, '');
