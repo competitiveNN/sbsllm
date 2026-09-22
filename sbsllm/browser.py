@@ -578,6 +578,7 @@ def wait_for_response(
                 if stable_since is None:
                     stable_since = time.monotonic()
                 elif idle_timeout and time.monotonic() - stable_since >= idle_timeout:
+                    last["done"] = True
                     return last
             else:
                 stable_since = None
@@ -663,6 +664,36 @@ def check_page_health(page: Page) -> bool:
         return run_in_browser_thread(_do_check)
     except Exception:  # noqa: BLE001
         return False
+
+
+def get_page_snapshot(page: Page) -> dict:
+    """Capture a diagnostic snapshot of the page for error logging.
+
+    Returns a dict with url, title, and visible text preview.
+    Safe to call even on closed pages.
+    """
+    snapshot = {"url": None, "title": None, "text_preview": None}
+    if page.is_closed():
+        snapshot["error"] = "page closed"
+        return snapshot
+
+    def _do_snapshot() -> dict:
+        try:
+            url = page.url
+            title = page.title()
+            text = page.evaluate(
+                "() => document.body ? document.body.innerText.slice(0, 500) : ''"
+            )
+            return {"url": url, "title": title, "text_preview": text}
+        except Exception as e:  # noqa: BLE001
+            return {"error": str(e)}
+
+    try:
+        result = run_in_browser_thread(_do_snapshot)
+        snapshot.update(result)
+    except Exception as e:  # noqa: BLE001
+        snapshot["error"] = f"snapshot failed: {e}"
+    return snapshot
 
 
 def recover_page(url: str, chrome_bin: str | None = None) -> Page | None:

@@ -20,6 +20,7 @@ from .browser import (
     BrowserError,
     capture_response,
     check_page_health,
+    get_page_snapshot,
     inject_and_submit,
     wait_for_response,
 )
@@ -40,18 +41,21 @@ REQUEST_ID_HEADER = "X-Request-ID"
 _request_count = 0
 _request_latencies = []
 _error_count = 0
+_error_types: dict[str, int] = {}
 _metrics_lock = threading.Lock()
 
 
-def _update_metrics(elapsed: float, error: bool) -> None:
+def _update_metrics(elapsed: float, error: bool, error_type: str | None = None) -> None:
     """Update request metrics."""
     # ruff: noqa: PLW0602 - in-place modification of globals (ruff false positive)
-    global _request_count, _request_latencies, _error_count
+    global _request_count, _request_latencies, _error_count, _error_types
     with _metrics_lock:
         _request_count += 1
         _request_latencies.append(elapsed)
         if error:
             _error_count += 1
+            if error_type:
+                _error_types[error_type] = _error_types.get(error_type, 0) + 1
         # Keep only last 1000 latencies
         if len(_request_latencies) > 1000:
             _request_latencies.pop(0)
@@ -140,8 +144,11 @@ class OpenAIHandler(BaseHTTPRequestHandler):
 
     def _send_sse(self, data: str) -> None:
         """Write one server-sent event and flush it immediately."""
-        self.wfile.write(f"data: {data}\n\n".encode())
-        self.wfile.flush()
+        try:
+            self.wfile.write(f"data: {data}\n\n".encode())
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionError):
+            raise
 
     def _send_sse_headers(self, request_id: str) -> None:
         """Send headers for an OpenAI-compatible streaming response."""
@@ -213,6 +220,7 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         with _metrics_lock:
             request_count = _request_count
             error_count = _error_count
+            error_types = dict(_error_types)
             if _request_latencies:
                 avg_latency = sum(_request_latencies) / len(_request_latencies)
                 min_latency = min(_request_latencies)
@@ -232,6 +240,12 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             f"# TYPE sbsllm_errors_total counter\n"
             f"sbsllm_errors_total {error_count}\n"
         )
+        for err_type, count in sorted(error_types.items()):
+            metrics += (
+                f"# HELP sbsllm_errors_by_type_total Errors by type\n"
+                f"# TYPE sbsllm_errors_by_type_total counter\n"
+                f'sbsllm_errors_by_type_total{{type="{err_type}"}} {count}\n'
+            )
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; version=0.0.4")
         if request_id:
@@ -377,14 +391,26 @@ class OpenAIHandler(BaseHTTPRequestHandler):
     ) -> None:
         """Handle an SSE-streamed chat completion."""
         logger = logging.getLogger(__name__)
-        browser_lock, lock_acquired, _ = self._acquire_browser_lock()
+        browser_lock, lock_acquired, lock_timeout = self._acquire_browser_lock()
         if not lock_acquired:
+            logger.warning(
+                "chat_completion lock_acquired",
+                extra={
+                    "model": model,
+                    "tab_index": tab_index,
+                    "lock_timeout": lock_timeout,
+                    "request_id": request_id,
+                    "stream": True,
+                },
+            )
             self._send_error(
                 503,
-                "Server busy: could not acquire browser lock",
+                "Server busy: could not acquire browser lock within timeout. "
+                "Reduce concurrent requests or increase browser_lock_timeout.",
                 "server_error",
                 request_id,
             )
+            _update_metrics(time.monotonic() - request_start, error=True, error_type="lock_timeout")
             return
 
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
@@ -404,22 +430,45 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         try:
             extraction = extract_js(site_id)
             if extraction is None:
+                logger.warning(
+                    "chat_completion extraction_unsupported",
+                    extra={
+                        "model": model,
+                        "site_id": site_id,
+                        "tab_index": tab_index,
+                        "request_id": request_id,
+                        "stream": True,
+                    },
+                )
                 self._send_error(
                     502,
-                    f"Response extraction is not supported for site: {site_id}",
+                    f"Response extraction is not supported for site: {site_id}. "
+                    f"This site may require a login or page refresh.",
                     "server_error",
                     request_id,
                 )
+                _update_metrics(time.monotonic() - request_start, error=True, error_type="extraction_unsupported")
                 return
             baseline = capture_response(page, extraction)
             status = self._inject_and_submit(page, site_id, prompt, tab_index)
             if not isinstance(status, dict):
+                logger.error(
+                    "chat_completion invalid_status",
+                    extra={
+                        "model": model,
+                        "tab_index": tab_index,
+                        "request_id": request_id,
+                        "stream": True,
+                        "status": str(status),
+                    },
+                )
                 self._send_error(
                     500,
                     "Browser automation returned an invalid status",
                     "server_error",
                     request_id,
                 )
+                _update_metrics(time.monotonic() - request_start, error=True, error_type="invalid_status")
                 return
             browser_error = next(
                 (
@@ -431,21 +480,53 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                 None,
             )
             if browser_error:
-                self._send_error(
-                    502, f"Browser error: {browser_error}", "server_error", request_id
+                snapshot = get_page_snapshot(page)
+                logger.warning(
+                    "chat_completion browser_error",
+                    extra={
+                        "model": model,
+                        "tab_index": tab_index,
+                        "request_id": request_id,
+                        "stream": True,
+                        "error": browser_error,
+                        "page_url": snapshot.get("url"),
+                        "page_title": snapshot.get("title"),
+                    },
                 )
+                self._send_error(
+                    502,
+                    f"Browser error: {browser_error}. "
+                    f"Check the browser tab for CAPTCHA or login prompts.",
+                    "server_error",
+                    request_id,
+                )
+                _update_metrics(time.monotonic() - request_start, error=True, error_type="browser_error")
                 return
             if status.get("inject") != "OK" or status.get("submit") not in {
                 "OK",
                 "ENTER_SENT",
                 "ENTER_SENT_UNVERIFIED",
             }:
+                logger.warning(
+                    "chat_completion inject_submit_failed",
+                    extra={
+                        "model": model,
+                        "tab_index": tab_index,
+                        "request_id": request_id,
+                        "stream": True,
+                        "inject_status": status.get("inject"),
+                        "submit_status": status.get("submit"),
+                    },
+                )
                 self._send_error(
                     502,
-                    "Browser automation failed to inject or submit the prompt",
+                    f"Browser automation failed to inject or submit the prompt. "
+                    f"Inject: {status.get('inject', 'unknown')}, Submit: {status.get('submit', 'unknown')}. "
+                    f"Try refreshing the browser tab or restarting sbsllm.",
                     "server_error",
                     request_id,
                 )
+                _update_metrics(time.monotonic() - request_start, error=True, error_type="inject_submit_failed")
                 return
             if not extraction:
                 self._send_error(
@@ -454,13 +535,58 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                     "server_error",
                     request_id,
                 )
+                _update_metrics(time.monotonic() - request_start, error=True, error_type="extraction_unsupported")
                 return
 
             deadline = time.monotonic() + max(float(browser_timeout), 1.0)
+            idle_deadline = deadline
+            idle_timeout = min(float(browser_timeout), 10.0)
             self._send_sse_headers(request_id)
             headers_sent = True
             while time.monotonic() <= deadline:
                 response = capture_response(page, extraction)
+
+                # Check done condition even when content hasn't changed,
+                # so we don't miss a transition from loading -> idle.
+                if response.get("done") and self._is_new_response(response, baseline):
+                    content = response.get("content", "")
+                    thinking = response.get("thinking") or ""
+                    delta = {}
+                    if content and not role_sent:
+                        delta = {"role": "assistant", "content": content}
+                        role_sent = True
+                        last_emitted = content
+                    elif content != last_emitted:
+                        if content.startswith(last_emitted):
+                            delta_content = content[len(last_emitted) :]
+                        else:
+                            delta_content = content
+                        if delta_content:
+                            delta = {"content": delta_content}
+                        last_emitted = content
+                    if thinking and thinking != last_thinking:
+                        delta["thinking"] = thinking.removeprefix(last_thinking)
+                        last_thinking = thinking
+                    if delta:
+                        self._send_sse(
+                            json.dumps(
+                                {
+                                    "id": completion_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": model,
+                                    "choices": [
+                                        {
+                                            "index": 0,
+                                            "delta": delta,
+                                            "finish_reason": None,
+                                        }
+                                    ],
+                                }
+                            )
+                        )
+                    break
+
                 if not self._is_new_response(response, baseline):
                     time.sleep(0.25)
                     continue
@@ -510,6 +636,13 @@ class OpenAIHandler(BaseHTTPRequestHandler):
 
                 if response.get("done"):
                     break
+                # Track idle time: reset timer whenever content changes
+                if content != last_emitted or thinking != last_thinking:
+                    idle_deadline = time.monotonic() + idle_timeout
+                elif time.monotonic() >= idle_deadline and response.get("content"):
+                    # Content is stable for the idle window — treat as done
+                    response["done"] = True
+                    break
                 time.sleep(0.25)
 
             if not role_sent and response.get("content"):
@@ -551,8 +684,24 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             )
             self._send_sse("[DONE]")
             headers_sent = True
+        except (BrokenPipeError, ConnectionError) as e:
+            # Client disconnected mid-stream; log and exit silently
+            elapsed = time.monotonic() - request_start
+            logger.info(
+                "chat_completion client_disconnected",
+                extra={
+                    "model": model,
+                    "tab_index": tab_index,
+                    "duration_ms": int(elapsed * 1000),
+                    "request_id": request_id,
+                    "stream": True,
+                    "error": str(e),
+                },
+            )
+            _update_metrics(elapsed, error=True, error_type="client_disconnected")
         except BrowserError as e:
             elapsed = time.monotonic() - request_start
+            snapshot = get_page_snapshot(page)
             logger.warning(
                 "chat_completion request_end",
                 extra={
@@ -561,13 +710,16 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                     "status_code": 502,
                     "duration_ms": int(elapsed * 1000),
                     "error": str(e),
+                    "error_type": "browser_error",
                     "request_id": request_id,
                     "stream": True,
+                    "page_url": snapshot.get("url"),
+                    "page_title": snapshot.get("title"),
                 },
             )
-            _update_metrics(elapsed, error=True)
+            _update_metrics(elapsed, error=True, error_type="browser_error")
             if not headers_sent:
-                self._send_error(502, f"Browser error: {e}", "server_error", request_id)
+                self._send_error(502, f"Browser error: {e}. Try restarting the browser.", "server_error", request_id)
             else:
                 self._send_sse(
                     json.dumps(
@@ -590,6 +742,7 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                 self._send_sse("[DONE]")
         except Exception as e:  # noqa: BLE001
             elapsed = time.monotonic() - request_start
+            snapshot = get_page_snapshot(page)
             logger.error(
                 "chat_completion request_end",
                 extra={
@@ -598,11 +751,15 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                     "status_code": 500,
                     "duration_ms": int(elapsed * 1000),
                     "error": str(e),
+                    "error_type": type(e).__name__,
                     "request_id": request_id,
                     "stream": True,
+                    "page_url": snapshot.get("url"),
+                    "page_title": snapshot.get("title"),
                 },
+                exc_info=True,
             )
-            _update_metrics(elapsed, error=True)
+            _update_metrics(elapsed, error=True, error_type=type(e).__name__)
             if not headers_sent:
                 self._send_error(500, f"Internal error: {e}", "server_error", request_id)
             else:
@@ -764,14 +921,26 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             return
 
         # Serialize browser automation: Playwright pages are not thread-safe.
-        browser_lock, lock_acquired, _ = self._acquire_browser_lock()
+        browser_lock, lock_acquired, lock_timeout = self._acquire_browser_lock()
         if not lock_acquired:
+            logger.warning(
+                "chat_completion lock_acquired",
+                extra={
+                    "model": model,
+                    "tab_index": tab_index,
+                    "lock_timeout": lock_timeout,
+                    "request_id": request_id,
+                    "stream": False,
+                },
+            )
             self._send_error(
                 503,
-                "Server busy: could not acquire browser lock",
+                "Server busy: could not acquire browser lock within timeout. "
+                "Reduce concurrent requests or increase browser_lock_timeout.",
                 "server_error",
                 request_id,
             )
+            _update_metrics(time.monotonic() - request_start, error=True, error_type="lock_timeout")
             return
 
         status = None
@@ -795,6 +964,7 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                 )
         except BrowserError as e:
             elapsed = time.monotonic() - request_start
+            snapshot = get_page_snapshot(page)
             logger.warning(
                 "chat_completion request_end",
                 extra={
@@ -803,14 +973,18 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                     "status_code": 502,
                     "duration_ms": int(elapsed * 1000),
                     "error": str(e),
+                    "error_type": "browser_error",
                     "request_id": request_id,
+                    "page_url": snapshot.get("url"),
+                    "page_title": snapshot.get("title"),
                 },
             )
-            _update_metrics(elapsed, error=True)
-            self._send_error(502, f"Browser error: {e}", "server_error", request_id)
+            _update_metrics(elapsed, error=True, error_type="browser_error")
+            self._send_error(502, f"Browser error: {e}. Try restarting the browser.", "server_error", request_id)
             return
         except Exception as e:  # noqa: BLE001
             elapsed = time.monotonic() - request_start
+            snapshot = get_page_snapshot(page)
             logger.error(
                 "chat_completion request_end",
                 extra={
@@ -819,22 +993,36 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                     "status_code": 500,
                     "duration_ms": int(elapsed * 1000),
                     "error": str(e),
+                    "error_type": type(e).__name__,
                     "request_id": request_id,
+                    "page_url": snapshot.get("url"),
+                    "page_title": snapshot.get("title"),
                 },
+                exc_info=True,
             )
-            _update_metrics(elapsed, error=True)
+            _update_metrics(elapsed, error=True, error_type=type(e).__name__)
             self._send_error(500, f"Internal error: {e}", "server_error", request_id)
             return
         finally:
             self._release_browser_lock(browser_lock)
 
         if not isinstance(status, dict):
+            logger.error(
+                "chat_completion invalid_status",
+                extra={
+                    "model": model,
+                    "tab_index": tab_index,
+                    "request_id": request_id,
+                    "status": str(status),
+                },
+            )
             self._send_error(
                 500,
                 "Browser automation returned an invalid status",
                 "server_error",
                 request_id,
             )
+            _update_metrics(time.monotonic() - request_start, error=True, error_type="invalid_status")
             return
         browser_error = next(
             (
@@ -846,15 +1034,41 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             None,
         )
         if browser_error:
-            self._send_error(
-                502, f"Browser error: {browser_error}", "server_error", request_id
+            snapshot = get_page_snapshot(page)
+            logger.warning(
+                "chat_completion browser_error",
+                extra={
+                    "model": model,
+                    "tab_index": tab_index,
+                    "request_id": request_id,
+                    "error": browser_error,
+                    "page_url": snapshot.get("url"),
+                    "page_title": snapshot.get("title"),
+                },
             )
+            self._send_error(
+                502,
+                f"Browser error: {browser_error}. Check the browser tab for CAPTCHA or login prompts.",
+                "server_error",
+                request_id,
+            )
+            _update_metrics(time.monotonic() - request_start, error=True, error_type="browser_error")
             return
         if status.get("inject") != "OK" or status.get("submit") not in {
             "OK",
             "ENTER_SENT",
             "ENTER_SENT_UNVERIFIED",
         }:
+            logger.warning(
+                "chat_completion inject_submit_failed",
+                extra={
+                    "model": model,
+                    "tab_index": tab_index,
+                    "request_id": request_id,
+                    "inject_status": status.get("inject"),
+                    "submit_status": status.get("submit"),
+                },
+            )
             if status.get("inject") != "OK":
                 content = f"Failed to inject prompt: {status['inject']}"
             else:
@@ -890,22 +1104,40 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                     "server_error",
                     request_id,
                 )
+                _update_metrics(time.monotonic() - request_start, error=True, error_type="extraction_unsupported")
                 return
             if response_result.get("timed_out"):
                 self._send_error(
                     504,
-                    "Request timeout: assistant response was not completed",
+                    "Request timeout: assistant response was not completed. "
+                    "The chat may be slow or stuck. Try again or refresh the page.",
                     "server_error",
                     request_id,
                 )
+                _update_metrics(time.monotonic() - request_start, error=True, error_type="timeout")
                 return
             if not response_result.get("found"):
+                snapshot = get_page_snapshot(page)
+                logger.warning(
+                    "chat_completion no_response",
+                    extra={
+                        "model": model,
+                        "tab_index": tab_index,
+                        "request_id": request_id,
+                        "page_url": snapshot.get("url"),
+                        "page_title": snapshot.get("title"),
+                        "page_text_preview": snapshot.get("text_preview", "")[:200],
+                    },
+                )
                 self._send_error(
                     504,
-                    "No assistant response was detected after submission",
+                    "No assistant response was detected after submission. "
+                    "The chat may have encountered an error or is still loading. "
+                    "Check the browser tab for error messages.",
                     "server_error",
                     request_id,
                 )
+                _update_metrics(time.monotonic() - request_start, error=True, error_type="no_response")
                 return
             content = response_result.get("content", "")
         else:

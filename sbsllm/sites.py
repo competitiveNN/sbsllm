@@ -18,6 +18,10 @@ _INJECT_TEMPLATE = """
         if (!(input instanceof HTMLTextAreaElement || isTextInput || isEditable)) {
             return 'NO_INPUT';
         }
+        // Prevent double submission: clear any previous sbsllm marker
+        if (input.dataset.sbsllmInput === 'true') {
+            return 'OK';
+        }
         input.focus();
         if (isEditable) {
             try {
@@ -53,7 +57,7 @@ _INJECT_TEMPLATE = """
         input.dispatchEvent(new Event('change', { bubbles: true }));
         return 'OK';
     })()
-"""
+    """
 
 _SUBMIT_TEMPLATE = """
     (() => {
@@ -63,6 +67,20 @@ _SUBMIT_TEMPLATE = """
             delete input.dataset.sbsllmInput;
         }
         const form = input?.closest('form');
+        // Helper to check if a button looks like a file upload button
+        const isUploadButton = (btn) => {
+            const id = (btn.id || '').toLowerCase();
+            const cls = (btn.className || '').toLowerCase();
+            const aria = (btn.getAttribute('aria-label') || '').toLowerCase();
+            const title = (btn.getAttribute('title') || '').toLowerCase();
+            const text = (btn.textContent || '').toLowerCase();
+            return id.includes('upload') || id.includes('attach') || id.includes('file')
+                || cls.includes('upload') || cls.includes('attach')
+                || aria.includes('upload') || aria.includes('attach')
+                || title.includes('upload') || title.includes('attach')
+                || text.includes('upload') || text.includes('attach')
+                || text.includes('file');
+        };
         const candidates = [
             __BUTTON_SELECTORS__,
             document.querySelector('button[type="submit"]:not([disabled])'),
@@ -70,16 +88,35 @@ _SUBMIT_TEMPLATE = """
             input?.parentElement?.querySelector('button:not([disabled])'),
         ];
         const btn = candidates.find((candidate) =>
-            candidate && !candidate.disabled && candidate.getAttribute?.('aria-disabled') !== 'true'
+            candidate && !candidate.disabled && !isUploadButton(candidate)
+                && candidate.getAttribute?.('aria-disabled') !== 'true'
         );
-        if (btn) { btn.click(); return 'OK'; }
+        if (btn) {
+            // Prevent double submission: mark as submitted and block form events
+            window.sbsllm_submitted = true;
+            // For submit-type buttons in forms, prevent the form's native
+            // submit handler from also firing after the click.
+            // We do this by temporarily disabling the button after click.
+            try {
+                btn.disabled = true;
+                btn.setAttribute('aria-disabled', 'true');
+            } catch (_) {}
+            btn.click();
+            return 'OK';
+        }
+        // If a button was already clicked, don't fall through to form submit
+        // or Enter key events (prevents double-send on sites like meta.ai
+        // where button click also triggers form submission)
+        if (window.sbsllm_submitted) {
+            return 'OK';
+        }
         try {
-            if (form?.requestSubmit) { form.requestSubmit(); return 'OK'; }
+            if (form?.requestSubmit && !window.sbsllm_submitted) { form.requestSubmit(); return 'OK'; }
         } catch (_) {}
         if (input) {
             try {
                 // Try to submit via form if available
-                if (form) {
+                if (form && !window.sbsllm_submitted) {
                     form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
                     return 'ENTER_SENT';
                 }
@@ -153,15 +190,23 @@ _RESPONSE_TEMPLATE = """
         const loading = matches(loadingSelectors).filter(isVisible);
         const response = responses.at(-1) || null;
         const thinkingText = thinking.map(textOf).filter(Boolean).join('\\n\\n').trim();
+        // Strip "Working for Xs" prefix that appears during streaming.
+        // Also treat content starting with "Working for" as still loading.
+        let content = textOf(response);
+        const workingMatch = content.match(/^Working for \\d+s/);
+        const isWorking = workingMatch !== null;
+        content = content.replace(/^Working for \\d+s\\s*/, '');
+        // Also strip any remaining "Worked for Xs" or similar timing prefixes
+        content = content.replace(/^Worked for \\d+s\\s*/, '');
         return {
             found: response !== null,
-            content: textOf(response),
+            content: content,
             thinking: thinkingText || null,
-            done: response !== null && loading.length === 0,
+            done: response !== null && loading.length === 0 && !isWorking,
             count: responses.length,
         };
     })()
-"""
+    """
 
 
 def _response_js(
@@ -245,9 +290,10 @@ SITES: dict[str, dict] = {
                 || document.querySelector('textarea')
         """),
         "submit_js": _submit_js("""
-            document.querySelector('button[aria-label*="Send"]')
-                || document.querySelector('button[class*="send"]')
-                || document.querySelector('textarea')?.closest('div')?.querySelector('button')
+            document.querySelector('button[aria-label="Send"]:not([disabled])')
+                || document.querySelector('button[aria-label*="Send"]:not([disabled])')
+                || document.querySelector('button[class*="send"]:not([disabled])')
+                || document.querySelector('textarea')?.closest('form')?.querySelector('button:not([disabled])')
         """),
     },
     "grok": {
@@ -261,19 +307,18 @@ SITES: dict[str, dict] = {
                 || document.querySelector('textarea')
         """),
         "submit_js": _submit_js("""
-            document.querySelector('button[aria-label="Submit"]')
-                || document.querySelector('button[aria-label*="Send message" i]')
-                || document.querySelector('button[aria-label*="Send" i]')
-                || document.querySelector('button[data-testid*="send" i]')
-                || document.querySelector('button[data-testid*="submit" i]')
+            document.querySelector('button[data-testid="chat-submit"]:not([disabled])')
+                || document.querySelector('button[aria-label="Submit"]:not([disabled])')
+                || document.querySelector('button[data-testid*="send" i]:not([disabled])')
+                || document.querySelector('button[data-testid*="submit" i]:not([disabled])')
+                || document.querySelector('button[aria-label*="Send" i]:not([disabled])')
                 || document.querySelector('button[type="submit"]:not([disabled])')
                 || document.querySelector('.tiptap, [contenteditable], textarea')?.closest('form')?.querySelector('button:not([disabled])')
         """, "document.querySelector('.tiptap, [contenteditable], textarea')"),
         "response_selectors": [
-            '[data-testid="assistant-message"]',
-            '[data-message-author-role="assistant"]',
-            '[class*="assistant-message"]',
-            '[class*="assistant"]',
+            '[data-testid="user-message"] ~ .message-bubble',
+            '.message-bubble:not([data-testid="user-message"])',
+            'div[class*="prose-chat"]',
         ],
         "thinking_selectors": [
             '[data-testid*="thinking"]',
@@ -285,6 +330,8 @@ SITES: dict[str, dict] = {
             '[class*="typing"]',
             '[class*="generating"]',
             'button[aria-label*="Stop" i]',
+            '[class*="working"]',
+            '[class*="streaming"]',
         ],
     },
     "google": {
@@ -306,8 +353,12 @@ SITES: dict[str, dict] = {
                 || document.querySelector('button[aria-label*="Run" i]')
                 || document.querySelector('button[aria-label*="Send" i]')
                 || document.querySelector('button[aria-label*="Submit" i]')
+                || document.querySelector('button[class*="build-button"]:not([disabled])')
+                || document.querySelector('button[class*="ms-button-primary"]:not([disabled])')
                 || document.querySelector('button[type="submit"]:not([disabled])')
                 || document.querySelector('ms-prompt-box textarea')?.closest('form')?.querySelector('button:not([disabled])')
+                || document.querySelector('ms-prompt-box textarea')?.parentElement?.querySelector('button:not([disabled])')
+                || document.querySelector('ms-prompt-box textarea')?.parentElement?.parentElement?.querySelector('button:not([disabled])')
         """, "document.querySelector('ms-prompt-box textarea, textarea')"),
         "response_selectors": [
             'ms-chat-turn .chat-turn-container.model',
@@ -421,19 +472,27 @@ SITES: dict[str, dict] = {
                 || document.querySelector('textarea')
         """),
         "submit_js": _submit_js("""
-            document.querySelector('button#send-message-button')
-                || document.querySelector('button[aria-label*="Send" i]')
-                || document.querySelector('button[aria-label*="Submit" i]')
-                || document.querySelector('button[type="submit"]:not([disabled])')
-                || document.querySelector('textarea#chat-input')?.closest('form')?.querySelector('button:not([disabled])')
+            // Must check for actual send button first to avoid file upload buttons
+            document.querySelector('button#send-message-button:not([disabled])')
+                || document.querySelector('button#send-message-button:not([class*="upload"]):not([class*="image"])')
+                || document.querySelector('button[aria-label="Send"]:not([disabled]):not([class*="upload"]):not([class*="image"])')
+                || document.querySelector('button[data-testid="send-message-button"]:not([disabled])')
+                || document.querySelector('button[class*="send"]:not([disabled]):not([class*="upload"]):not([class*="image"])')
+                // Fallback: find submit button in form that is not upload/attach
+                || form?.querySelector('button[type="submit"]:not([disabled]):not([id*="upload"]):not([id*="attach"]):not([id*="file"])')
+                || form?.querySelector('button[type="submit"]:not([disabled])')
         """, "document.querySelector('textarea#chat-input, textarea')"),
         "response_selectors": [
+            '#response-content-container',
             '[data-message-author-role="assistant"]',
-            '[class*="assistant"]',
-            '.message:not(.user)',
+            '.message.assistant .markdown',
+            '.chat-assistant .markdown',
+            '.assistant-message .markdown',
             'article .markdown',
         ],
         "thinking_selectors": [
+            '.thinking-block',
+            '.thinking-chain-container',
             '[class*="thinking"]',
             '[class*="reasoning"]',
             '[data-testid*="thinking"]',
@@ -443,6 +502,7 @@ SITES: dict[str, dict] = {
             '[class*="typing"]',
             '[class*="generating"]',
             'button[aria-label*="Stop" i]',
+            '#send-message-button[disabled]',
         ],
     },
     "meta": {
@@ -457,6 +517,24 @@ SITES: dict[str, dict] = {
                 || document.querySelector('button[class*="send"]')
                 || document.querySelector('textarea')?.closest('form')?.querySelector('button')
         """),
+        "response_selectors": [
+            '[data-testid="ai-message"]',
+            '[data-message-author-role="assistant"]',
+            '.assistant-message',
+            '[class*="assistant-message"]',
+            'article .markdown',
+        ],
+        "thinking_selectors": [
+            '[class*="thinking"]',
+            '[class*="reasoning"]',
+            '[data-testid*="thinking"]',
+        ],
+        "loading_selectors": [
+            '[class*="loading"]',
+            '[class*="typing"]',
+            '[class*="generating"]',
+            'button[aria-label*="Stop" i]',
+        ],
     },
     "huggingface": {
         "url": "https://huggingface.co/chat",

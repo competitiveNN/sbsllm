@@ -336,7 +336,7 @@ class TestOpenAIHandlerChatCompletions:
                 OpenAIHandler._handle_chat_completions(handler)
 
         handler._send_error.assert_called_once_with(
-            502, "Browser error: fail", "server_error", "test-request-id"
+            502, "Browser error: fail. Try restarting the browser.", "server_error", "test-request-id"
         )
 
     def test_browser_page_error_returns_502(self):
