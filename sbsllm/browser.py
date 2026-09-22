@@ -571,7 +571,9 @@ def wait_for_response(
     }
     while time.monotonic() <= deadline:
         last = capture_response(page, extract_js)
-        if _is_new_response(last, baseline) and last["done"]:
+        # Check done even when content hasn't changed, so we don't miss
+        # a transition from loading -> idle where content is identical.
+        if last.get("done") and _is_new_response(last, baseline):
             return last
         if last["found"] and last.get("content"):
             if previous is not None and last == previous:
