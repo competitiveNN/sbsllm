@@ -188,6 +188,20 @@ _RESPONSE_TEMPLATE = """
         // Strip "Working for Xs" prefix that appears during streaming.
         // Also treat content starting with "Working for" as still loading.
         let content = textOf(response);
+        // Remove thinking-chain text that some sites embed inside the
+        // response container (e.g. z.ai puts "Thought Process" in
+        // .thinking-chain-container which lives within .markdown-prose).
+        if (response) {
+            try {
+                const thinkingInResponse = response.querySelectorAll(
+                    thinkingSelectors.join(',')
+                );
+                for (const el of thinkingInResponse) {
+                    content = content.replace(textOf(el), '');
+                }
+            } catch (_) {}
+        }
+        content = content.replace(/\s+/g, ' ').trim();
         const workingMatch = content.match(/^Working for \\d+s/);
         const isWorking = workingMatch !== null;
         content = content.replace(/^Working for \\d+s\\s*/, '');
@@ -606,6 +620,7 @@ SITES: dict[str, dict] = {
                 || form?.querySelector('button[type="submit"]:not([disabled])')
         """, "document.querySelector('textarea#chat-input, textarea')"),
         "response_selectors": [
+            '#response-content-container .markdown-prose',
             '#response-content-container',
             '[data-message-author-role="assistant"]',
             '.message.assistant .markdown',
