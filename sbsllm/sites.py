@@ -358,6 +358,7 @@ SITES: dict[str, dict] = {
                 || document.querySelector('div[contenteditable="true"][data-lexical-editor="true"]')
                 || document.querySelector('div[role="textbox"][contenteditable="true"]')
                 || document.querySelector('div[contenteditable="true"]')
+                || document.querySelector('textarea[class*="prose"]')
                 || document.querySelector('textarea[placeholder*="Ask" i]')
                 || document.querySelector('textarea')
         """),
@@ -371,8 +372,9 @@ SITES: dict[str, dict] = {
                 || document.querySelector('.tiptap, [contenteditable], textarea')?.closest('form')?.querySelector('button:not([disabled])')
         """, "document.querySelector('.tiptap, [contenteditable], textarea')"),
         "response_selectors": [
-            '[data-testid="user-message"] ~ .message-bubble',
             '.message-bubble:not([data-testid="user-message"])',
+            '[data-testid="assistant-message"]',
+            '[data-message-author-role="assistant"]',
             'div[class*="prose-chat"]',
         ],
         "thinking_selectors": [
