@@ -230,6 +230,9 @@ _RESPONSE_TEMPLATE = """
                 }
             } catch (_) {}
         }
+        // Also strip the "Thought Process" header label that z.ai renders
+        // inside the thinking-chain-container (the button text).
+        content = content.replace(/Thought Process\\s*/gi, '');
         content = content.replace(/\\s+/g, ' ').trim();
         const workingMatch = content.match(/^Working for \\d+s/);
         const isWorking = workingMatch !== null;
@@ -640,7 +643,9 @@ SITES: dict[str, dict] = {
                 || document.querySelector('textarea')
         """),
         "submit_js": _submit_js("""
-            // Must check for actual send button first to avoid file upload buttons
+            // z.ai's send button is a custom element that may not respond to
+            // synthetic click events reliably. Prefer Enter-key dispatch on
+            // the textarea, which is the most reliable path for React SPA.
             document.querySelector('button#send-message-button:not([disabled])')
                 || document.querySelector('button#send-message-button:not([class*="upload"]):not([class*="image"])')
                 || document.querySelector('button[aria-label="Send"]:not([disabled]):not([class*="upload"]):not([class*="image"])')
@@ -658,6 +663,14 @@ SITES: dict[str, dict] = {
             '.chat-assistant .markdown',
             '.assistant-message .markdown',
             'article .markdown',
+            # Fallbacks from external automation scripts
+            'div[class*="prose"]',
+            'div[class*="markdown"]',
+            'div[class*="chat-assistant"]',
+            'div[class*="response"]',
+            '[data-message-role="assistant"]',
+            'div.chat-message',
+            'div[id*="message"]',
         ],
         "thinking_selectors": [
             '.thinking-block',
@@ -671,7 +684,10 @@ SITES: dict[str, dict] = {
             '[class*="typing"]',
             '[class*="generating"]',
             'button[aria-label*="Stop" i]',
-            '#send-message-button[disabled]',
+            # NOTE: #send-message-button[disabled] is intentionally omitted —
+            # the button is disabled whenever the input is empty, which
+            # happens after every sent message. Including it would keep
+            # `done` false forever.
         ],
     },
     "meta": {
