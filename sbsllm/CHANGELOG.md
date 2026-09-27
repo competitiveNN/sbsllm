@@ -4,6 +4,9 @@
 
 ### Fixed
 
+- **Non-streaming path returned a fake "Prompt sent to X successfully" message**
+  when extraction was unsupported, which the local chat rendered as the
+  assistant's answer. Now returns a visible 502 error instead.
 - **z.ai thinking leaked into content.** The extraction prune fallback
   (`if prunedText) content = prunedText`) fell back to the unpruned text during
   z.ai's empty thinking phase, injecting reasoning into `content`. The local chat
