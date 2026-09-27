@@ -328,3 +328,63 @@ class TestZaiLoadingDots:
         """
         result = _extract(extract_page, html)
         assert result["login_wall"] is False
+
+    def test_login_wall_pattern_sign_in_to_continue(self, extract_page):
+        """'Sign in to continue' is a login-wall signal."""
+        html = """
+        <div id="response-content-container">
+            <div class="markdown-prose"><p>hello</p></div>
+        </div>
+        <div>Sign in to continue using X</div>
+        """
+        result = _extract(extract_page, html)
+        assert result["login_wall"] is True
+
+    def test_login_wall_pattern_please_log_in(self, extract_page):
+        """'Please log in to continue' is a login-wall signal."""
+        html = """
+        <div id="response-content-container">
+            <div class="markdown-prose"><p>hello</p></div>
+        </div>
+        <div>Please log in to continue</div>
+        """
+        result = _extract(extract_page, html)
+        assert result["login_wall"] is True
+
+    def test_login_wall_pattern_login_to_continue(self, extract_page):
+        """'Login to continue' is a login-wall signal."""
+        html = """
+        <div id="response-content-container">
+            <div class="markdown-prose"><p>hello</p></div>
+        </div>
+        <div>Login to continue your session</div>
+        """
+        result = _extract(extract_page, html)
+        assert result["login_wall"] is True
+
+    def test_login_wall_pattern_must_be_logged_in(self, extract_page):
+        """'You must be logged in' is a login-wall signal."""
+        html = """
+        <div id="response-content-container">
+            <div class="markdown-prose"><p>hello</p></div>
+        </div>
+        <div>You must be logged in to use this feature</div>
+        """
+        result = _extract(extract_page, html)
+        assert result["login_wall"] is True
+
+    def test_login_wall_does_not_false_positive_on_footer(self, extract_page):
+        """A normal footer with 'Terms of Service' and 'Privacy Policy'
+        must NOT trigger a login wall."""
+        html = """
+        <div id="response-content-container">
+            <div class="markdown-prose"><p>42</p></div>
+        </div>
+        <footer>
+            <a>Terms of Service</a>
+            <a>Privacy Policy</a>
+            <a>Contact us</a>
+        </footer>
+        """
+        result = _extract(extract_page, html)
+        assert result["login_wall"] is False
