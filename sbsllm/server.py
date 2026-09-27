@@ -1414,8 +1414,20 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                 _update_metrics(time.monotonic() - request_start, error=True, error_type="no_response")
                 return
             content = response_result.get("content", "")
+            thinking = response_result.get("thinking") or ""
         else:
-            content = f"Prompt sent to {site_id} successfully."
+            # No extraction for this site — surface a visible error instead of
+            # returning a fake "Prompt sent to X successfully" message, which
+            # the local chat would render as the assistant's answer.
+            self._send_error(
+                502,
+                f"Response extraction is not supported for site: {site_id}. "
+                f"This site may require a login or page refresh.",
+                "server_error",
+                request_id,
+            )
+            _update_metrics(time.monotonic() - request_start, error=True, error_type="extraction_unsupported")
+            return
 
         response = {
             "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
@@ -1439,8 +1451,8 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             },
             "request_id": request_id,
         }
-        if response_result is not None and response_result.get("thinking"):
-            response["thinking"] = response_result["thinking"]
+        if thinking:
+            response["thinking"] = thinking
 
         elapsed = time.monotonic() - request_start
         logger.info(

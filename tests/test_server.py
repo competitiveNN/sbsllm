@@ -276,15 +276,14 @@ class TestOpenAIHandlerChatCompletions:
                         mock_extract.return_value = None
                         OpenAIHandler._handle_chat_completions(handler)
 
-        handler._send_json.assert_called_once()
-        call_args = handler._send_json.call_args[0]
-        assert call_args[0] == 200
-        data = call_args[1]
-        assert data["object"] == "chat.completion"
-        assert data["model"] == "gpt-4"
-        assert data["choices"][0]["message"]["role"] == "assistant"
-        assert "sent to chatgpt" in data["choices"][0]["message"]["content"]
-        assert data.get("request_id") == "test-request-id"
+        # No extraction JS for this site → visible 502, not a fake
+        # "Prompt sent to X successfully" answer.
+        handler._send_error.assert_called_once()
+        call_args = handler._send_error.call_args[0]
+        assert call_args[0] == 502
+        assert "extraction is not supported" in call_args[1].lower()
+        assert call_args[2] == "server_error"
+        assert call_args[3] == "test-request-id"
 
     def test_inject_failure(self):
         body = json.dumps(
