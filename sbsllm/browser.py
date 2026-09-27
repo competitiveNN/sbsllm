@@ -30,6 +30,11 @@ RETRY_JITTER = 0.1  # seconds
 
 # Timeout for browser queue operations (seconds)
 BROWSER_OPERATION_TIMEOUT = 120
+# Upper bound for a single response-extraction poll (seconds). page.evaluate()
+# takes no timeout of its own, so a page with a stalled main thread blocks
+# forever; this bound makes such a poll fail fast and lets the request end
+# with a terminal chunk instead of holding the browser lock.
+CAPTURE_TIMEOUT = 15.0
 
 # Global browser state
 _context: BrowserContext | None = None
@@ -118,7 +123,12 @@ def _stop_browser_worker(timeout: float = 5.0) -> None:
             _browser_thread = None
 
 
-def run_in_browser_thread(func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+def run_in_browser_thread(
+    func: Callable[..., Any],
+    *args: Any,
+    operation_timeout: float | None = None,
+    **kwargs: Any,
+) -> Any:
     """Execute a function on the Playwright browser worker thread.
 
     Playwright pages are not thread-safe; all Playwright API calls must run
@@ -128,29 +138,42 @@ def run_in_browser_thread(func: Callable[..., Any], *args: Any, **kwargs: Any) -
     Args:
         func: The function to execute on the browser thread.
         *args: Positional arguments to pass to func.
+        operation_timeout: Seconds to wait for completion. Defaults to
+            BROWSER_OPERATION_TIMEOUT. Polling calls that can block on a
+            stalled page (e.g. page.evaluate, which takes no timeout of its
+            own) should pass a tighter bound. Named distinctly from a plain
+            `timeout` so it cannot shadow a wrapped function's own kwarg.
         **kwargs: Keyword arguments to pass to func.
 
     Returns:
         The return value of func.
 
     Raises:
-        RuntimeError: If the operation times out.
+        BrowserOperationTimeout: If the operation exceeds its deadline. The
+            worker thread is still blocked in `func`, so the browser will not
+            recover on its own and sbsllm must be restarted.
+        RuntimeError: If the worker thread dies mid-operation.
         Any exception raised by func.
     """
     if _is_browser_thread():
         return func(*args, **kwargs)
 
+    wait_for = (
+        BROWSER_OPERATION_TIMEOUT
+        if operation_timeout is None
+        else float(operation_timeout)
+    )
     worker = _start_browser_worker()
     event = threading.Event()
     result_holder: list[tuple[str, Any]] = []
     _browser_queue.put((func, args, kwargs, event, result_holder))
-    deadline = time.monotonic() + BROWSER_OPERATION_TIMEOUT
+    deadline = time.monotonic() + wait_for
     while not event.wait(timeout=0.1):
         if not worker.is_alive():
             raise RuntimeError("Browser worker stopped before completing the operation")
         if time.monotonic() >= deadline:
-            raise RuntimeError(
-                f"Browser operation timed out after {BROWSER_OPERATION_TIMEOUT}s"
+            raise BrowserOperationTimeout(
+                f"Browser operation timed out after {wait_for:g}s"
             )
     if not result_holder:
         raise RuntimeError("Browser operation completed without result")
@@ -228,6 +251,16 @@ def retry_with_backoff(
 
 class BrowserError(Exception):
     """Raised when a browser operation fails."""
+
+
+class BrowserOperationTimeout(RuntimeError):
+    """A queued browser operation did not finish within its deadline.
+
+    Subclasses RuntimeError so existing callers that guard against a wedged
+    browser keep working, but stays distinct from a genuine internal error.
+    Note this means the worker thread is still blocked in the call: the
+    browser will not recover on its own and sbsllm must be restarted.
+    """
 
 
 def setup_logging(
@@ -398,7 +431,7 @@ def _close_blank_pages(browser: BrowserContext, keep_page: Page | None = None) -
             pass
 
 
-def _do_open_page(url: str, chrome_bin: str | None = None) -> Page:
+def _do_open_page(url: str, chrome_bin: str | None = None, setup_js: str | None = None) -> Page:
     """Open a URL on the Playwright browser thread."""
     browser = ensure_browser(chrome_bin)
     page = _find_blank_page(browser)
@@ -430,15 +463,23 @@ def _do_open_page(url: str, chrome_bin: str | None = None) -> Page:
         logger.error(f"Failed to open page: {url} - {e}")
         raise BrowserError(f"Failed to open page: {url} - {e}") from e
 
+    # Run site-specific setup (e.g. set Deep Think level on z.ai) after load.
+    if setup_js:
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=5000)
+            page.evaluate(setup_js)
+        except Exception:
+            logger.debug("setup_js failed for %s", url, exc_info=True)
+
     _close_blank_pages(browser, keep_page=page)
     return page
 
 
-def open_page(url: str, chrome_bin: str | None = None) -> Page:
+def open_page(url: str, chrome_bin: str | None = None, setup_js: str | None = None) -> Page:
     """Open a URL in a new page/tab. Returns the page."""
     if _is_browser_thread():
-        return _do_open_page(url, chrome_bin)
-    return run_in_browser_thread(_do_open_page, url, chrome_bin)
+        return _do_open_page(url, chrome_bin, setup_js)
+    return run_in_browser_thread(_do_open_page, url, chrome_bin, setup_js)
 
 
 def close_browser() -> None:
@@ -485,6 +526,10 @@ def _do_run_js(page: Page, js: str) -> str:
 
 
 def _do_run_js_value(page: Page, js: str) -> Any:
+    # NOTE: page.evaluate() accepts no timeout and page.set_default_timeout()
+    # does not bound it (verified: a promise that never settles hangs the
+    # call indefinitely). A stalled page main thread is bounded by
+    # run_in_browser_thread's deadline in run_js_value instead.
     try:
         return page.evaluate(js)
     except PlaywrightError as e:
@@ -503,11 +548,21 @@ def run_js(page: Page, js: str) -> str:
         return f"BROWSER_ERROR: {e}"
 
 
-def run_js_value(page: Page, js: str) -> Any:
-    """Execute JS and return its structured result on the browser thread."""
+def run_js_value(page: Page, js: str, timeout: float | None = None) -> Any:
+    """Execute JS and return its structured result on the browser thread.
+
+    Unlike `run_js`, failures propagate: this is used by response capture,
+    where a failed extraction must end the request rather than be reported
+    as a page string.
+    """
     if _is_browser_thread():
         return _do_run_js_value(page, js)
-    return run_in_browser_thread(_do_run_js_value, page, js)
+    return run_in_browser_thread(
+        _do_run_js_value,
+        page,
+        js,
+        operation_timeout=CAPTURE_TIMEOUT if timeout is None else timeout,
+    )
 
 
 def _normalize_response(result: Any) -> dict:
@@ -517,6 +572,7 @@ def _normalize_response(result: Any) -> dict:
             "found": False,
             "content": "",
             "thinking": None,
+            "busy": False,
             "done": False,
             "count": 0,
         }
@@ -532,6 +588,7 @@ def _normalize_response(result: Any) -> dict:
         "found": bool(result.get("found")),
         "content": content,
         "thinking": thinking,
+        "busy": bool(result.get("busy")),
         "done": bool(result.get("done")),
         "count": int(result.get("count") or 0),
     }
@@ -542,12 +599,27 @@ def capture_response(page: Page, extract_js: str) -> dict:
     return _normalize_response(run_js_value(page, extract_js))
 
 
-def _is_new_response(response: dict, baseline: dict | None) -> bool:
+def is_new_response(response: dict, baseline: dict | None) -> bool:
+    """True once this poll reflects a new assistant turn, not the old one.
+
+    Single source of truth for both the streaming and non-streaming paths.
+
+    Reasoning counts: while a web chat is still thinking the answer text is
+    empty, so keying on content alone discarded the whole trace and never
+    recognised a thinking-only turn as a new response.
+    """
     if baseline is None:
-        return response["found"]
-    if response["count"] > baseline.get("count", 0):
+        return bool(response.get("found")) or bool(response.get("thinking"))
+    if response.get("count", 0) > baseline.get("count", 0):
         return True
-    return response["found"] and response["content"] != baseline.get("content", "")
+    if response.get("content", "") != baseline.get("content", ""):
+        return True
+    thinking = response.get("thinking") or ""
+    return bool(thinking) and thinking != (baseline.get("thinking") or "")
+
+
+# Backwards-compatible alias for the previous private name.
+_is_new_response = is_new_response
 
 
 def wait_for_response(
@@ -557,37 +629,57 @@ def wait_for_response(
     poll_interval: float = 0.25,
     idle_timeout: float | None = None,
     baseline: dict | None = None,
+    done_confirm: float = 0.75,
 ) -> dict:
-    """Poll a page until a new assistant response is complete or timeout."""
+    """Poll a page until a new assistant response is complete or timeout.
+
+    Mirrors the streaming completion rules so both paths agree: a site seen
+    generating is trusted once it stops *and* the text has been stable for
+    `done_confirm`; a site that never signals is trusted after the text has
+    been unchanged for `idle_timeout`.
+
+    An unchanged payload is never read as finished while the page still
+    reports generation, because web chats pause mid-answer (thinking, re-render,
+    rate limiting) and stopping there truncates the reply.
+    """
     deadline = time.monotonic() + max(float(timeout), 0.0)
-    stable_since: float | None = None
-    previous: dict | None = None
+    last_change_at: float | None = None
+    saw_busy = False
     last = {
         "found": False,
         "content": "",
         "thinking": None,
+        "busy": False,
         "done": False,
         "count": 0,
     }
     while time.monotonic() <= deadline:
-        last = capture_response(page, extract_js)
-        # Check done even when content hasn't changed, so we don't miss
-        # a transition from loading -> idle where content is identical.
-        if last.get("done") and _is_new_response(last, baseline):
-            return last
-        if last["found"] and last.get("content"):
-            if previous is not None and last == previous:
-                if stable_since is None:
-                    stable_since = time.monotonic()
-                elif idle_timeout and time.monotonic() - stable_since >= idle_timeout:
-                    last["done"] = True
-                    return last
-            else:
-                stable_since = None
-        previous = last
+        current = capture_response(page, extract_js)
+        content = current.get("content") or ""
+        thinking = current.get("thinking") or ""
+        busy = bool(current.get("busy"))
+        if busy:
+            saw_busy = True
+
+        if is_new_response(current, baseline):
+            now = time.monotonic()
+            if current != last or busy:
+                # Mid-generation pauses are normal; never count them as done.
+                last_change_at = now
+            stable_for = now - last_change_at if last_change_at is not None else 0.0
+            if saw_busy and current.get("done") and stable_for >= done_confirm:
+                return current
+            if (
+                not busy
+                and (content or thinking)
+                and idle_timeout
+                and stable_for >= idle_timeout
+            ):
+                current["done"] = True
+                return current
+        last = current
         time.sleep(max(float(poll_interval), 0.01))
     return {**last, "timed_out": True}
-
 
 def _do_inject_and_submit(
     page: Page, inject_js: str, submit_js: str, tab_index: int
@@ -664,7 +756,7 @@ def check_page_health(page: Page) -> bool:
 
     try:
         return run_in_browser_thread(_do_check)
-    except Exception:  # noqa: BLE001
+    except (PlaywrightError, RuntimeError, BrowserError, BrowserOperationTimeout):
         return False
 
 

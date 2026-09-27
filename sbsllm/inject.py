@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .sites import _inject_js, _response_js, _submit_js, get_site
+from .sites import _response_js, get_site
 
 # Template placeholder used in injection JS
 PLACEHOLDER = "PROMPT_PLACEHOLDER"

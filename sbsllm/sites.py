@@ -178,22 +178,45 @@ def _submit_js(button_selectors: str, input_selector: str | None = None) -> str:
     )
 
 
+# Selectors that positively indicate the site is still generating a reply.
+# Bare `[class*="loading"]` is deliberately excluded: sites keep decorative
+# skeletons and spinners in the DOM (often at zero opacity) long after
+# generation ends, which pinned `done` to false and left the local chat
+# streaming until the request deadline.
+_LOADING_SELECTORS = [
+    'button[aria-label*="Stop" i]',
+    'button[aria-label*="Stop generating" i]',
+    '[data-testid*="stop-button"]',
+    '[aria-busy="true"]',
+]
+
 _RESPONSE_TEMPLATE = """
     (() => {
         const responseSelectors = __RESPONSE_SELECTORS__;
         const thinkingSelectors = __THINKING_SELECTORS__;
         const loadingSelectors = __LOADING_SELECTORS__;
-        const textOf = (element) => {
-            if (!element) return '';
-            const text = element.innerText || element.textContent || '';
-            return text.replace(/\\u00a0/g, ' ').trim();
-        };
         const isVisible = (element) => {
             if (!element) return false;
             const style = window.getComputedStyle(element);
-            return style && style.visibility !== 'hidden' && style.display !== 'none'
-                && element.getClientRects().length > 0;
+            if (!style) return true;
+            if (style.display === 'none') return false;
+            if (style.visibility === 'hidden' || style.visibility === 'collapse') return false;
+            // Skeletons and placeholders are laid out at zero opacity; treat
+            // them as absent so they cannot keep a finished answer "loading".
+            if (style.opacity !== '' && Number(style.opacity) < 0.05) return false;
+            return element.getClientRects().length > 0;
         };
+        const textOf = (element) => {
+            if (!element) return '';
+            const text = element.innerText || element.textContent || '';
+            return text.replace(/\\u00a0/g, ' ');
+        };
+        // Detached nodes have no layout, so innerText is empty for clones.
+        const rawTextOf = (element) => {
+            if (!element) return '';
+            return (element.textContent || '').replace(/\\u00a0/g, ' ');
+        };
+        const squash = (text) => (text || '').replace(/\\s+/g, ' ').trim();
         const matches = (selectors) => {
             const elements = [];
             const seen = new Set();
@@ -209,42 +232,127 @@ _RESPONSE_TEMPLATE = """
             }
             return elements;
         };
-        const responses = matches(responseSelectors).filter(isVisible);
-        const thinking = matches(thinkingSelectors).filter(isVisible);
-        const loading = matches(loadingSelectors).filter(isVisible);
-        const response = responses.at(-1) || null;
-        const thinkingText = thinking.map(textOf).filter(Boolean).join('\\n\\n').trim();
-        // Strip "Working for Xs" prefix that appears during streaming.
-        // Also treat content starting with "Working for" as still loading.
-        let content = textOf(response);
-        // Remove thinking-chain text that some sites embed inside the
-        // response container (e.g. z.ai puts "Thought Process" in
-        // .thinking-chain-container which lives within .markdown-prose).
-        if (response) {
+        // A collapsed disclosure only renders its label ("Thought Process").
+        // That is UI chrome, not a reasoning trace, so it must not be
+        // forwarded to the local chat as thinking content.
+        const ANSWER_HOST = 'div[class*="prose"], .markdown, [class*="markdown"]';
+        const LABEL_ONLY = /^(?:thought\\s*process|thought|thinking|reasoning|deep\\s*think|chain\\s*of\\s*thought|思考(?:过程|中)?)[\\s:：0-9smh秒.,-]*$/i;
+        const isLabelOnly = (text) => {
+            const t = squash(text);
+            return t === '' || LABEL_ONLY.test(t);
+        };
+        // Selectors are ordered fallbacks: use the FIRST one that matches.
+        // Merging every selector and taking the last match let a catch-all
+        // further down the list (div[id*=message] and friends) override the
+        // precise selector and win for the wrong element entirely.
+        let response = null;
+        let responseCount = 0;
+        for (const selector of responseSelectors) {
+            let nodes;
             try {
-                const thinkingInResponse = response.querySelectorAll(
-                    thinkingSelectors.join(',')
-                );
-                for (const el of thinkingInResponse) {
-                    content = content.replace(textOf(el), '');
-                }
-            } catch (_) {}
+                nodes = Array.from(document.querySelectorAll(selector)).filter(isVisible);
+            } catch (_) {
+                continue;
+            }
+            if (nodes.length) {
+                response = nodes[nodes.length - 1];
+                responseCount = nodes.length;
+                break;
+            }
         }
-        // Also strip the "Thought Process" header label that z.ai renders
-        // inside the thinking-chain-container (the button text).
+
+        // Reasoning: read each thinking container from a detached copy with
+        // its collapsible header removed, and skip containers that only hold
+        // the collapsed label.
+        const thinkingParts = [];
+        for (const node of matches(thinkingSelectors)) {
+            if (!isVisible(node)) continue;
+            const clone = node.cloneNode(true);
+            for (const header of Array.from(clone.querySelectorAll(
+                'button, [role="button"], summary, [aria-expanded]'
+            ))) {
+                if (header.parentNode) header.parentNode.removeChild(header);
+            }
+            const text = squash(textOf(clone) || rawTextOf(clone));
+            if (isLabelOnly(text) || thinkingParts.indexOf(text) !== -1) continue;
+            thinkingParts.push(text);
+        }
+        const thinkingText = thinkingParts.join('\\n\\n').trim();
+
+        // Answer: prune the reasoning subtree from a copy of the response
+        // instead of string-replacing its text. z.ai nests the disclosure
+        // inside the same container as the answer, so replacing text there
+        // either left the label behind or ate the answer.
+        let content = textOf(response);
+        if (response && thinkingSelectors.length) {
+            // A broad thinking selector can match a node that also wraps the
+            // answer. z.ai keeps the answer in a .markdown-prose block, so
+            // treat any candidate containing one as an answer host and leave
+            // it alone rather than deleting the answer with the reasoning.
+            const wrapsAnswer = (node) => {
+                try {
+                    return node.matches(ANSWER_HOST) ||
+                        node.querySelector(ANSWER_HOST) !== null;
+                } catch (_) {
+                    return false;
+                }
+            };
+            const clone = response.cloneNode(true);
+            let pruned = false;
+            for (const selector of thinkingSelectors) {
+                let nodes;
+                try {
+                    nodes = Array.from(clone.querySelectorAll(selector));
+                } catch (_) {
+                    continue;
+                }
+                for (const node of nodes) {
+                    if (!node.parentNode || wrapsAnswer(node)) continue;
+                    node.parentNode.removeChild(node);
+                    pruned = true;
+                }
+            }
+            if (pruned) {
+                // Use the pruned text even when empty. During the thinking
+                // phase the answer is legitimately empty, and falling back to
+                // the unpruned text there re-injected the reasoning into the
+                // answer, so the local chat rendered the thinking twice.
+                content = squash(rawTextOf(clone));
+            }
+        }
+        // Safety net for sites that render the disclosure label outside any
+        // element matched by thinking_selectors.
         content = content.replace(/Thought Process\\s*/gi, '');
-        content = content.replace(/\\s+/g, ' ').trim();
-        const workingMatch = content.match(/^Working for \\d+s/);
-        const isWorking = workingMatch !== null;
-        content = content.replace(/^Working for \\d+s\\s*/, '');
-        // Also strip any remaining "Worked for Xs" or similar timing prefixes
-        content = content.replace(/^Worked for \\d+s\\s*/, '');
+        content = squash(content);
+        // "Working for 12s" / "Worked for 12s" appear while a reply streams.
+        const isWorking = /^Work(?:ing|ed) for \\d+s/.test(content);
+        content = content.replace(/^Work(?:ing|ed) for \\d+s\\s*/, '');
+        content = content.trim();
+
+        // Still generating? Require a positive signal: a stop control, an
+        // aria-busy region, or a busy node inside the answer itself.
+        const loading = matches(loadingSelectors).filter((element) => {
+            if (!isVisible(element)) return false;
+            if (response && (response === element || response.contains(element))) {
+                return true;
+            }
+            if (element.getAttribute('aria-busy') === 'true') return true;
+            const tag = (element.tagName || '').toLowerCase();
+            return tag === 'button' || element.getAttribute('role') === 'button';
+        });
+        const busy = loading.length > 0;
         return {
             found: response !== null,
             content: content,
             thinking: thinkingText || null,
-            done: response !== null && loading.length === 0 && !isWorking,
-            count: responses.length,
+            // `busy` is the raw "still generating" signal. `done` alone is
+            // not trustworthy: sites render their stop control a moment after
+            // the first token, so `done` is briefly true while the answer is
+            // still arriving. Callers must use `busy` to tell a real finish
+            // from the gap between the start of a turn and its spinner.
+            busy: busy,
+            done: response !== null && !isWorking && !busy,
+            count: responseCount,
         };
     })()
     """
@@ -294,9 +402,7 @@ SITES: dict[str, dict] = {
             '[class*="reasoning"]',
         ],
         "loading_selectors": [
-            'button[data-testid="stop-button"]',
-            'button[aria-label*="Stop" i]',
-            '[class*="generating"]',
+            *_LOADING_SELECTORS,
         ],
     },
     "claude": {
@@ -322,9 +428,7 @@ SITES: dict[str, dict] = {
             '[class*="reasoning"]',
         ],
         "loading_selectors": [
-            '[class*="loading"]',
-            '[class*="typing"]',
-            'button[aria-label*="Stop" i]',
+            *_LOADING_SELECTORS,
         ],
     },
     "deepseek": {
@@ -363,9 +467,7 @@ SITES: dict[str, dict] = {
             '[class*="reasoning"]',
         ],
         "loading_selectors": [
-            '[class*="loading"]',
-            '[class*="typing"]',
-            'button[aria-label*="Stop" i]',
+            *_LOADING_SELECTORS,
         ],
     },
     "qwen": {
@@ -392,9 +494,7 @@ SITES: dict[str, dict] = {
             '[class*="reasoning"]',
         ],
         "loading_selectors": [
-            '[class*="loading"]',
-            '[class*="typing"]',
-            'button[aria-label*="Stop" i]',
+            *_LOADING_SELECTORS,
         ],
     },
     "grok": {
@@ -429,12 +529,8 @@ SITES: dict[str, dict] = {
             '[class*="reasoning"]',
         ],
         "loading_selectors": [
-            '[class*="loading"]',
-            '[class*="typing"]',
-            '[class*="generating"]',
-            'button[aria-label*="Stop" i]',
+            *_LOADING_SELECTORS,
             '[class*="working"]',
-            '[class*="streaming"]',
         ],
     },
     "google": {
@@ -473,10 +569,8 @@ SITES: dict[str, dict] = {
             'ms-chat-turn [class*="reasoning"]',
         ],
         "loading_selectors": [
+            *_LOADING_SELECTORS,
             'ms-run-button .stoppable-spinner',
-            'ms-run-button button[aria-label="Run"] svg',
-            '[class*="loading"]',
-            'button[aria-label*="Stop" i]',
         ],
     },
     "mistral": {
@@ -505,9 +599,7 @@ SITES: dict[str, dict] = {
             '[class*="reasoning"]',
         ],
         "loading_selectors": [
-            '[class*="loading"]',
-            '[class*="typing"]',
-            'button[aria-label*="Stop" i]',
+            *_LOADING_SELECTORS,
         ],
     },
     "kimi": {
@@ -541,10 +633,7 @@ SITES: dict[str, dict] = {
             '[data-testid*="thinking"]',
         ],
         "loading_selectors": [
-            '[class*="loading"]',
-            '[class*="typing"]',
-            '[class*="generating"]',
-            'button[aria-label*="Stop" i]',
+            *_LOADING_SELECTORS,
         ],
     },
     "perplexity": {
@@ -571,9 +660,7 @@ SITES: dict[str, dict] = {
             '[class*="reasoning"]',
         ],
         "loading_selectors": [
-            '[class*="loading"]',
-            '[class*="typing"]',
-            'button[aria-label*="Stop" i]',
+            *_LOADING_SELECTORS,
         ],
     },
     "poe": {
@@ -600,9 +687,7 @@ SITES: dict[str, dict] = {
             '[class*="reasoning"]',
         ],
         "loading_selectors": [
-            '[class*="loading"]',
-            '[class*="typing"]',
-            'button[aria-label*="Stop" i]',
+            *_LOADING_SELECTORS,
         ],
     },
     "cohere": {
@@ -629,9 +714,7 @@ SITES: dict[str, dict] = {
             '[class*="reasoning"]',
         ],
         "loading_selectors": [
-            '[class*="loading"]',
-            '[class*="typing"]',
-            'button[aria-label*="Stop" i]',
+            *_LOADING_SELECTORS,
         ],
     },
     "zai": {
@@ -655,6 +738,27 @@ SITES: dict[str, dict] = {
                 || form?.querySelector('button[type="submit"]:not([disabled]):not([id*="upload"]):not([id*="attach"]):not([id*="file"])')
                 || form?.querySelector('button[type="submit"]:not([disabled])')
         """, "document.querySelector('textarea#chat-input, textarea')"),
+        "setup_js": """
+            (() => {
+                // Click the Deep Think dropdown and select "High" if not already set.
+                const trigger = document.querySelector('#bits-c286[aria-haspopup="menu"]');
+                if (!trigger || trigger.getAttribute('aria-expanded') === 'true') return 'SKIP';
+                trigger.click();
+                return new Promise(resolve => {
+                    setTimeout(() => {
+                        const items = document.querySelectorAll('[role="menu"] button');
+                        for (const item of items) {
+                            if (item.textContent.trim().toLowerCase() === 'high') {
+                                item.click();
+                                resolve('SET_HIGH');
+                                return;
+                            }
+                        }
+                        resolve('NO_HIGH_FOUND');
+                    }, 300);
+                });
+            })()
+        """,
         "response_selectors": [
             '#response-content-container .markdown-prose',
             '#response-content-container',
@@ -680,14 +784,13 @@ SITES: dict[str, dict] = {
             '[data-testid*="thinking"]',
         ],
         "loading_selectors": [
-            '[class*="loading"]',
-            '[class*="typing"]',
-            '[class*="generating"]',
-            'button[aria-label*="Stop" i]',
-            # NOTE: #send-message-button[disabled] is intentionally omitted —
-            # the button is disabled whenever the input is empty, which
-            # happens after every sent message. Including it would keep
-            # `done` false forever.
+            *_LOADING_SELECTORS,
+            # z.ai uses an animated dot loader inside the response container
+            # while a reply is being generated. Without this, `busy` is always
+            # False and the server terminates the stream before any content
+            # arrives.
+            '#response-content-container .dot',
+            '.skeleton.loading',
         ],
     },
     "meta": {
@@ -719,11 +822,8 @@ SITES: dict[str, dict] = {
             '[data-testid*="thinking"]',
         ],
         "loading_selectors": [
-            '[class*="loading"]',
-            '[class*="typing"]',
-            '[class*="generating"]',
-            'button[aria-label*="Stop" i]',
-        ],
+            *_LOADING_SELECTORS,
+                ],
     },
     "huggingface": {
         "url": "https://huggingface.co/chat",
@@ -750,10 +850,8 @@ SITES: dict[str, dict] = {
             '[class*="reasoning"]',
         ],
         "loading_selectors": [
-            '[class*="loading"]',
-            '[class*="typing"]',
-            'button[aria-label*="Stop" i]',
-        ],
+            *_LOADING_SELECTORS,
+                ],
     },
     "tencent": {
         "url": "https://aistudio.tencent.ai/",
@@ -784,10 +882,8 @@ SITES: dict[str, dict] = {
             '[class*="reasoning"]',
         ],
         "loading_selectors": [
-            '[class*="loading"]',
-            '[class*="typing"]',
-            'button[aria-label*="Stop" i]',
-        ],
+            *_LOADING_SELECTORS,
+                ],
     },
 }
 

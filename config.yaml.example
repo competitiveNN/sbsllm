@@ -23,3 +23,27 @@ login_wait: 30
 
 # Output logs in JSON format for structured logging (default: false)
 # json_log_format: false
+
+# Hard cap on one answer (seconds). Keep generous: a chat with thinking
+# enabled can run for minutes, and cutting here truncates the reply.
+# browser_timeout: 600
+
+# How long a request waits for its chat tab to be free (seconds). Must exceed
+# a full answer, or a follow-up request gets a 503 while the tab is busy.
+# Only requests to the SAME chat serialize; different chats run in parallel.
+# browser_lock_timeout: 300
+
+# Seconds an unchanged answer is treated as finished, when the site gives no
+# "still generating" signal. Raise if long answers get cut short.
+# response_idle_timeout: 3.0
+
+# How long an unchanged answer is tolerated WHILE the site claims to still be
+# generating. Web chats pause mid-answer; this must exceed a normal pause but
+# must stay well under browser_timeout, or a site whose spinner never clears
+# holds the tab until the budget expires.
+# busy_patience: 20.0
+
+# After sending, how long to wait for the web chat to produce anything at all.
+# On expiry the stream ends with a visible message instead of hanging
+# silently. Raise it for very slow models.
+# first_token_timeout: 60.0

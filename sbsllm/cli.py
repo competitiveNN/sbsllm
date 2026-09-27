@@ -186,11 +186,16 @@ def wait_for_login(wait: int) -> None:
 
 
 def _open_tabs(chats: list[str], urls: list[str], browser_bin: str | None) -> list:
-    """Open all tabs sequentially."""
+    """Open all tabs sequentially, running site-specific setup_js after load."""
+    from .sites import SITES
+
     pages: list = [None] * len(chats)
     for i, (chat, url) in enumerate(zip(chats, urls)):
+        setup_js = None
+        if chat in SITES:
+            setup_js = SITES[chat].get("setup_js")
         try:
-            page = open_page(url, browser_bin)
+            page = open_page(url, browser_bin, setup_js=setup_js)
             pages[i] = page
             print(f"  [OK] {chat}: {url}", flush=True)
         except Exception as e:  # noqa: BLE001
@@ -295,6 +300,7 @@ def run(
             port=port,
             browser_timeout=config.browser_timeout,
             browser_lock_timeout=config.browser_lock_timeout,
+            response_idle_timeout=config.response_idle_timeout,
         )
         server_thread = _start_server(server)
         if server_thread is None:
@@ -417,6 +423,7 @@ def run_server(
             port=port,
             browser_timeout=config.browser_timeout,
             browser_lock_timeout=config.browser_lock_timeout,
+            response_idle_timeout=config.response_idle_timeout,
         )
 
         server_thread = _start_server(server)

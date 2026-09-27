@@ -9,11 +9,13 @@ from typing import Any
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
+from .server import DEFAULT_RESPONSE_IDLE_TIMEOUT
 from .sites import list_sites
 
 MAX_LOGIN_WAIT = 24 * 60 * 60  # 24 hours
-MAX_BROWSER_TIMEOUT = 300  # 5 minutes
-MAX_BROWSER_LOCK_TIMEOUT = 60  # 1 minute
+MAX_BROWSER_TIMEOUT = 1800  # 30 minutes
+MAX_BROWSER_LOCK_TIMEOUT = 1800  # 30 minutes
+MAX_RESPONSE_IDLE_TIMEOUT = 120
 
 
 class Config(BaseModel):
@@ -37,16 +39,31 @@ class Config(BaseModel):
         default=None, description="Path to log file (optional)"
     )
     browser_timeout: int = Field(
-        default=60,
+        default=180,
         ge=1,
         le=MAX_BROWSER_TIMEOUT,
-        description="Browser operation timeout (seconds)",
+        description=(
+            "Hard cap on one answer (seconds). A chat with thinking enabled can "
+            "run for minutes, and cutting here truncates the reply."
+        ),
     )
     browser_lock_timeout: int = Field(
-        default=10,
+        default=300,
         ge=1,
         le=MAX_BROWSER_LOCK_TIMEOUT,
-        description="Browser lock acquisition timeout (seconds)",
+        description=(
+            "How long a request waits for its chat tab to be free (seconds). "
+            "Must exceed a full answer, or follow-up requests get a 503."
+        ),
+    )
+    response_idle_timeout: float = Field(
+        default=DEFAULT_RESPONSE_IDLE_TIMEOUT,
+        ge=0.1,
+        le=MAX_RESPONSE_IDLE_TIMEOUT,
+        description=(
+            "Seconds an unchanged answer is treated as finished when the site "
+            "gives no 'still generating' signal."
+        ),
     )
     json_log_format: bool = Field(
         default=False, description="Output logs in JSON format"

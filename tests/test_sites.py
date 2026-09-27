@@ -2,7 +2,7 @@
 
 import pytest
 
-from sbsllm.sites import SITES, get_site, list_sites
+from sbsllm.sites import SITES, _response_js, get_site, list_sites
 
 
 class TestListSites:
@@ -102,3 +102,76 @@ class TestSiteStructure:
         assert submit.strip().startswith("(() =>") or submit.strip().startswith(
             "(function"
         )
+
+
+class TestResponseSelectors:
+    @pytest.mark.parametrize("site_id", list(SITES.keys()))
+    def test_site_has_response_selectors(self, site_id):
+        assert SITES[site_id]["response_selectors"]
+
+    @pytest.mark.parametrize("site_id", list(SITES.keys()))
+    def test_loading_selectors_are_precise(self, site_id):
+        """Bare `[class*="loading"]` matches decorative skeletons that linger
+        after generation ends, which pinned `done` to false and left the
+        local chat streaming until the request deadline."""
+        for selector in SITES[site_id]["loading_selectors"]:
+            assert '[class*="loading"]' not in selector
+            assert '[class*="typing"]' not in selector
+
+    @pytest.mark.parametrize("site_id", list(SITES.keys()))
+    def test_loading_selectors_include_shared_set(self, site_id):
+        assert "button[aria-label*=\"Stop\" i]" in SITES[site_id]["loading_selectors"]
+
+    @pytest.mark.parametrize("site_id", list(SITES.keys()))
+    def test_thinking_selectors_present(self, site_id):
+        assert SITES[site_id]["thinking_selectors"]
+
+    @pytest.mark.parametrize("site_id", list(SITES.keys()))
+    def test_loading_selector_lists_are_not_shared(self, site_id):
+        """Each site gets its own list so a site-specific tweak cannot leak."""
+        other = next(s for s in SITES if s != site_id)
+        a = SITES[site_id]["loading_selectors"]
+        a.append("sentinel")
+        try:
+            assert "sentinel" not in SITES[other]["loading_selectors"]
+        finally:
+            a.remove("sentinel")
+
+
+class TestResponseJs:
+    def test_embeds_all_selector_groups(self):
+        js = _response_js(["#a"], [".t"], ["#l"])
+        assert '["#a"]' in js
+        assert '[".t"]' in js
+        assert '["#l"]' in js
+
+    def test_filters_collapsed_thinking_labels(self):
+        js = _response_js(["#a"], [".t"], [])
+        assert "LABEL_ONLY" in js
+        assert "Thought Process" in js
+
+    def test_prunes_thinking_from_answer(self):
+        js = _response_js(["#a"], [".t"], [])
+        assert "cloneNode" in js
+        assert "removeChild" in js
+
+    def test_ignores_invisible_loading_nodes(self):
+        js = _response_js(["#a"], [".t"], ["#l"])
+        assert "opacity" in js
+        assert "aria-busy" in js
+
+    def test_handles_empty_selector_groups(self):
+        js = _response_js(None, None, None)
+        assert "const responseSelectors = [];" in js
+
+    @pytest.mark.parametrize("site_id", list(SITES.keys()))
+    def test_generated_js_is_a_valid_iife(self, site_id):
+        js = _response_js(
+            SITES[site_id]["response_selectors"],
+            SITES[site_id]["thinking_selectors"],
+            SITES[site_id]["loading_selectors"],
+        )
+        assert js.strip().startswith("(() =>")
+        assert "__RESPONSE_SELECTORS__" not in js
+        assert "__THINKING_SELECTORS__" not in js
+        assert "__LOADING_SELECTORS__" not in js

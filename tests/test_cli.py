@@ -379,8 +379,9 @@ class TestRunServer:
                 tab_map={"chatgpt": page},
                 host="127.0.0.1",
                 port=8080,
-                browser_timeout=60,
-                browser_lock_timeout=10,
+                browser_timeout=180,
+                browser_lock_timeout=300,
+                response_idle_timeout=3.0,
             )
             mock_server.start.assert_called_once()
 
@@ -403,8 +404,9 @@ class TestRunServer:
                 tab_map={"chatgpt": pages[0], "claude": pages[1]},
                 host="0.0.0.0",
                 port=9000,
-                browser_timeout=60,
-                browser_lock_timeout=10,
+                browser_timeout=180,
+                browser_lock_timeout=300,
+                response_idle_timeout=3.0,
             )
             mock_server.start.assert_called_once()
             url_calls = [

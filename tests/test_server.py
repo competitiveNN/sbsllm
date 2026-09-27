@@ -54,7 +54,9 @@ class TestServerStartStop:
             # Start in a thread
             thread = threading.Thread(target=server.start, daemon=True)
             thread.start()
-            time.sleep(0.1)
+            # Wait for the socket to be bound rather than sleeping a fixed
+            # amount: otherwise stop() can land before the serve loop runs.
+            server.wait_until_ready(5)
             server.stop()
             thread.join(timeout=2)
 

@@ -556,3 +556,270 @@ class TestBrowserQueue:
 
         assert run_js(mock_page, "return 'result'") == "result"
         mock_page.evaluate.assert_called_once_with("return 'result'")
+
+
+class TestRunJsValue:
+    def test_evaluate_takes_no_timeout_argument(self):
+        """Guard against the earlier bug: page.evaluate() accepts no
+        `timeout`, and a MagicMock hides that. Assert on the real API."""
+        import inspect
+
+        from playwright.sync_api import Page
+
+        params = inspect.signature(Page.evaluate).parameters
+        assert "timeout" not in params, "page.evaluate() has no timeout parameter"
+
+        page = MagicMock()
+        page.evaluate.return_value = {"found": True}
+        with patch.object(browser_module, "_is_browser_thread", return_value=True):
+            browser_module.run_js_value(page, "JS")
+        # Positional only: expression, then optional arg.
+        assert page.evaluate.call_args.args == ("JS",)
+        assert not page.evaluate.call_args.kwargs
+
+    def test_capture_timeout_is_below_operation_timeout(self):
+        assert browser_module.CAPTURE_TIMEOUT < browser_module.BROWSER_OPERATION_TIMEOUT
+
+    def test_capture_poll_is_bounded(self):
+        """A hung page must fail the poll instead of blocking forever."""
+        page = MagicMock()
+        with (
+            patch.object(browser_module, "_is_browser_thread", return_value=False),
+            patch.object(
+                browser_module, "run_in_browser_thread", side_effect=RuntimeError("t/o")
+            ) as dispatch,
+            pytest.raises(RuntimeError),
+        ):
+            browser_module.run_js_value(page, "JS")
+        assert dispatch.call_args.kwargs["operation_timeout"] == (
+            browser_module.CAPTURE_TIMEOUT
+        )
+
+    def test_capture_timeout_is_overridable(self):
+        page = MagicMock()
+        with (
+            patch.object(browser_module, "_is_browser_thread", return_value=False),
+            patch.object(
+                browser_module, "run_in_browser_thread", side_effect=RuntimeError("t/o")
+            ) as dispatch,
+            pytest.raises(RuntimeError),
+        ):
+            browser_module.run_js_value(page, "JS", timeout=2.0)
+        assert dispatch.call_args.kwargs["operation_timeout"] == 2.0
+
+    def test_evaluate_error_becomes_browser_error(self):
+        page = MagicMock()
+        page.evaluate.side_effect = browser_module.PlaywrightError("boom")
+        with (
+            patch.object(browser_module, "_is_browser_thread", return_value=True),
+            pytest.raises(browser_module.BrowserError),
+        ):
+            browser_module.run_js_value(page, "JS")
+
+
+class _FakeClock:
+    """Virtual clock: only advances when the code under test sleeps."""
+
+    def __init__(self):
+        self.t = 1000.0
+
+    def monotonic(self):
+        return self.t
+
+    def sleep(self, seconds):
+        self.t += max(seconds, 0.01)
+
+
+class TestWaitForResponse:
+    def _run(self, polls, **kwargs):
+        """Run wait_for_response on a fake clock; returns (result, elapsed)."""
+        clock = _FakeClock()
+        with (
+            patch.object(browser_module, "capture_response", side_effect=self._polls(polls)),
+            patch.object(browser_module.time, "sleep", side_effect=clock.sleep),
+            patch.object(browser_module.time, "monotonic", side_effect=clock.monotonic),
+        ):
+            start = clock.t
+            result = browser_module.wait_for_response(
+                MagicMock(), "JS", **kwargs
+            )
+            return result, clock.t - start
+
+    def _polls(self, sequence):
+        it = iter(sequence)
+
+        def capture(page, js):
+            try:
+                return dict(next(it))
+            except StopIteration:
+                return dict(sequence[-1])
+
+        return capture
+
+    def _result(
+        self, content="", *, thinking=None, done=False, busy=False, found=True, count=1
+    ):
+        return {
+            "found": found,
+            "content": content,
+            "thinking": thinking,
+            "busy": busy,
+            "done": done,
+            "count": count,
+        }
+
+    def test_returns_immediately_when_done(self):
+        """A site seen generating, then finished, must not wait the idle window."""
+        polls = [
+            self._result("hi", busy=True, done=False),
+            self._result("hi", busy=False, done=True),
+        ]
+        result, elapsed = self._run(polls, timeout=5, idle_timeout=30, done_confirm=0.5)
+        assert result["content"] == "hi"
+        assert result["done"] is True
+        assert "timed_out" not in result
+        assert elapsed < 2.0
+
+    def test_returns_on_idle_window(self):
+        """Sites rarely clear their `done` flag; a stable payload must end it."""
+        polls = [self._result("stable answer")] * 3
+        result, elapsed = self._run(polls, timeout=5, idle_timeout=0.3)
+        assert result["content"] == "stable answer"
+        assert result["done"] is True
+        assert "timed_out" not in result
+        assert elapsed < 2.0
+
+    def test_thinking_only_turn_completes(self):
+        """Regression: the non-streaming path had a divergent copy of
+        _is_new_response without the thinking check, so a thinking-only turn
+        was never recognised and the request ran to timeout."""
+        polls = [self._result("", thinking="reasoning")] * 3
+        result, elapsed = self._run(
+            polls, timeout=5, idle_timeout=0.3, baseline=self._result("")
+        )
+        assert result["thinking"] == "reasoning"
+        assert result["done"] is True
+        assert "timed_out" not in result
+        assert elapsed < 2.0
+
+    def test_growing_content_resets_idle(self):
+        calls = {"n": 0}
+
+        def capture(page, js):
+            calls["n"] += 1
+            return self._result("x" * calls["n"])
+
+        with (
+            patch.object(browser_module, "capture_response", side_effect=capture),
+            patch.object(browser_module.time, "sleep"),
+            patch.object(browser_module.time, "monotonic", side_effect=iter(range(400)).__next__),
+        ):
+            result = browser_module.wait_for_response(
+                MagicMock(), "JS", timeout=3, idle_timeout=100
+            )
+        assert result["timed_out"] is True
+        assert result["done"] is False
+
+    def test_ignores_previous_answer_via_baseline(self):
+        """The answer on screen before we sent anything must not be returned
+        as this turn's answer."""
+        polls = [self._result("old answer", count=1)]
+        result, _ = self._run(
+            polls, timeout=1, baseline=self._result("old answer", count=1)
+        )
+        assert result["timed_out"] is True
+        assert result["done"] is False
+
+
+class TestIsNewResponseShared:
+    def test_server_and_browser_agree(self):
+        """The server used to keep a divergent copy that lacked the thinking
+        check, so the non-streaming path never saw a thinking-only turn."""
+        from sbsllm.browser import is_new_response
+        from sbsllm.server import OpenAIHandler
+
+        handler = OpenAIHandler.__new__(OpenAIHandler)
+        base = {"found": True, "content": "", "thinking": None, "busy": False,
+                "done": False, "count": 1}
+        cases = [
+            ({**base, "thinking": "hmm"}, base),
+            ({**base, "content": "x"}, base),
+            ({**base, "count": 2}, base),
+            (base, base),
+            ({**base, "thinking": "hmm"}, None),
+            (base, None),
+        ]
+        for response, baseline in cases:
+            assert handler._is_new_response(response, baseline) == is_new_response(
+                response, baseline
+            ), (response, baseline)
+
+    def test_thinking_only_turn_is_new(self):
+        from sbsllm.browser import is_new_response
+
+        base = {"found": True, "content": "", "thinking": None, "busy": False,
+                "done": False, "count": 1}
+        assert is_new_response({**base, "thinking": "reasoning"}, base) is True
+
+
+class TestNormalizeResponse:
+    def test_missing_result_is_not_found(self):
+        out = browser_module._normalize_response(None)
+        assert out["found"] is False
+        assert out["busy"] is False
+
+    def test_string_result_is_coerced(self):
+        out = browser_module._normalize_response({"content": 42, "count": "3"})
+        assert out["content"] == "42"
+        assert out["count"] == 3
+
+    def test_blank_thinking_becomes_none(self):
+        out = browser_module._normalize_response({"content": "x", "thinking": "   "})
+        assert out["thinking"] is None
+
+    def test_thinking_is_stripped(self):
+        out = browser_module._normalize_response({"content": "x", "thinking": " hmm "})
+        assert out["thinking"] == "hmm"
+
+    def test_busy_is_carried_through(self):
+        assert browser_module._normalize_response({"content": "x", "busy": True})["busy"] is True
+        assert browser_module._normalize_response({"content": "x"})["busy"] is False
+
+
+class TestBrowserOperationTimeout:
+    def test_is_a_runtime_error_subclass(self):
+        """Callers that already guarded RuntimeError must keep working."""
+        assert issubclass(browser_module.BrowserOperationTimeout, RuntimeError)
+        assert not issubclass(browser_module.BrowserOperationTimeout, browser_module.BrowserError)
+
+    def test_timeout_raises_the_dedicated_type(self):
+        # Keep the sleep short: a timed-out call leaves the worker blocked in
+        # the function, so later dispatches queue behind it.
+        with pytest.raises(browser_module.BrowserOperationTimeout):
+            browser_module.run_in_browser_thread(time.sleep, 0.4, operation_timeout=0.1)
+
+    def test_per_call_timeout_overrides_default(self):
+        assert browser_module.CAPTURE_TIMEOUT < browser_module.BROWSER_OPERATION_TIMEOUT
+        with pytest.raises(browser_module.BrowserOperationTimeout) as exc:
+            browser_module.run_in_browser_thread(
+                time.sleep, 0.4, operation_timeout=0.1
+            )
+        assert "0.1s" in str(exc.value)
+
+    def test_positional_args_still_reach_the_function(self):
+        assert browser_module.run_in_browser_thread(lambda a, b: a + b, 1, 2) == 3
+
+    def test_wrapped_function_can_still_take_a_timeout_kwarg(self):
+        """`operation_timeout` must not shadow a wrapped function's own
+        `timeout` argument."""
+        seen = {}
+
+        def takes_timeout(value, timeout=None):
+            seen["timeout"] = timeout
+            return value
+
+        result = browser_module.run_in_browser_thread(
+            takes_timeout, 7, operation_timeout=5.0, timeout=0.25
+        )
+        assert result == 7
+        assert seen["timeout"] == 0.25

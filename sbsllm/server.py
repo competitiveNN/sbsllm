@@ -16,12 +16,16 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, ClassVar
 
+from playwright.sync_api import Error as PlaywrightError
+
 from .browser import (
     BrowserError,
+    BrowserOperationTimeout,
     capture_response,
     check_page_health,
     get_page_snapshot,
     inject_and_submit,
+    is_new_response,
     wait_for_response,
 )
 from .inject import extract_js, inject_prompt, submit_js
@@ -33,8 +37,34 @@ DEFAULT_PORT = 8080
 MAX_REQUEST_BYTES = 1_000_000
 # Default timeout for browser operations (seconds)
 DEFAULT_BROWSER_TIMEOUT = 60
-# Default timeout for acquiring browser lock (seconds)
-DEFAULT_BROWSER_LOCK_TIMEOUT = 10
+# How long the extracted answer/thinking may stay unchanged before we treat
+# the web chat as finished and terminate the local response (seconds). This
+# is the primary completion signal: web chats rarely clear their "generating"
+# marker reliably, so waiting for `done` alone left the local chat spinning.
+DEFAULT_RESPONSE_IDLE_TIMEOUT = 3.0
+# Grace period after a site stops reporting generation before its `done`
+# flag is trusted. Covers the brief window where a stop control flickers
+# out mid-render and would otherwise truncate the answer.
+DEFAULT_RESPONSE_DONE_CONFIRM = 0.75
+# How long an unchanged payload is tolerated while the site still claims to
+# be generating. Web chats pause mid-answer (thinking, re-render, rate limit)
+# and cutting there truncates the reply -- but a site whose spinner never
+# clears must not hold the tab until browser_timeout.
+DEFAULT_BUSY_PATIENCE = 20.0
+# After submitting, how long to wait for the web chat to produce any output at
+# all. Without this a selector mismatch meant silence until browser_timeout,
+# and the local chat simply spun forever.
+DEFAULT_FIRST_TOKEN_TIMEOUT = 60.0
+# SSE comment cadence while waiting, so the connection shows liveness.
+DEFAULT_KEEPALIVE_INTERVAL = 10.0
+# Poll interval between extraction passes (seconds)
+DEFAULT_POLL_INTERVAL = 0.25
+# How long a request waits for its model tab to become free (seconds). This
+# must comfortably exceed a full answer: a chat with thinking enabled can hold
+# its tab for a minute, and open-webui fires follow-up requests (e.g. title
+# generation) while the main one is still streaming. 10s produced spurious
+# 503s on a tab that was merely busy answering.
+DEFAULT_BROWSER_LOCK_TIMEOUT = 180
 # Default interval for periodic health checks (seconds)
 DEFAULT_HEALTH_INTERVAL = 30
 # Request ID header name
@@ -50,8 +80,7 @@ _metrics_lock = threading.Lock()
 
 def _update_metrics(elapsed: float, error: bool, error_type: str | None = None) -> None:
     """Update request metrics."""
-    # ruff: noqa: PLW0602 - in-place modification of globals (ruff false positive)
-    global _request_count, _request_latencies, _error_count, _error_types
+    global _request_count, _error_count
     with _metrics_lock:
         _request_count += 1
         _request_latencies.append(elapsed)
@@ -76,6 +105,21 @@ class _SBSHTTPServer(ThreadingHTTPServer):
         self._active_lock = threading.Lock()
         self._active_done = threading.Event()
         self._active_done.set()
+        # Request handlers read their runtime settings off `self.server`.
+        # These must live here: keeping them only on the Server wrapper made
+        # every handler fall back to the defaults, so the configured
+        # browser_timeout was ignored and no tab lock was ever taken.
+        self.model_locks: _ModelLockRegistry = _ModelLockRegistry()
+        self.browser_lock_timeout: float = DEFAULT_BROWSER_LOCK_TIMEOUT
+        self.browser_timeout: float = DEFAULT_BROWSER_TIMEOUT
+        self.response_idle_timeout: float = DEFAULT_RESPONSE_IDLE_TIMEOUT
+        self.response_done_confirm: float = DEFAULT_RESPONSE_DONE_CONFIRM
+        self.busy_patience: float = DEFAULT_BUSY_PATIENCE
+        self.first_token_timeout: float = DEFAULT_FIRST_TOKEN_TIMEOUT
+        self.keepalive_interval: float = DEFAULT_KEEPALIVE_INTERVAL
+        self.poll_interval: float = DEFAULT_POLL_INTERVAL
+        self.model_map: dict[str, str] = {}
+        self.tab_map: dict[str, object] = {}
 
     def process_request(self, request: Any, client_address: Any) -> None:
         with self._active_lock:
@@ -101,6 +145,36 @@ class _SBSHTTPServer(ThreadingHTTPServer):
 
     def wait_for_idle(self, timeout: float) -> bool:
         return self._active_done.wait(timeout)
+
+
+class _ModelLockRegistry:
+    """One lock per browser tab, created on demand.
+
+    A single global lock serialised every model against every other model, so a
+    request to one chat blocked an unrelated request to a different chat for
+    the entire answer. Playwright dispatches all page operations to a single
+    worker thread, so distinct pages are already safe to drive concurrently;
+    only requests targeting the *same* tab need to serialise, because one tab
+    shows one conversation.
+    """
+
+    def __init__(self) -> None:
+        self._guard = threading.Lock()
+        self._locks: dict[str, threading.Lock] = {}
+
+    def get(self, model: str) -> threading.Lock:
+        """Return the lock for `model`, creating it if needed."""
+        with self._guard:
+            lock = self._locks.get(model)
+            if lock is None:
+                lock = threading.Lock()
+                self._locks[model] = lock
+            return lock
+
+    def busy_models(self) -> list[str]:
+        """Return the models whose tab is currently in use."""
+        with self._guard:
+            return [m for m, lock in self._locks.items() if lock.locked()]
 
 
 class OpenAIHandler(BaseHTTPRequestHandler):
@@ -145,20 +219,32 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             request_id,
         )
 
+    def _send_sse_comment(self) -> None:
+        """Emit an SSE comment. Ignored by clients, but proves liveness.
+
+        A disconnect surfaces as BrokenPipeError/ConnectionError to the caller,
+        which already handles a client going away mid-stream.
+        """
+        self.wfile.write(b": keepalive\n\n")
+        self.wfile.flush()
+
     def _send_sse(self, data: str) -> None:
         """Write one server-sent event and flush it immediately."""
-        try:
-            self.wfile.write(f"data: {data}\n\n".encode())
-            self.wfile.flush()
-        except (BrokenPipeError, ConnectionError):
-            raise
+        self.wfile.write(f"data: {data}\n\n".encode())
+        self.wfile.flush()
 
     def _send_sse_headers(self, request_id: str) -> None:
         """Send headers for an OpenAI-compatible streaming response."""
+        # A streaming body has no Content-Length, so the client can only
+        # detect the end of the response by the [DONE] sentinel or by the
+        # connection closing. This handler speaks HTTP/1.0 and never really
+        # keeps the socket alive, so advertising `Connection: keep-alive`
+        # left clients waiting on a socket that stayed open indefinitely.
+        self.close_connection = True
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
+        self.send_header("Connection", "close")
         self.send_header("X-Accel-Buffering", "no")
         if request_id:
             self.send_header(REQUEST_ID_HEADER, request_id)
@@ -316,8 +402,11 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             model, site_id, url,
         )
         new_page = recover_page(url)
-        if new_page is not None and self.server is not None:
-            self.server.tab_map[model] = new_page
+        if new_page is not None:
+            # `self.tab_map` is the dict shared with the Server that owns the
+            # pages. Writing to `self.server.tab_map` would update a different
+            # mapping and leave later requests pointing at the dead page.
+            self.tab_map[model] = new_page
         return new_page
 
     def _inject_and_submit(
@@ -420,21 +509,212 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                     return content
         return ""
 
-    def _acquire_browser_lock(self):
-        """Acquire the browser lock and return (lock, acquired, timeout)."""
+    def _acquire_browser_lock(self, model: str):
+        """Acquire the lock for `model`'s tab; returns (lock, acquired, timeout).
+
+        The lock is per tab, not global, so a request to one chat never blocks
+        an unrelated chat. `lock` is None when acquisition failed, so the
+        caller cannot accidentally release a lock it does not hold.
+        """
         server_obj = getattr(self, "server", None)
-        browser_lock = getattr(server_obj, "browser_lock", None)
-        browser_lock_timeout = getattr(
-            server_obj, "browser_lock_timeout", DEFAULT_BROWSER_LOCK_TIMEOUT
+        registry = getattr(server_obj, "model_locks", None)
+        browser_lock_timeout = self._server_setting(
+            "browser_lock_timeout", DEFAULT_BROWSER_LOCK_TIMEOUT
         )
-        if browser_lock is None:
+        if registry is None:
             return None, True, 0
-        acquired = browser_lock.acquire(timeout=browser_lock_timeout)
-        return browser_lock, acquired, browser_lock_timeout
+        lock = registry.get(model)
+        acquired = lock.acquire(timeout=browser_lock_timeout)
+        return (lock if acquired else None), acquired, browser_lock_timeout
 
     def _release_browser_lock(self, browser_lock) -> None:
         if browser_lock is not None:
             browser_lock.release()
+
+    def _busy_models(self) -> list[str]:
+        """Models whose tab is currently serving another request."""
+        registry = getattr(getattr(self, "server", None), "model_locks", None)
+        if registry is None:
+            return []
+        return registry.busy_models()
+
+    def _send_busy_error(self, request_id: str, model: str, timeout: float) -> None:
+        """Report a tab-busy conflict with actionable detail."""
+        busy = ", ".join(self._busy_models()) or model
+        self._send_error(
+            503,
+            f"Model '{model}' is already answering another request (busy: {busy}). "
+            f"Waited {timeout:g}s. Send one request per model at a time, or raise "
+            "browser_lock_timeout.",
+            "server_error",
+            request_id,
+        )
+
+    def _server_setting(self, name: str, default: Any) -> Any:
+        """Read a runtime setting published by Server onto the HTTP server."""
+        server_obj = getattr(self, "server", None)
+        value = getattr(server_obj, name, None)
+        return default if value is None else value
+
+    def _sse_chunk(
+        self,
+        completion_id: str,
+        created: int,
+        model: str,
+        delta: dict,
+        finish_reason: str | None = None,
+    ) -> None:
+        """Write one OpenAI-compatible `chat.completion.chunk` SSE event."""
+        self._send_sse(
+            json.dumps(
+                {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [
+                        {"index": 0, "delta": delta, "finish_reason": finish_reason}
+                    ],
+                }
+            )
+        )
+
+    def _stream_web_chat(
+        self,
+        page,
+        extraction: str,
+        baseline: dict | None,
+        completion_id: str,
+        created: int,
+        model: str,
+        browser_timeout: float,
+    ) -> dict:
+        """Poll a web chat and stream its thinking + answer as they appear.
+
+        Returns the final extraction result with a `stop_reason` saying why
+        polling ended, so the handler can report a real failure instead of
+        leaving the client waiting.
+
+        Termination is guaranteed. The loop exits on the first of:
+          * the site finishing after having been seen generating (`site_done`),
+          * the payload going idle while the site is not generating (`idle`),
+          * an unchanged payload outlasting the busy patience (`busy_timeout`),
+          * no output at all after the prompt (`no_output`),
+          * the overall budget elapsing (`budget_exhausted`).
+
+        Truncation guard: web chats pause routinely mid-answer, so an unchanged
+        payload is not treated as finished while the site still claims to be
+        generating. The busy patience is what stops that tolerance from turning
+        into an indefinite hang.
+        """
+        setting = self._server_setting
+        idle_timeout = float(setting("response_idle_timeout", DEFAULT_RESPONSE_IDLE_TIMEOUT))
+        done_confirm = float(setting("response_done_confirm", DEFAULT_RESPONSE_DONE_CONFIRM))
+        busy_patience = float(setting("busy_patience", DEFAULT_BUSY_PATIENCE))
+        first_token_timeout = float(
+            setting("first_token_timeout", DEFAULT_FIRST_TOKEN_TIMEOUT)
+        )
+        poll_interval = float(setting("poll_interval", DEFAULT_POLL_INTERVAL))
+        keepalive_interval = float(
+            setting("keepalive_interval", DEFAULT_KEEPALIVE_INTERVAL)
+        )
+        started_at = time.monotonic()
+        deadline = started_at + max(float(browser_timeout), 1.0)
+        last_content = ""
+        last_thinking = ""
+        role_sent = False
+        saw_busy = False
+        got_output = False
+        last_change_at: float | None = None
+        last_keepalive_at: float = started_at
+        response = {
+            "found": False,
+            "content": "",
+            "thinking": None,
+            "busy": False,
+            "done": False,
+            "count": 0,
+        }
+
+        def finish(reason: str, *, done: bool = True) -> dict:
+            response["stop_reason"] = reason
+            response["done"] = done
+            return response
+
+        while True:
+            now = time.monotonic()
+            if now > deadline:
+                return finish("budget_exhausted", done=bool(response.get("done")))
+            try:
+                response = capture_response(page, extraction)
+            except (BrowserError, BrowserOperationTimeout) as e:
+                # A wedged browser thread surfaces here; end the stream
+                # instead of holding the browser lock until the deadline.
+                raise BrowserError(f"Response capture failed: {e}") from e
+
+            content = response.get("content") or ""
+            thinking = response.get("thinking") or ""
+            busy = bool(response.get("busy"))
+            if busy:
+                saw_busy = True
+
+            is_new = self._is_new_response(response, baseline)
+            if is_new and (content or thinking):
+                got_output = True
+
+            if not is_new:
+                # Nothing new on screen yet. Never spin silently: if the web
+                # chat has produced nothing at all, say so and stop, instead
+                # of holding the tab until the budget runs out.
+                if not got_output and now - started_at >= first_token_timeout:
+                    return finish("no_output", done=False)
+                if now - last_keepalive_at >= keepalive_interval:
+                    # A long silence reads as a dead connection; an SSE
+                    # comment keeps the client (and any proxy) satisfied.
+                    self._send_sse_comment()
+                    last_keepalive_at = now
+                time.sleep(poll_interval)
+                continue
+
+            delta: dict[str, Any] = {}
+            if not role_sent:
+                # Announce the role on the first chunk even when it only
+                # carries reasoning, so thinking-only turns stay valid.
+                delta["role"] = "assistant"
+                role_sent = True
+            changed = False
+            if content != last_content:
+                changed = True
+                delta["content"] = content.removeprefix(last_content)
+                last_content = content
+            if thinking and thinking != last_thinking:
+                changed = True
+                delta["thinking"] = thinking.removeprefix(last_thinking)
+                last_thinking = thinking
+
+            if delta:
+                self._sse_chunk(completion_id, created, model, delta)
+
+            now = time.monotonic()
+            if changed:
+                # Track only real payload movement. Resetting on `busy` as
+                # well made the elapsed time always ~0, so the busy-patience
+                # guard could never fire and a site with a stuck spinner held
+                # the tab until the budget ran out.
+                last_change_at = now
+            stable_for = now - last_change_at if last_change_at is not None else 0.0
+
+            if saw_busy and not busy and response.get("done") and stable_for >= done_confirm:
+                return finish("site_done")
+            if not busy and (content or thinking) and stable_for >= idle_timeout:
+                return finish("idle")
+            if busy and (content or thinking) and stable_for >= busy_patience:
+                # The site never stopped claiming to generate, yet the text
+                # has not moved for a long time. Do not wait forever.
+                return finish("busy_timeout", done=False)
+            if not got_output and now - started_at >= first_token_timeout:
+                return finish("no_output", done=False)
+            time.sleep(poll_interval)
 
     def _handle_streaming_chat_completions(
         self,
@@ -449,25 +729,20 @@ class OpenAIHandler(BaseHTTPRequestHandler):
     ) -> None:
         """Handle an SSE-streamed chat completion."""
         logger = logging.getLogger(__name__)
-        browser_lock, lock_acquired, lock_timeout = self._acquire_browser_lock()
+        browser_lock, lock_acquired, lock_timeout = self._acquire_browser_lock(model)
         if not lock_acquired:
             logger.warning(
-                "chat_completion lock_acquired",
+                "chat_completion tab_busy",
                 extra={
                     "model": model,
                     "tab_index": tab_index,
                     "lock_timeout": lock_timeout,
+                    "busy_models": self._busy_models(),
                     "request_id": request_id,
                     "stream": True,
                 },
             )
-            self._send_error(
-                503,
-                "Server busy: could not acquire browser lock within timeout. "
-                "Reduce concurrent requests or increase browser_lock_timeout.",
-                "server_error",
-                request_id,
-            )
+            self._send_busy_error(request_id, model, lock_timeout)
             _update_metrics(time.monotonic() - request_start, error=True, error_type="lock_timeout")
             return
 
@@ -475,16 +750,6 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         created = int(time.time())
         extraction = extract_js(site_id)
         headers_sent = False
-        last_emitted = ""
-        last_thinking = ""
-        role_sent = False
-        response = {
-            "found": False,
-            "content": "",
-            "thinking": None,
-            "done": False,
-            "count": 0,
-        }
         try:
             if extraction is None:
                 logger.warning(
@@ -597,149 +862,70 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                 _update_metrics(time.monotonic() - request_start, error=True, error_type="extraction_unsupported")
                 return
 
-            deadline = time.monotonic() + max(float(browser_timeout), 1.0)
-            idle_deadline = deadline
-            idle_timeout = min(float(browser_timeout), 10.0)
             self._send_sse_headers(request_id)
             headers_sent = True
-            while time.monotonic() <= deadline:
-                response = capture_response(page, extraction)
-
-                # Check done condition even when content hasn't changed,
-                # so we don't miss a transition from loading -> idle.
-                if response.get("done") and self._is_new_response(response, baseline):
-                    content = response.get("content", "")
-                    thinking = response.get("thinking") or ""
-                    delta = {}
-                    if content and not role_sent:
-                        delta = {"role": "assistant", "content": content}
-                        role_sent = True
-                        last_emitted = content
-                    elif content != last_emitted:
-                        if content.startswith(last_emitted):
-                            delta_content = content[len(last_emitted) :]
-                        else:
-                            delta_content = content
-                        if delta_content:
-                            delta = {"content": delta_content}
-                        last_emitted = content
-                    if thinking and thinking != last_thinking:
-                        delta["thinking"] = thinking.removeprefix(last_thinking)
-                        last_thinking = thinking
-                    if delta:
-                        self._send_sse(
-                            json.dumps(
-                                {
-                                    "id": completion_id,
-                                    "object": "chat.completion.chunk",
-                                    "created": created,
-                                    "model": model,
-                                    "choices": [
-                                        {
-                                            "index": 0,
-                                            "delta": delta,
-                                            "finish_reason": None,
-                                        }
-                                    ],
-                                }
-                            )
-                        )
-                    break
-
-                if not self._is_new_response(response, baseline):
-                    time.sleep(0.25)
-                    continue
-
-                content = response.get("content", "")
-                thinking = response.get("thinking") or ""
-                if content and not role_sent:
-                    delta = {"role": "assistant", "content": content}
-                    role_sent = True
-                    last_emitted = content
-                elif content != last_emitted:
-                    if content.startswith(last_emitted):
-                        delta_content = content[len(last_emitted) :]
-                    else:
-                        delta_content = content
-                    if delta_content:
-                        delta = {"content": delta_content}
-                    else:
-                        delta = {}
-                    last_emitted = content
-                else:
-                    delta = {}
-
-                if thinking and thinking != last_thinking:
-                    delta["thinking"] = thinking.removeprefix(last_thinking)
-                    last_thinking = thinking
-
-                if delta:
-                    self._send_sse(
-                        json.dumps(
-                            {
-                                "id": completion_id,
-                                "object": "chat.completion.chunk",
-                                "created": created,
-                                "model": model,
-                                "choices": [
-                                    {
-                                        "index": 0,
-                                        "delta": delta,
-                                        "finish_reason": None,
-                                    }
-                                ],
-                            }
-                        )
-                    )
-                    headers_sent = True
-
-                if response.get("done"):
-                    break
-                # Track idle time: reset timer whenever content changes
-                if content != last_emitted or thinking != last_thinking:
-                    idle_deadline = time.monotonic() + idle_timeout
-                elif time.monotonic() >= idle_deadline and response.get("content"):
-                    # Content is stable for the idle window — treat as done
-                    response["done"] = True
-                    break
-                time.sleep(0.25)
-
-            if not role_sent and response.get("content"):
-                self._send_sse(
-                    json.dumps(
-                        {
-                            "id": completion_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": model,
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {"role": "assistant", "content": response["content"]},
-                                    "finish_reason": None,
-                                }
-                            ],
-                        }
-                    )
+            response = self._stream_web_chat(
+                page,
+                extraction,
+                baseline,
+                completion_id,
+                created,
+                model,
+                browser_timeout,
+            )
+            stop_reason = response.get("stop_reason", "unknown")
+            stopped_cleanly = bool(response.get("done"))
+            elapsed = time.monotonic() - request_start
+            logger.info(
+                "chat_completion stream_end",
+                extra={
+                    "model": model,
+                    "site_id": site_id,
+                    "tab_index": tab_index,
+                    "request_id": request_id,
+                    "stream": True,
+                    "stop_reason": stop_reason,
+                    "duration_ms": int(elapsed * 1000),
+                    "chars": len(response.get("content") or ""),
+                    "has_thinking": bool(response.get("thinking")),
+                },
+            )
+            if not response.get("content") and not response.get("thinking"):
+                # Never end an empty stream without saying why: a silent
+                # empty response is indistinguishable from a hang in the
+                # local chat, and gives nothing to debug with.
+                detail = {
+                    "no_output": (
+                        f"The {site_id} page produced no answer within "
+                        f"{self._server_setting('first_token_timeout', DEFAULT_FIRST_TOKEN_TIMEOUT):g}s. "
+                        "Check the browser tab is logged in, that the message "
+                        "was actually sent, and that the response selectors "
+                        "in sites.py still match the page."
+                    ),
+                    "busy_timeout": (
+                        f"The {site_id} page kept reporting 'generating' without "
+                        "changing its text. Returning what was captured."
+                    ),
+                    "budget_exhausted": (
+                        f"The {site_id} answer did not finish within "
+                        f"{browser_timeout:g}s. Returning what was captured."
+                    ),
+                }.get(
+                    stop_reason,
+                    f"No answer text could be extracted from {site_id}.",
                 )
-                headers_sent = True
-
-            self._send_sse(
-                json.dumps(
-                    {
-                        "id": completion_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {},
-                                "finish_reason": "stop" if response.get("done") else "length",
-                            }
-                        ],
-                    }
+                self._sse_chunk(
+                    completion_id, created, model, {"content": f"[sbsllm] {detail}"}
                 )
+
+            # Always finish the stream: a terminal chunk followed by the
+            # [DONE] sentinel. Without this the local chat kept waiting.
+            self._sse_chunk(
+                completion_id,
+                created,
+                model,
+                {},
+                finish_reason="stop" if stopped_cleanly else "length",
             )
             self._send_sse("[DONE]")
             headers_sent = True
@@ -798,11 +984,13 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                         }
                     )
                 )
+                # Always close the stream, even on failure, or the client
+                # waits for a response that will never come.
                 self._send_sse("[DONE]")
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             elapsed = time.monotonic() - request_start
             snapshot = get_page_snapshot(page)
-            logger.error(
+            logger.exception(
                 "chat_completion request_end",
                 extra={
                     "model": model,
@@ -816,7 +1004,6 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                     "page_url": snapshot.get("url"),
                     "page_title": snapshot.get("title"),
                 },
-                exc_info=True,
             )
             _update_metrics(elapsed, error=True, error_type=type(e).__name__)
             if not headers_sent:
@@ -840,18 +1027,20 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                         }
                     )
                 )
+                # Always close the stream, even on failure, or the client
+                # waits for a response that will never come.
                 self._send_sse("[DONE]")
         finally:
             self._release_browser_lock(browser_lock)
 
     def _is_new_response(self, response: dict, baseline: dict | None) -> bool:
-        if baseline is None:
-            return response.get("found", False)
-        if response.get("count", 0) > baseline.get("count", 0):
-            return True
-        return response.get("found", False) and response.get("content", "") != baseline.get(
-            "content", ""
-        )
+        """Delegate to the shared implementation.
+
+        This used to be a second, divergent copy: it was missing the thinking
+        check, so the non-streaming path could never recognise a
+        thinking-only turn as a new response.
+        """
+        return is_new_response(response, baseline)
 
     def _handle_chat_completions(self) -> None:
         """Handle a chat completion request."""
@@ -962,9 +1151,8 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             },
         )
 
-        server_obj = getattr(self, "server", None)
-        browser_timeout = getattr(
-            server_obj, "browser_timeout", DEFAULT_BROWSER_TIMEOUT
+        browser_timeout = self._server_setting(
+            "browser_timeout", DEFAULT_BROWSER_TIMEOUT
         )
         if stream:
             self._handle_streaming_chat_completions(
@@ -980,25 +1168,20 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             return
 
         # Serialize browser automation: Playwright pages are not thread-safe.
-        browser_lock, lock_acquired, lock_timeout = self._acquire_browser_lock()
+        browser_lock, lock_acquired, lock_timeout = self._acquire_browser_lock(model)
         if not lock_acquired:
             logger.warning(
-                "chat_completion lock_acquired",
+                "chat_completion tab_busy",
                 extra={
                     "model": model,
                     "tab_index": tab_index,
                     "lock_timeout": lock_timeout,
+                    "busy_models": self._busy_models(),
                     "request_id": request_id,
                     "stream": False,
                 },
             )
-            self._send_error(
-                503,
-                "Server busy: could not acquire browser lock within timeout. "
-                "Reduce concurrent requests or increase browser_lock_timeout.",
-                "server_error",
-                request_id,
-            )
+            self._send_busy_error(request_id, model, lock_timeout)
             _update_metrics(time.monotonic() - request_start, error=True, error_type="lock_timeout")
             return
 
@@ -1020,7 +1203,12 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                     page,
                     extraction,
                     browser_timeout,
-                    idle_timeout=min(float(browser_timeout), 10.0),
+                    idle_timeout=self._server_setting(
+                        "response_idle_timeout", DEFAULT_RESPONSE_IDLE_TIMEOUT
+                    ),
+                    poll_interval=self._server_setting(
+                        "poll_interval", DEFAULT_POLL_INTERVAL
+                    ),
                     baseline=baseline,
                 )
         except BrowserError as e:
@@ -1043,10 +1231,36 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             _update_metrics(elapsed, error=True, error_type="browser_error")
             self._send_error(502, f"Browser error: {e}. Try restarting the browser.", "server_error", request_id)
             return
-        except Exception as e:  # noqa: BLE001
+        except BrowserOperationTimeout as e:
+            # A browser operation that never completed means the Playwright
+            # worker thread is wedged (e.g. a page.evaluate() on a stalled
+            # page main thread). Every later browser call will fail too, so
+            # say so plainly instead of reporting a generic 500.
+            elapsed = time.monotonic() - request_start
+            logger.error(
+                "chat_completion browser_unresponsive",
+                extra={
+                    "model": model,
+                    "tab_index": tab_index,
+                    "duration_ms": int(elapsed * 1000),
+                    "error": str(e),
+                    "error_type": "browser_timeout",
+                    "request_id": request_id,
+                },
+            )
+            _update_metrics(elapsed, error=True, error_type="browser_timeout")
+            self._send_error(
+                502,
+                f"Browser is unresponsive: {e}. The browser worker thread is "
+                "blocked and will not recover on its own — restart sbsllm.",
+                "server_error",
+                request_id,
+            )
+            return
+        except Exception as e:
             elapsed = time.monotonic() - request_start
             snapshot = get_page_snapshot(page)
-            logger.error(
+            logger.exception(
                 "chat_completion request_end",
                 extra={
                     "model": model,
@@ -1059,7 +1273,6 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                     "page_url": snapshot.get("url"),
                     "page_title": snapshot.get("title"),
                 },
-                exc_info=True,
             )
             _update_metrics(elapsed, error=True, error_type=type(e).__name__)
             self._send_error(500, f"Internal error: {e}", "server_error", request_id)
@@ -1300,6 +1513,12 @@ class Server:
         browser_timeout: int = DEFAULT_BROWSER_TIMEOUT,
         browser_lock_timeout: int = DEFAULT_BROWSER_LOCK_TIMEOUT,
         health_interval: float = DEFAULT_HEALTH_INTERVAL,
+        response_idle_timeout: float = DEFAULT_RESPONSE_IDLE_TIMEOUT,
+        response_done_confirm: float = DEFAULT_RESPONSE_DONE_CONFIRM,
+        busy_patience: float = DEFAULT_BUSY_PATIENCE,
+        first_token_timeout: float = DEFAULT_FIRST_TOKEN_TIMEOUT,
+        keepalive_interval: float = DEFAULT_KEEPALIVE_INTERVAL,
+        poll_interval: float = DEFAULT_POLL_INTERVAL,
     ):
         self.model_map = model_map or {}
         self.tab_map = tab_map or {}
@@ -1308,13 +1527,19 @@ class Server:
         self.browser_timeout = browser_timeout
         self.browser_lock_timeout = browser_lock_timeout
         self.health_interval = max(float(health_interval), 1.0)
+        self.response_idle_timeout = max(float(response_idle_timeout), 0.1)
+        self.response_done_confirm = max(float(response_done_confirm), 0.0)
+        self.busy_patience = max(float(busy_patience), 0.1)
+        self.first_token_timeout = max(float(first_token_timeout), 0.1)
+        self.keepalive_interval = max(float(keepalive_interval), 0.1)
+        self.poll_interval = max(float(poll_interval), 0.01)
         self._server: _SBSHTTPServer | None = None
         self._ready = threading.Event()
         self._startup_error: BaseException | None = None
         self._serve_thread: threading.Thread | None = None
         self._stop_requested = threading.Event()
         self._state_lock = threading.Lock()
-        self.browser_lock = threading.Lock()
+        self.model_locks = _ModelLockRegistry()
         self._health_thread: threading.Thread | None = None
         self._shutdown_initiated = False
         self._signal_handler_installed = False
@@ -1390,6 +1615,19 @@ class Server:
             server.daemon_threads = True
             server.block_on_close = False
             server.timeout = 0.1
+            # Handlers resolve these via `self.server`; without them they
+            # silently fell back to defaults.
+            server.model_locks = self.model_locks
+            server.browser_lock_timeout = self.browser_lock_timeout
+            server.browser_timeout = self.browser_timeout
+            server.response_idle_timeout = self.response_idle_timeout
+            server.response_done_confirm = self.response_done_confirm
+            server.busy_patience = self.busy_patience
+            server.first_token_timeout = self.first_token_timeout
+            server.keepalive_interval = self.keepalive_interval
+            server.poll_interval = self.poll_interval
+            server.model_map = self.model_map
+            server.tab_map = self.tab_map
             if announce:
                 print(
                     f"sbsllm server listening on {self.url.rstrip('/')}",
@@ -1485,7 +1723,7 @@ class Server:
         while not self._stop_requested.is_set():
             try:
                 self._check_tab_health_once(logger)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.debug("Health monitor iteration failed", exc_info=True)
             self._stop_requested.wait(timeout=self.health_interval)
 
@@ -1503,7 +1741,7 @@ class Server:
                 continue
             try:
                 healthy = check_page_health(page)
-            except Exception:  # noqa: BLE001
+            except (PlaywrightError, RuntimeError, BrowserError, BrowserOperationTimeout):
                 healthy = False
             if not healthy:
                 logger.warning(
@@ -1528,6 +1766,12 @@ def create_server(
     browser_timeout: int = DEFAULT_BROWSER_TIMEOUT,
     browser_lock_timeout: int = DEFAULT_BROWSER_LOCK_TIMEOUT,
     health_interval: float = DEFAULT_HEALTH_INTERVAL,
+    response_idle_timeout: float = DEFAULT_RESPONSE_IDLE_TIMEOUT,
+    response_done_confirm: float = DEFAULT_RESPONSE_DONE_CONFIRM,
+    busy_patience: float = DEFAULT_BUSY_PATIENCE,
+    first_token_timeout: float = DEFAULT_FIRST_TOKEN_TIMEOUT,
+    keepalive_interval: float = DEFAULT_KEEPALIVE_INTERVAL,
+    poll_interval: float = DEFAULT_POLL_INTERVAL,
 ) -> Server:
     """Create a new server instance."""
     return Server(
@@ -1538,4 +1782,10 @@ def create_server(
         browser_timeout=browser_timeout,
         browser_lock_timeout=browser_lock_timeout,
         health_interval=health_interval,
+        response_idle_timeout=response_idle_timeout,
+        response_done_confirm=response_done_confirm,
+        busy_patience=busy_patience,
+        first_token_timeout=first_token_timeout,
+        keepalive_interval=keepalive_interval,
+        poll_interval=poll_interval,
     )
