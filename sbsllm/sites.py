@@ -341,6 +341,27 @@ _RESPONSE_TEMPLATE = """
             return tag === 'button' || element.getAttribute('role') === 'button';
         });
         const busy = loading.length > 0;
+        // Login-wall detection: a positive signal that the chat requires a
+        // signed-in session. Checked AFTER a submit attempt so that a
+        // logged-out home page (where `found` is legitimately false) does
+        // not trigger a false positive. The page text is the most reliable
+        // cross-site signal; specific selectors are site-specific bonuses.
+        let loginWall = false;
+        const bodyText = (document.body && document.body.innerText) || '';
+        const loginPatterns = [
+            /sign up to continue/i,
+            /sign in to continue/i,
+            /please log in to continue/i,
+            /login to continue/i,
+            /continue your conversation/i,
+            /you must be logged in/i,
+        ];
+        for (const pattern of loginPatterns) {
+            if (pattern.test(bodyText)) {
+                loginWall = true;
+                break;
+            }
+        }
         return {
             found: response !== null,
             content: content,
@@ -353,6 +374,11 @@ _RESPONSE_TEMPLATE = """
             busy: busy,
             done: response !== null && !isWorking && !busy,
             count: responseCount,
+            // `login_wall` is a positive signal that the chat requires a
+            // signed-in session. It is checked AFTER a submit attempt so
+            // that a logged-out home page (where `found` is legitimately
+            // false) does not trigger a false positive.
+            login_wall: loginWall,
         };
     })()
     """

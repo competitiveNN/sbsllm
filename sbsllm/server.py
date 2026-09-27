@@ -894,26 +894,32 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                 # Never end an empty stream without saying why: a silent
                 # empty response is indistinguishable from a hang in the
                 # local chat, and gives nothing to debug with.
-                detail = {
-                    "no_output": (
-                        f"The {site_id} page produced no answer within "
-                        f"{self._server_setting('first_token_timeout', DEFAULT_FIRST_TOKEN_TIMEOUT):g}s. "
-                        "Check the browser tab is logged in, that the message "
-                        "was actually sent, and that the response selectors "
-                        "in sites.py still match the page."
-                    ),
-                    "busy_timeout": (
-                        f"The {site_id} page kept reporting 'generating' without "
-                        "changing its text. Returning what was captured."
-                    ),
-                    "budget_exhausted": (
-                        f"The {site_id} answer did not finish within "
-                        f"{browser_timeout:g}s. Returning what was captured."
-                    ),
-                }.get(
-                    stop_reason,
-                    f"No answer text could be extracted from {site_id}.",
-                )
+                if response.get("login_wall"):
+                    detail = (
+                        f"The {site_id} chat requires a signed-in session. "
+                        f"Please log in to {site_id} in the browser tab, then retry."
+                    )
+                else:
+                    detail = {
+                        "no_output": (
+                            f"The {site_id} page produced no answer within "
+                            f"{self._server_setting('first_token_timeout', DEFAULT_FIRST_TOKEN_TIMEOUT):g}s. "
+                            "Check the browser tab is logged in, that the message "
+                            "was actually sent, and that the response selectors "
+                            "in sites.py still match the page."
+                        ),
+                        "busy_timeout": (
+                            f"The {site_id} page kept reporting 'generating' without "
+                            "changing its text. Returning what was captured."
+                        ),
+                        "budget_exhausted": (
+                            f"The {site_id} answer did not finish within "
+                            f"{browser_timeout:g}s. Returning what was captured."
+                        ),
+                    }.get(
+                        stop_reason,
+                        f"No answer text could be extracted from {site_id}.",
+                    )
                 self._sse_chunk(
                     completion_id, created, model, {"content": f"[sbsllm] {detail}"}
                 )
@@ -1392,6 +1398,7 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                 return
             if not response_result.get("found"):
                 snapshot = get_page_snapshot(page)
+                page_text = snapshot.get("text_preview", "")[:200]
                 logger.warning(
                     "chat_completion no_response",
                     extra={
@@ -1400,9 +1407,20 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                         "request_id": request_id,
                         "page_url": snapshot.get("url"),
                         "page_title": snapshot.get("title"),
-                        "page_text_preview": snapshot.get("text_preview", "")[:200],
+                        "page_text_preview": page_text,
+                        "login_wall": response_result.get("login_wall"),
                     },
                 )
+                if response_result.get("login_wall"):
+                    self._send_error(
+                        502,
+                        f"The {site_id} chat requires a signed-in session. "
+                        f"Please log in to {site_id} in the browser tab, then retry.",
+                        "server_error",
+                        request_id,
+                    )
+                    _update_metrics(time.monotonic() - request_start, error=True, error_type="login_required")
+                    return
                 self._send_error(
                     504,
                     "No assistant response was detected after submission. "

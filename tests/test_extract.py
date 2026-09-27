@@ -302,3 +302,29 @@ class TestZaiLoadingDots:
         assert result["busy"] is False
         assert result["done"] is True
         assert result["content"] == "42"
+
+    def test_login_wall_detected_after_submit(self, extract_page):
+        """A page that shows 'Sign up to continue' after submission must
+        report login_wall=True so the server can surface a login error
+        instead of a silent empty response."""
+        html = """
+        <div id="response-content-container">
+            <div class="markdown-prose"><p>Say hello</p></div>
+        </div>
+        <div>Continue your conversation</div>
+        <div>Sign up to continue seamlessly with Grok</div>
+        """
+        result = _extract(extract_page, html)
+        assert result["login_wall"] is True, (
+            "login_wall must be True when the page shows a sign-up wall"
+        )
+
+    def test_no_login_wall_on_normal_page(self, extract_page):
+        """A normal page without login prompts must report login_wall=False."""
+        html = """
+        <div id="response-content-container">
+            <div class="markdown-prose"><p>42</p></div>
+        </div>
+        """
+        result = _extract(extract_page, html)
+        assert result["login_wall"] is False
