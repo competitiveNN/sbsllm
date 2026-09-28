@@ -51,6 +51,13 @@ DEFAULT_RESPONSE_DONE_CONFIRM = 0.75
 # and cutting there truncates the reply -- but a site whose spinner never
 # clears must not hold the tab until browser_timeout.
 DEFAULT_BUSY_PATIENCE = 20.0
+# Tolerance for a *thinking-only* stall: content is still empty, only the
+# reasoning trace is present, and the site keeps reporting "generating".
+# Thinking traces update in bursts with natural pauses between chunks, and
+# models like o1 / deepseek-reasoner / Claude-thinking can think for minutes,
+# so this must be far larger than DEFAULT_BUSY_PATIENCE. A site whose
+# thinking never moves again after this is genuinely stuck.
+DEFAULT_THINKING_PATIENCE = 120.0
 # After submitting, how long to wait for the web chat to produce any output at
 # all. Without this a selector mismatch meant silence until browser_timeout,
 # and the local chat simply spun forever.
@@ -115,6 +122,7 @@ class _SBSHTTPServer(ThreadingHTTPServer):
         self.response_idle_timeout: float = DEFAULT_RESPONSE_IDLE_TIMEOUT
         self.response_done_confirm: float = DEFAULT_RESPONSE_DONE_CONFIRM
         self.busy_patience: float = DEFAULT_BUSY_PATIENCE
+        self.thinking_patience: float = DEFAULT_THINKING_PATIENCE
         self.first_token_timeout: float = DEFAULT_FIRST_TOKEN_TIMEOUT
         self.keepalive_interval: float = DEFAULT_KEEPALIVE_INTERVAL
         self.poll_interval: float = DEFAULT_POLL_INTERVAL
@@ -399,7 +407,9 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         logger = logging.getLogger(__name__)
         logger.info(
             "recovering page for model=%s site=%s url=%s",
-            model, site_id, url,
+            model,
+            site_id,
+            url,
         )
         new_page = recover_page(url)
         if new_page is not None:
@@ -444,20 +454,13 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         status = self._inject_and_submit(page, site_id, prompt, tab_index)
 
         # Only attempt recovery if the page was unhealthy to begin with.
-        if (
-            status.get("inject") == "BROWSER_ERROR: page unhealthy"
-            and max_retries > 0
-        ):
+        if status.get("inject") == "BROWSER_ERROR: page unhealthy" and max_retries > 0:
             logger = logging.getLogger(__name__)
-            logger.warning(
-                "Page unhealthy for model=%s; attempting recovery", model
-            )
+            logger.warning("Page unhealthy for model=%s; attempting recovery", model)
             new_page = self._recover_page(model, site_id)
             if new_page is not None:
                 page = new_page
-                status = self._inject_and_submit(
-                    page, site_id, prompt, tab_index
-                )
+                status = self._inject_and_submit(page, site_id, prompt, tab_index)
         return status, page
 
     def _message_text(self, message: dict) -> str:
@@ -608,9 +611,16 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         into an indefinite hang.
         """
         setting = self._server_setting
-        idle_timeout = float(setting("response_idle_timeout", DEFAULT_RESPONSE_IDLE_TIMEOUT))
-        done_confirm = float(setting("response_done_confirm", DEFAULT_RESPONSE_DONE_CONFIRM))
+        idle_timeout = float(
+            setting("response_idle_timeout", DEFAULT_RESPONSE_IDLE_TIMEOUT)
+        )
+        done_confirm = float(
+            setting("response_done_confirm", DEFAULT_RESPONSE_DONE_CONFIRM)
+        )
         busy_patience = float(setting("busy_patience", DEFAULT_BUSY_PATIENCE))
+        thinking_patience = float(
+            setting("thinking_patience", DEFAULT_THINKING_PATIENCE)
+        )
         first_token_timeout = float(
             setting("first_token_timeout", DEFAULT_FIRST_TOKEN_TIMEOUT)
         )
@@ -704,14 +714,28 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                 last_change_at = now
             stable_for = now - last_change_at if last_change_at is not None else 0.0
 
-            if saw_busy and not busy and response.get("done") and stable_for >= done_confirm:
+            if (
+                saw_busy
+                and not busy
+                and response.get("done")
+                and stable_for >= done_confirm
+            ):
                 return finish("site_done")
             if not busy and (content or thinking) and stable_for >= idle_timeout:
                 return finish("idle")
-            if busy and (content or thinking) and stable_for >= busy_patience:
-                # The site never stopped claiming to generate, yet the text
-                # has not moved for a long time. Do not wait forever.
-                return finish("busy_timeout", done=False)
+            # A stall while the site still reports generating. A thinking-only
+            # stall (content empty, reasoning present) gets far more patience
+            # than an answer stall: reasoning traces pause naturally between
+            # chunks and thinking models think for minutes, so use
+            # thinking_patience instead of busy_patience for that case.
+            if busy and (content or thinking):
+                thinking_only = not content and bool(thinking)
+                patience = thinking_patience if thinking_only else busy_patience
+                if stable_for >= patience:
+                    return finish(
+                        "thinking_timeout" if thinking_only else "busy_timeout",
+                        done=False,
+                    )
             if not got_output and now - started_at >= first_token_timeout:
                 return finish("no_output", done=False)
             time.sleep(poll_interval)
@@ -743,7 +767,9 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                 },
             )
             self._send_busy_error(request_id, model, lock_timeout)
-            _update_metrics(time.monotonic() - request_start, error=True, error_type="lock_timeout")
+            _update_metrics(
+                time.monotonic() - request_start, error=True, error_type="lock_timeout"
+            )
             return
 
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
@@ -769,7 +795,11 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                     "server_error",
                     request_id,
                 )
-                _update_metrics(time.monotonic() - request_start, error=True, error_type="extraction_unsupported")
+                _update_metrics(
+                    time.monotonic() - request_start,
+                    error=True,
+                    error_type="extraction_unsupported",
+                )
                 return
             baseline = capture_response(page, extraction)
             status, page = self._inject_and_submit_with_recovery(
@@ -792,7 +822,11 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                     "server_error",
                     request_id,
                 )
-                _update_metrics(time.monotonic() - request_start, error=True, error_type="invalid_status")
+                _update_metrics(
+                    time.monotonic() - request_start,
+                    error=True,
+                    error_type="invalid_status",
+                )
                 return
             browser_error = next(
                 (
@@ -824,7 +858,11 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                     "server_error",
                     request_id,
                 )
-                _update_metrics(time.monotonic() - request_start, error=True, error_type="browser_error")
+                _update_metrics(
+                    time.monotonic() - request_start,
+                    error=True,
+                    error_type="browser_error",
+                )
                 return
             if status.get("inject") != "OK" or status.get("submit") not in {
                 "OK",
@@ -850,7 +888,11 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                     "server_error",
                     request_id,
                 )
-                _update_metrics(time.monotonic() - request_start, error=True, error_type="inject_submit_failed")
+                _update_metrics(
+                    time.monotonic() - request_start,
+                    error=True,
+                    error_type="inject_submit_failed",
+                )
                 return
             if not extraction:
                 self._send_error(
@@ -859,7 +901,11 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                     "server_error",
                     request_id,
                 )
-                _update_metrics(time.monotonic() - request_start, error=True, error_type="extraction_unsupported")
+                _update_metrics(
+                    time.monotonic() - request_start,
+                    error=True,
+                    error_type="extraction_unsupported",
+                )
                 return
 
             self._send_sse_headers(request_id)
@@ -911,6 +957,11 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                         "busy_timeout": (
                             f"The {site_id} page kept reporting 'generating' without "
                             "changing its text. Returning what was captured."
+                        ),
+                        "thinking_timeout": (
+                            f"The {site_id} page was thinking for over "
+                            f"{self._server_setting('thinking_patience', DEFAULT_THINKING_PATIENCE):g}s "
+                            "without its reasoning trace changing. Returning what was captured."
                         ),
                         "budget_exhausted": (
                             f"The {site_id} answer did not finish within "
@@ -970,7 +1021,12 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             )
             _update_metrics(elapsed, error=True, error_type="browser_error")
             if not headers_sent:
-                self._send_error(502, f"Browser error: {e}. Try restarting the browser.", "server_error", request_id)
+                self._send_error(
+                    502,
+                    f"Browser error: {e}. Try restarting the browser.",
+                    "server_error",
+                    request_id,
+                )
             else:
                 self._send_sse(
                     json.dumps(
@@ -1013,7 +1069,9 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             )
             _update_metrics(elapsed, error=True, error_type=type(e).__name__)
             if not headers_sent:
-                self._send_error(500, f"Internal error: {e}", "server_error", request_id)
+                self._send_error(
+                    500, f"Internal error: {e}", "server_error", request_id
+                )
             else:
                 self._send_sse(
                     json.dumps(
@@ -1188,7 +1246,9 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                 },
             )
             self._send_busy_error(request_id, model, lock_timeout)
-            _update_metrics(time.monotonic() - request_start, error=True, error_type="lock_timeout")
+            _update_metrics(
+                time.monotonic() - request_start, error=True, error_type="lock_timeout"
+            )
             return
 
         status = None
@@ -1202,7 +1262,8 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             if (
                 isinstance(status, dict)
                 and status.get("inject") == "OK"
-                and status.get("submit") in {"OK", "ENTER_SENT", "ENTER_SENT_UNVERIFIED"}
+                and status.get("submit")
+                in {"OK", "ENTER_SENT", "ENTER_SENT_UNVERIFIED"}
                 and extraction
             ):
                 response_result = wait_for_response(
@@ -1214,6 +1275,9 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                     ),
                     poll_interval=self._server_setting(
                         "poll_interval", DEFAULT_POLL_INTERVAL
+                    ),
+                    thinking_patience=self._server_setting(
+                        "thinking_patience", DEFAULT_THINKING_PATIENCE
                     ),
                     baseline=baseline,
                 )
@@ -1235,7 +1299,12 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                 },
             )
             _update_metrics(elapsed, error=True, error_type="browser_error")
-            self._send_error(502, f"Browser error: {e}. Try restarting the browser.", "server_error", request_id)
+            self._send_error(
+                502,
+                f"Browser error: {e}. Try restarting the browser.",
+                "server_error",
+                request_id,
+            )
             return
         except BrowserOperationTimeout as e:
             # A browser operation that never completed means the Playwright
@@ -1302,7 +1371,11 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                 "server_error",
                 request_id,
             )
-            _update_metrics(time.monotonic() - request_start, error=True, error_type="invalid_status")
+            _update_metrics(
+                time.monotonic() - request_start,
+                error=True,
+                error_type="invalid_status",
+            )
             return
         browser_error = next(
             (
@@ -1332,7 +1405,9 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                 "server_error",
                 request_id,
             )
-            _update_metrics(time.monotonic() - request_start, error=True, error_type="browser_error")
+            _update_metrics(
+                time.monotonic() - request_start, error=True, error_type="browser_error"
+            )
             return
         if status.get("inject") != "OK" or status.get("submit") not in {
             "OK",
@@ -1349,31 +1424,26 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                     "submit_status": status.get("submit"),
                 },
             )
+            # Surface a visible error, not a fake assistant message. The
+            # streaming path already does this; the non-streaming path used to
+            # wrap the failure in a 200 "chat.completion" whose assistant
+            # content read "Failed to inject/submit prompt: ...", which the
+            # local chat rendered as the model's answer.
             if status.get("inject") != "OK":
-                content = f"Failed to inject prompt: {status['inject']}"
+                detail = f"Failed to inject prompt: {status['inject']}"
             else:
-                content = f"Failed to submit: {status['submit']}"
-            response = {
-                "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
-                "object": "chat.completion",
-                "created": int(time.time()),
-                "model": model,
-                "choices": [
-                    {
-                        "index": 0,
-                        "message": {"role": "assistant", "content": content},
-                        "finish_reason": "stop",
-                    }
-                ],
-                "usage": {
-                    "prompt_tokens": 0,
-                    "completion_tokens": 0,
-                    "total_tokens": 0,
-                },
-                "request_id": request_id,
-            }
-            _update_metrics(time.monotonic() - request_start, error=False)
-            self._send_json(200, response, request_id)
+                detail = f"Failed to submit: {status['submit']}"
+            self._send_error(
+                502,
+                f"{detail}. Try refreshing the browser tab or restarting sbsllm.",
+                "server_error",
+                request_id,
+            )
+            _update_metrics(
+                time.monotonic() - request_start,
+                error=True,
+                error_type="inject_submit_failed",
+            )
             return
 
         if extraction:
@@ -1384,7 +1454,11 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                     "server_error",
                     request_id,
                 )
-                _update_metrics(time.monotonic() - request_start, error=True, error_type="extraction_unsupported")
+                _update_metrics(
+                    time.monotonic() - request_start,
+                    error=True,
+                    error_type="extraction_unsupported",
+                )
                 return
             if response_result.get("timed_out"):
                 self._send_error(
@@ -1394,7 +1468,9 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                     "server_error",
                     request_id,
                 )
-                _update_metrics(time.monotonic() - request_start, error=True, error_type="timeout")
+                _update_metrics(
+                    time.monotonic() - request_start, error=True, error_type="timeout"
+                )
                 return
             if not response_result.get("found"):
                 snapshot = get_page_snapshot(page)
@@ -1419,7 +1495,11 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                         "server_error",
                         request_id,
                     )
-                    _update_metrics(time.monotonic() - request_start, error=True, error_type="login_required")
+                    _update_metrics(
+                        time.monotonic() - request_start,
+                        error=True,
+                        error_type="login_required",
+                    )
                     return
                 self._send_error(
                     504,
@@ -1429,7 +1509,11 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                     "server_error",
                     request_id,
                 )
-                _update_metrics(time.monotonic() - request_start, error=True, error_type="no_response")
+                _update_metrics(
+                    time.monotonic() - request_start,
+                    error=True,
+                    error_type="no_response",
+                )
                 return
             content = response_result.get("content", "")
             thinking = response_result.get("thinking") or ""
@@ -1444,7 +1528,11 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                 "server_error",
                 request_id,
             )
-            _update_metrics(time.monotonic() - request_start, error=True, error_type="extraction_unsupported")
+            _update_metrics(
+                time.monotonic() - request_start,
+                error=True,
+                error_type="extraction_unsupported",
+            )
             return
 
         response = {
@@ -1527,7 +1615,9 @@ class Server:
         logger = logging.getLogger(__name__)
         logger.info(
             "recovering page for model=%s site=%s url=%s",
-            model, site_id, url,
+            model,
+            site_id,
+            url,
         )
         new_page = recover_page(url)
         if new_page is not None:
@@ -1546,6 +1636,7 @@ class Server:
         response_idle_timeout: float = DEFAULT_RESPONSE_IDLE_TIMEOUT,
         response_done_confirm: float = DEFAULT_RESPONSE_DONE_CONFIRM,
         busy_patience: float = DEFAULT_BUSY_PATIENCE,
+        thinking_patience: float = DEFAULT_THINKING_PATIENCE,
         first_token_timeout: float = DEFAULT_FIRST_TOKEN_TIMEOUT,
         keepalive_interval: float = DEFAULT_KEEPALIVE_INTERVAL,
         poll_interval: float = DEFAULT_POLL_INTERVAL,
@@ -1560,6 +1651,7 @@ class Server:
         self.response_idle_timeout = max(float(response_idle_timeout), 0.1)
         self.response_done_confirm = max(float(response_done_confirm), 0.0)
         self.busy_patience = max(float(busy_patience), 0.1)
+        self.thinking_patience = max(float(thinking_patience), 0.1)
         self.first_token_timeout = max(float(first_token_timeout), 0.1)
         self.keepalive_interval = max(float(keepalive_interval), 0.1)
         self.poll_interval = max(float(poll_interval), 0.01)
@@ -1653,6 +1745,7 @@ class Server:
             server.response_idle_timeout = self.response_idle_timeout
             server.response_done_confirm = self.response_done_confirm
             server.busy_patience = self.busy_patience
+            server.thinking_patience = self.thinking_patience
             server.first_token_timeout = self.first_token_timeout
             server.keepalive_interval = self.keepalive_interval
             server.poll_interval = self.poll_interval
@@ -1771,7 +1864,12 @@ class Server:
                 continue
             try:
                 healthy = check_page_health(page)
-            except (PlaywrightError, RuntimeError, BrowserError, BrowserOperationTimeout):
+            except (
+                PlaywrightError,
+                RuntimeError,
+                BrowserError,
+                BrowserOperationTimeout,
+            ):
                 healthy = False
             if not healthy:
                 logger.warning(
@@ -1799,6 +1897,7 @@ def create_server(
     response_idle_timeout: float = DEFAULT_RESPONSE_IDLE_TIMEOUT,
     response_done_confirm: float = DEFAULT_RESPONSE_DONE_CONFIRM,
     busy_patience: float = DEFAULT_BUSY_PATIENCE,
+    thinking_patience: float = DEFAULT_THINKING_PATIENCE,
     first_token_timeout: float = DEFAULT_FIRST_TOKEN_TIMEOUT,
     keepalive_interval: float = DEFAULT_KEEPALIVE_INTERVAL,
     poll_interval: float = DEFAULT_POLL_INTERVAL,
@@ -1815,6 +1914,7 @@ def create_server(
         response_idle_timeout=response_idle_timeout,
         response_done_confirm=response_done_confirm,
         busy_patience=busy_patience,
+        thinking_patience=thinking_patience,
         first_token_timeout=first_token_timeout,
         keepalive_interval=keepalive_interval,
         poll_interval=poll_interval,

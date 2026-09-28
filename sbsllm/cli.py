@@ -301,6 +301,7 @@ def run(
             browser_timeout=config.browser_timeout,
             browser_lock_timeout=config.browser_lock_timeout,
             response_idle_timeout=config.response_idle_timeout,
+            thinking_patience=config.thinking_patience,
         )
         server_thread = _start_server(server)
         if server_thread is None:
@@ -424,6 +425,7 @@ def run_server(
             browser_timeout=config.browser_timeout,
             browser_lock_timeout=config.browser_lock_timeout,
             response_idle_timeout=config.response_idle_timeout,
+            thinking_patience=config.thinking_patience,
         )
 
         server_thread = _start_server(server)

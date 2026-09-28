@@ -1,5 +1,6 @@
 """Tests for browser.py."""
 
+import os
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -124,6 +125,42 @@ class TestEnsureBrowser:
             assert call_kwargs["executable_path"] == "/usr/bin/chromium"
             assert "channel" not in call_kwargs
 
+    def test_headless_env_var_controls_mode(self):
+        """SBSLLM_HEADLESS env var should toggle headless mode."""
+        mock_context, _ = self._mock_context()
+        with (
+            patch("sbsllm.browser.sync_playwright") as mock_pw,
+            patch.dict(os.environ, {"SBSLLM_HEADLESS": "true"}),
+            patch("sbsllm.browser._find_system_chromium", return_value=False),
+        ):
+            mock_instance = MagicMock()
+            mock_pw.return_value.start.return_value = mock_instance
+            mock_instance.chromium.launch_persistent_context.return_value = mock_context
+
+            ensure_browser()
+
+            call_kwargs = mock_instance.chromium.launch_persistent_context.call_args[1]
+            assert call_kwargs["headless"] is True
+
+    def test_headless_defaults_to_false(self):
+        """Without SBSLLM_HEADLESS set, headless must default to False."""
+        mock_context, _ = self._mock_context()
+        with (
+            patch("sbsllm.browser.sync_playwright") as mock_pw,
+            patch.dict(os.environ, {}, clear=False),
+            patch("sbsllm.browser._find_system_chromium", return_value=False),
+        ):
+            # Ensure the env var is not set during this test.
+            os.environ.pop("SBSLLM_HEADLESS", None)
+            mock_instance = MagicMock()
+            mock_pw.return_value.start.return_value = mock_instance
+            mock_instance.chromium.launch_persistent_context.return_value = mock_context
+
+            ensure_browser()
+
+            call_kwargs = mock_instance.chromium.launch_persistent_context.call_args[1]
+            assert call_kwargs["headless"] is False
+
     def test_reuses_existing_browser(self):
         mock_context, _ = self._mock_context()
         with patch("sbsllm.browser.sync_playwright") as mock_pw:
@@ -169,6 +206,33 @@ class TestEnsureBrowser:
 
             call_kwargs = mock_instance.chromium.launch_persistent_context.call_args[1]
             assert call_kwargs["executable_path"] == "/usr/bin/google-chrome"
+
+
+class TestIsHeadless:
+    """Unit tests for the is_headless() helper."""
+
+    def test_truthy_values(self):
+        """All common truthy values should return True."""
+        for val in ("1", "true", "TRUE", "True", "yes", "YES", "on", "ON"):
+            with patch.dict(os.environ, {"SBSLLM_HEADLESS": val}):
+                assert browser_module.is_headless() is True, f"{val!r} should be truthy"
+
+    def test_falsy_values(self):
+        """All common falsy values should return False."""
+        for val in ("0", "false", "FALSE", "no", "off", "", "anything"):
+            with patch.dict(os.environ, {"SBSLLM_HEADLESS": val}):
+                assert browser_module.is_headless() is False, f"{val!r} should be falsy"
+
+    def test_missing_env_var(self):
+        """When the env var is not set, is_headless() must return False."""
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SBSLLM_HEADLESS", None)
+            assert browser_module.is_headless() is False
+
+    def test_whitespace_is_stripped(self):
+        """Leading/trailing whitespace should be stripped."""
+        with patch.dict(os.environ, {"SBSLLM_HEADLESS": "  true  "}):
+            assert browser_module.is_headless() is True
 
 
 class TestOpenPage:
@@ -635,14 +699,14 @@ class TestWaitForResponse:
         """Run wait_for_response on a fake clock; returns (result, elapsed)."""
         clock = _FakeClock()
         with (
-            patch.object(browser_module, "capture_response", side_effect=self._polls(polls)),
+            patch.object(
+                browser_module, "capture_response", side_effect=self._polls(polls)
+            ),
             patch.object(browser_module.time, "sleep", side_effect=clock.sleep),
             patch.object(browser_module.time, "monotonic", side_effect=clock.monotonic),
         ):
             start = clock.t
-            result = browser_module.wait_for_response(
-                MagicMock(), "JS", **kwargs
-            )
+            result = browser_module.wait_for_response(MagicMock(), "JS", **kwargs)
             return result, clock.t - start
 
     def _polls(self, sequence):
@@ -712,7 +776,9 @@ class TestWaitForResponse:
         with (
             patch.object(browser_module, "capture_response", side_effect=capture),
             patch.object(browser_module.time, "sleep"),
-            patch.object(browser_module.time, "monotonic", side_effect=iter(range(400)).__next__),
+            patch.object(
+                browser_module.time, "monotonic", side_effect=iter(range(400)).__next__
+            ),
         ):
             result = browser_module.wait_for_response(
                 MagicMock(), "JS", timeout=3, idle_timeout=100
@@ -739,8 +805,14 @@ class TestIsNewResponseShared:
         from sbsllm.server import OpenAIHandler
 
         handler = OpenAIHandler.__new__(OpenAIHandler)
-        base = {"found": True, "content": "", "thinking": None, "busy": False,
-                "done": False, "count": 1}
+        base = {
+            "found": True,
+            "content": "",
+            "thinking": None,
+            "busy": False,
+            "done": False,
+            "count": 1,
+        }
         cases = [
             ({**base, "thinking": "hmm"}, base),
             ({**base, "content": "x"}, base),
@@ -757,8 +829,14 @@ class TestIsNewResponseShared:
     def test_thinking_only_turn_is_new(self):
         from sbsllm.browser import is_new_response
 
-        base = {"found": True, "content": "", "thinking": None, "busy": False,
-                "done": False, "count": 1}
+        base = {
+            "found": True,
+            "content": "",
+            "thinking": None,
+            "busy": False,
+            "done": False,
+            "count": 1,
+        }
         assert is_new_response({**base, "thinking": "reasoning"}, base) is True
 
 
@@ -782,7 +860,10 @@ class TestNormalizeResponse:
         assert out["thinking"] == "hmm"
 
     def test_busy_is_carried_through(self):
-        assert browser_module._normalize_response({"content": "x", "busy": True})["busy"] is True
+        assert (
+            browser_module._normalize_response({"content": "x", "busy": True})["busy"]
+            is True
+        )
         assert browser_module._normalize_response({"content": "x"})["busy"] is False
 
 
@@ -790,7 +871,9 @@ class TestBrowserOperationTimeout:
     def test_is_a_runtime_error_subclass(self):
         """Callers that already guarded RuntimeError must keep working."""
         assert issubclass(browser_module.BrowserOperationTimeout, RuntimeError)
-        assert not issubclass(browser_module.BrowserOperationTimeout, browser_module.BrowserError)
+        assert not issubclass(
+            browser_module.BrowserOperationTimeout, browser_module.BrowserError
+        )
 
     def test_timeout_raises_the_dedicated_type(self):
         # Keep the sleep short: a timed-out call leaves the worker blocked in
@@ -801,9 +884,7 @@ class TestBrowserOperationTimeout:
     def test_per_call_timeout_overrides_default(self):
         assert browser_module.CAPTURE_TIMEOUT < browser_module.BROWSER_OPERATION_TIMEOUT
         with pytest.raises(browser_module.BrowserOperationTimeout) as exc:
-            browser_module.run_in_browser_thread(
-                time.sleep, 0.4, operation_timeout=0.1
-            )
+            browser_module.run_in_browser_thread(time.sleep, 0.4, operation_timeout=0.1)
         assert "0.1s" in str(exc.value)
 
     def test_positional_args_still_reach_the_function(self):
@@ -823,3 +904,114 @@ class TestBrowserOperationTimeout:
         )
         assert result == 7
         assert seen["timeout"] == 0.25
+
+
+class TestCaptureResponseRetry:
+    """Tests for the retry/backoff logic added to capture_response."""
+
+    def test_succeeds_after_transient_errors(self):
+        """Transient Playwright errors should be retried, then succeed."""
+        from playwright.sync_api import Error as PwError
+
+        fake_page = MagicMock()
+        extraction = "return {found:true,content:'final answer',thinking:null,busy:false,done:true,count:1};"
+        call_counts = {"n": 0}
+
+        def flaky_evaluate(page, js):
+            call_counts["n"] += 1
+            if call_counts["n"] <= 2:
+                raise PwError("Target closed: transient error")
+            return {
+                "found": True,
+                "content": "final answer",
+                "thinking": None,
+                "busy": False,
+                "done": True,
+                "count": 1,
+            }
+
+        with patch("sbsllm.browser.run_js_value", side_effect=flaky_evaluate):
+            result = browser_module.capture_response(
+                fake_page, extraction, retries=3, base_delay=0.01
+            )
+            assert result["content"] == "final answer"
+            assert call_counts["n"] == 3
+
+    def test_retries_on_connection_error(self):
+        """Connection errors are transient and should be retried."""
+        from playwright.sync_api import Error as PwError
+
+        fake_page = MagicMock()
+        extraction = "return {found:true};"
+        call_counts = {"n": 0}
+
+        def flaky_evaluate(page, js):
+            call_counts["n"] += 1
+            if call_counts["n"] == 1:
+                raise PwError("Connection closed")
+            return {
+                "found": True,
+                "content": "ok",
+                "thinking": None,
+                "busy": False,
+                "done": True,
+                "count": 1,
+            }
+
+        with patch("sbsllm.browser.run_js_value", side_effect=flaky_evaluate):
+            result = browser_module.capture_response(
+                fake_page, extraction, retries=2, base_delay=0.01
+            )
+            assert result["content"] == "ok"
+            assert call_counts["n"] == 2
+
+    def test_browser_operation_timeout_not_retried(self):
+        """A wedged browser worker (BrowserOperationTimeout) must not be retried."""
+        fake_page = MagicMock()
+        extraction = "return {found:true};"
+
+        with (
+            patch(
+                "sbsllm.browser.run_js_value",
+                side_effect=browser_module.BrowserOperationTimeout("wedged"),
+            ),
+            pytest.raises(browser_module.BrowserOperationTimeout),
+        ):
+            browser_module.capture_response(fake_page, extraction, retries=5)
+
+    def test_non_transient_error_surfaces_immediately(self):
+        """A non-transient Playwright error must not be retried."""
+        from playwright.sync_api import Error as PwError
+
+        fake_page = MagicMock()
+        extraction = "return {found:true};"
+        call_counts = {"n": 0}
+
+        def non_transient(page, js):
+            call_counts["n"] += 1
+            raise PwError("SyntaxError in page")
+
+        with patch("sbsllm.browser.run_js_value", side_effect=non_transient):
+            with pytest.raises(PwError):
+                browser_module.capture_response(
+                    fake_page, extraction, retries=3, base_delay=0.01
+                )
+            assert call_counts["n"] == 1, "non-transient error should not be retried"
+
+    def test_exhausts_retries_and_raises(self):
+        """After exhausting retries, the last error is re-raised."""
+        from playwright.sync_api import Error as PwError
+
+        fake_page = MagicMock()
+        extraction = "return {found:true};"
+
+        with (
+            patch(
+                "sbsllm.browser.run_js_value",
+                side_effect=PwError("connection timeout"),
+            ),
+            pytest.raises(PwError),
+        ):
+            browser_module.capture_response(
+                fake_page, extraction, retries=2, base_delay=0.01
+            )

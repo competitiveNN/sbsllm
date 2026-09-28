@@ -138,7 +138,11 @@ class TestBusySignal:
         assert result["done"] is True
 
     def test_busy_key_is_always_present(self, extract_page):
-        for html in (ZAI_COLLAPSED_THINKING, ZAI_STILL_GENERATING, ZAI_EXPANDED_THINKING):
+        for html in (
+            ZAI_COLLAPSED_THINKING,
+            ZAI_STILL_GENERATING,
+            ZAI_EXPANDED_THINKING,
+        ):
             assert "busy" in _extract(extract_page, html)
 
 
@@ -146,7 +150,10 @@ class TestZaiExtraction:
     def test_collapsed_disclosure_yields_answer_only(self, extract_page):
         """Regression: this markup left the local chat streaming forever."""
         result = _extract(extract_page, ZAI_COLLAPSED_THINKING)
-        assert result["content"] == "Hello! I'm GLM, trained by Z.ai. How can I help you today?"
+        assert (
+            result["content"]
+            == "Hello! I'm GLM, trained by Z.ai. How can I help you today?"
+        )
         # The toggle label is UI chrome, not a reasoning trace.
         assert result["thinking"] is None
         # A decorative `.loading` node must not pin done to false.

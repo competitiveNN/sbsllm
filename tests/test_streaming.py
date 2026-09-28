@@ -38,9 +38,7 @@ class FakeClock:
         self.t += max(seconds, 0.01)
 
 
-def _result(
-    content="", *, thinking=None, done=False, busy=False, found=True, count=1
-):
+def _result(content="", *, thinking=None, done=False, busy=False, found=True, count=1):
     return {
         "found": found,
         "content": content,
@@ -61,7 +59,12 @@ def _finished(content="", *, thinking=None, count=1):
     return _result(content, thinking=thinking, busy=False, done=True, count=count)
 
 
-def _handler(idle_timeout=3.0, poll_interval=0.25, done_confirm=0.75):
+def _handler(
+    idle_timeout=3.0,
+    poll_interval=0.25,
+    done_confirm=0.75,
+    thinking_patience=120.0,
+):
     handler = OpenAIHandler.__new__(OpenAIHandler)
     handler.server = types.SimpleNamespace(
         model_locks=_ModelLockRegistry(),
@@ -69,6 +72,7 @@ def _handler(idle_timeout=3.0, poll_interval=0.25, done_confirm=0.75):
         browser_timeout=30.0,
         response_idle_timeout=idle_timeout,
         response_done_confirm=done_confirm,
+        thinking_patience=thinking_patience,
         poll_interval=poll_interval,
     )
     handler.wfile = MagicMock()
@@ -209,9 +213,7 @@ class TestStreamTerminates:
 
     def test_emits_no_duplicate_content(self):
         _t, events = _stream(_handler(idle_timeout=1.0), STABLE_ANSWER)
-        text = "".join(
-            d.get("content", "") for d, _ in events if isinstance(d, dict)
-        )
+        text = "".join(d.get("content", "") for d, _ in events if isinstance(d, dict))
         assert text == "Hello! I'm GLM, trained by Z.ai."
 
     def test_capture_failure_ends_the_stream(self):
@@ -219,9 +221,12 @@ class TestStreamTerminates:
         with (
             patch(
                 "sbsllm.server.capture_response",
-                side_effect=[_result("", found=False, count=0),
-                             __import__("sbsllm.browser", fromlist=["BrowserError"])
-                             .BrowserError("page gone")],
+                side_effect=[
+                    _result("", found=False, count=0),
+                    __import__(
+                        "sbsllm.browser", fromlist=["BrowserError"]
+                    ).BrowserError("page gone"),
+                ],
             ),
             patch("sbsllm.server.extract_js", return_value="EXTRACT"),
             patch("sbsllm.server.get_page_snapshot", return_value={}),
@@ -245,7 +250,9 @@ class TestThinkingStreaming:
         """Thinking used to be dropped until the answer text appeared."""
         _t, events = _stream(_handler(idle_timeout=1.0), self.THINKING)
         thinking_deltas = [
-            d["thinking"] for d, _ in events if isinstance(d, dict) and d.get("thinking")
+            d["thinking"]
+            for d, _ in events
+            if isinstance(d, dict) and d.get("thinking")
         ]
         # Thinking is delivered as it grows, not one lump on the first chunk.
         assert thinking_deltas == [
@@ -262,14 +269,63 @@ class TestThinkingStreaming:
 
     def test_thinking_and_content_are_both_delivered(self):
         _t, events = _stream(_handler(idle_timeout=1.0), self.THINKING)
-        text = "".join(
-            d.get("content", "") for d, _ in events if isinstance(d, dict)
-        )
+        text = "".join(d.get("content", "") for d, _ in events if isinstance(d, dict))
         thinking = "".join(
             d.get("thinking", "") for d, _ in events if isinstance(d, dict)
         )
         assert text == "Hi there"
         assert thinking == "Let me check the greeting. Then answer."
+
+
+class TestThinkingStallPatience:
+    """A thinking-only stall (content empty, reasoning present, site still
+    generating) gets far more patience than an answer stall: reasoning traces
+    pause naturally between chunks and thinking models think for minutes."""
+
+    def _stall(self, *, busy=True, content="", thinking="still thinking"):
+        return _result(content, thinking=thinking, busy=busy, done=False, count=1)
+
+    def test_thinking_stall_uses_thinking_patience_not_busy_patience(self):
+        """20s of unchanged reasoning while generating must NOT end the stream."""
+        # 30s of unchanged thinking with busy_patience=20s would have cut it.
+        polls = [
+            _result("", found=False, count=0),
+            self._stall(),
+            self._stall(),
+            self._stall(),
+        ]
+        elapsed, events = _stream(
+            _handler(
+                idle_timeout=3.0,
+                thinking_patience=30.0,
+            ),
+            polls,
+            browser_timeout=30.0,
+        )
+        # 3 polls * 0.25s + 30s thinking_patience
+        assert 29.0 <= elapsed <= 31.0, f"took {elapsed}s"
+        assert events[-1] == ("[DONE]", None)
+        assert events[-2][1] == "length"
+
+    def test_answer_still_uses_busy_patience(self):
+        """A stall with content present must still respect busy_patience."""
+        polls = [
+            _result("", found=False, count=0),
+            _result("Hi", thinking="done", busy=True, done=False, count=1),
+            _result("Hi", thinking="done", busy=True, done=False, count=1),
+            _result("Hi", thinking="done", busy=True, done=False, count=1),
+        ]
+        elapsed, events = _stream(
+            _handler(
+                idle_timeout=3.0,
+                thinking_patience=30.0,
+            ),
+            polls,
+            browser_timeout=30.0,
+        )
+        # busy_patience defaults to 20.0
+        assert 19.0 <= elapsed <= 21.0, f"took {elapsed}s"
+        assert events[-2][1] == "length"
 
 
 class TestIsNewResponse:
@@ -336,9 +392,7 @@ class TestRuntimeSettingsPublished:
         mock_http_server = MagicMock()
         mock_http_server.handle_request.side_effect = KeyboardInterrupt()
 
-        with patch(
-            "sbsllm.server._SBSHTTPServer", return_value=mock_http_server
-        ):
+        with patch("sbsllm.server._SBSHTTPServer", return_value=mock_http_server):
             server.start(announce=False)
 
         published = mock_http_server
@@ -461,7 +515,12 @@ class TestNoDeadImports:
 )
 def test_result_helper_shape(attrs):
     assert set(_result(**attrs)) == {
-        "found", "content", "thinking", "busy", "done", "count",
+        "found",
+        "content",
+        "thinking",
+        "busy",
+        "done",
+        "count",
     }
 
 
@@ -474,15 +533,13 @@ class TestNoPrematureTruncation:
         polls = [
             _result("", found=False, count=0),
             _generating("The answer begins"),
-            _generating("The answer begins"),          # pause
-            _generating("The answer begins"),          # pause
-            _generating("The answer begins here"),     # pause
+            _generating("The answer begins"),  # pause
+            _generating("The answer begins"),  # pause
+            _generating("The answer begins here"),  # pause
             _generating("The answer begins here and continues"),
             _finished("The answer begins here and continues"),
         ]
-        elapsed, events = _stream(
-            _handler(idle_timeout=1.0, done_confirm=0.5), polls
-        )
+        elapsed, events = _stream(_handler(idle_timeout=1.0, done_confirm=0.5), polls)
         text = "".join(d.get("content", "") for d, _ in events if isinstance(d, dict))
         assert text == "The answer begins here and continues"
         assert elapsed < 5.0, f"took {elapsed}s"
@@ -491,9 +548,7 @@ class TestNoPrematureTruncation:
         polls = [_result("", found=False, count=0)]
         polls += [_generating("t" * i) for i in range(1, 30)]
         polls.append(_finished("t" * 29))
-        elapsed, events = _stream(
-            _handler(idle_timeout=1.0, done_confirm=0.5), polls
-        )
+        elapsed, events = _stream(_handler(idle_timeout=1.0, done_confirm=0.5), polls)
         text = "".join(d.get("content", "") for d, _ in events if isinstance(d, dict))
         assert text == "t" * 29
         # 29 polls plus a short confirm, nowhere near the 1s idle window.
@@ -506,14 +561,12 @@ class TestNoPrematureTruncation:
         polls = [
             _result("", found=False, count=0),
             _generating("part one"),
-            _finished("part one"),                     # blink: not busy
-            _generating("part one and two"),            # still going
+            _finished("part one"),  # blink: not busy
+            _generating("part one and two"),  # still going
             _generating("part one and two"),
             _finished("part one and two"),
         ]
-        _t, events = _stream(
-            _handler(idle_timeout=1.0, done_confirm=1.0), polls
-        )
+        _t, events = _stream(_handler(idle_timeout=1.0, done_confirm=1.0), polls)
         text = "".join(d.get("content", "") for d, _ in events if isinstance(d, dict))
         assert text == "part one and two"
 
@@ -525,9 +578,7 @@ class TestNoPrematureTruncation:
             _generating(thinking="thinking hard", content="Answer"),
             _finished(thinking="thinking hard", content="Answer"),
         ]
-        _t, events = _stream(
-            _handler(idle_timeout=1.0, done_confirm=0.5), polls
-        )
+        _t, events = _stream(_handler(idle_timeout=1.0, done_confirm=0.5), polls)
         thinking = "".join(
             d.get("thinking", "") for d, _ in events if isinstance(d, dict)
         )
@@ -579,8 +630,10 @@ class TestNoSilentHang:
         clock = FakeClock()
         handler._send_sse_comment = lambda: sent.append(1)
         with (
-            patch("sbsllm.server.capture_response",
-                  side_effect=lambda p, j: dict(polls[0])),
+            patch(
+                "sbsllm.server.capture_response",
+                side_effect=lambda p, j: dict(polls[0]),
+            ),
             patch("sbsllm.server.extract_js", return_value="EXTRACT"),
             patch("sbsllm.server.time") as fake_time,
         ):
@@ -609,6 +662,7 @@ class TestNoSilentHang:
 
     def test_budget_exhaustion_always_terminates(self):
         """Even content that keeps changing must stop at the budget."""
+
         def capture(page, js):
             capture.n += 1
             return _generating("x" * capture.n)

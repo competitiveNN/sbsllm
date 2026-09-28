@@ -120,7 +120,7 @@ class TestResponseSelectors:
 
     @pytest.mark.parametrize("site_id", list(SITES.keys()))
     def test_loading_selectors_include_shared_set(self, site_id):
-        assert "button[aria-label*=\"Stop\" i]" in SITES[site_id]["loading_selectors"]
+        assert 'button[aria-label*="Stop" i]' in SITES[site_id]["loading_selectors"]
 
     @pytest.mark.parametrize("site_id", list(SITES.keys()))
     def test_thinking_selectors_present(self, site_id):

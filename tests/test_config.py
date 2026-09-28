@@ -43,6 +43,87 @@ class TestConfigModel:
         with pytest.raises(ValueError):
             Config(chats=["chatgpt"], login_wait=-1)
 
+    def test_default_thinking_patience(self):
+        """thinking_patience defaults to DEFAULT_THINKING_PATIENCE (120s)."""
+        from sbsllm.config import DEFAULT_THINKING_PATIENCE  # noqa: F401
+        from sbsllm.server import DEFAULT_THINKING_PATIENCE as DEFAULT
+
+        config = Config(chats=["chatgpt"])
+        assert config.thinking_patience == DEFAULT
+
+    def test_custom_thinking_patience(self):
+        config = Config(chats=["chatgpt"], thinking_patience=60.0)
+        assert config.thinking_patience == 60.0
+
+    def test_thinking_patience_too_low_raises(self):
+        with pytest.raises(ValueError):
+            Config(chats=["chatgpt"], thinking_patience=0.05)
+
+    def test_thinking_patience_too_high_raises(self):
+        with pytest.raises(ValueError):
+            Config(chats=["chatgpt"], thinking_patience=121.0)
+
+    def test_default_json_log_format(self):
+        config = Config(chats=["chatgpt"])
+        assert config.json_log_format is False
+
+    def test_custom_json_log_format(self):
+        config = Config(chats=["chatgpt"], json_log_format=True)
+        assert config.json_log_format is True
+
+    def test_default_browser_timeout(self):
+        config = Config(chats=["chatgpt"])
+        assert config.browser_timeout == 180
+
+    def test_custom_browser_timeout(self):
+        config = Config(chats=["chatgpt"], browser_timeout=300)
+        assert config.browser_timeout == 300
+
+    def test_browser_timeout_too_low_raises(self):
+        with pytest.raises(ValueError):
+            Config(chats=["chatgpt"], browser_timeout=0)
+
+    def test_browser_timeout_too_high_raises(self):
+        with pytest.raises(ValueError):
+            Config(chats=["chatgpt"], browser_timeout=1801)
+
+    def test_default_browser_lock_timeout(self):
+        config = Config(chats=["chatgpt"])
+        assert config.browser_lock_timeout == 300
+
+    def test_custom_browser_lock_timeout(self):
+        config = Config(chats=["chatgpt"], browser_lock_timeout=600)
+        assert config.browser_lock_timeout == 600
+
+    def test_browser_lock_timeout_too_high_raises(self):
+        with pytest.raises(ValueError):
+            Config(chats=["chatgpt"], browser_lock_timeout=1801)
+
+    def test_default_response_idle_timeout(self):
+        from sbsllm.server import DEFAULT_RESPONSE_IDLE_TIMEOUT
+
+        config = Config(chats=["chatgpt"])
+        assert config.response_idle_timeout == DEFAULT_RESPONSE_IDLE_TIMEOUT
+
+    def test_custom_response_idle_timeout(self):
+        config = Config(chats=["chatgpt"], response_idle_timeout=5.0)
+        assert config.response_idle_timeout == 5.0
+
+    def test_response_idle_timeout_too_low_raises(self):
+        with pytest.raises(ValueError):
+            Config(chats=["chatgpt"], response_idle_timeout=0.05)
+
+    def test_response_idle_timeout_too_high_raises(self):
+        with pytest.raises(ValueError):
+            Config(chats=["chatgpt"], response_idle_timeout=121.0)
+
+    def test_extra_field_rejected(self):
+        """Unknown config keys must be rejected (extra='forbid')."""
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            Config(chats=["chatgpt"], unknown_field=1)
+
 
 class TestParseConfig:
     def test_valid_config(self):

@@ -9,7 +9,7 @@ from typing import Any
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-from .server import DEFAULT_RESPONSE_IDLE_TIMEOUT
+from .server import DEFAULT_RESPONSE_IDLE_TIMEOUT, DEFAULT_THINKING_PATIENCE
 from .sites import list_sites
 
 MAX_LOGIN_WAIT = 24 * 60 * 60  # 24 hours
@@ -63,6 +63,17 @@ class Config(BaseModel):
         description=(
             "Seconds an unchanged answer is treated as finished when the site "
             "gives no 'still generating' signal."
+        ),
+    )
+    thinking_patience: float = Field(
+        default=DEFAULT_THINKING_PATIENCE,
+        ge=0.1,
+        le=MAX_RESPONSE_IDLE_TIMEOUT,
+        description=(
+            "Seconds a *thinking-only* stall is tolerated while the site still "
+            "reports 'generating'. Reasoning traces pause naturally between "
+            "chunks and thinking models think for minutes, so this must be far "
+            "larger than response_idle_timeout."
         ),
     )
     json_log_format: bool = Field(

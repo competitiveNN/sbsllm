@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import queue
 import random
 import threading
@@ -317,6 +318,21 @@ def setup_logging(
     )
 
 
+def is_headless() -> bool:
+    """Return True when sbsllm should launch Chromium headless.
+
+    Reads the ``SBSLLM_HEADLESS`` environment variable. Defaults to a visible
+    browser so the user can log in to chat sites interactively; CI / container
+    environments can set ``SBSLLM_HEADLESS=true`` (or any of ``1``, ``yes``,
+    ``on``) to run without a window.
+
+    Returns:
+        True if Chromium should launch headless, False otherwise.
+    """
+    headless_env = os.environ.get("SBSLLM_HEADLESS", "").strip().lower()
+    return headless_env in ("1", "true", "yes", "on")
+
+
 def _find_system_chromium() -> str | None:
     """Return path to a system Chromium binary if available, else None."""
     import shutil
@@ -359,8 +375,13 @@ def ensure_browser(chrome_bin: str | None = None) -> BrowserContext:
             playwright_instance = sync_playwright().start()
             _playwright_instance = playwright_instance
 
+            # Allow CI / container environments to override headless mode via
+            # the SBSLLM_HEADLESS env var. Defaults to a visible browser so
+            # the user can log in to chat sites interactively.
+            headless = is_headless()
+
             launch_args: dict[str, Any] = {
-                "headless": False,
+                "headless": headless,
                 "java_script_enabled": True,
                 "args": [
                     "--no-first-run",
@@ -431,7 +452,9 @@ def _close_blank_pages(browser: BrowserContext, keep_page: Page | None = None) -
             pass
 
 
-def _do_open_page(url: str, chrome_bin: str | None = None, setup_js: str | None = None) -> Page:
+def _do_open_page(
+    url: str, chrome_bin: str | None = None, setup_js: str | None = None
+) -> Page:
     """Open a URL on the Playwright browser thread."""
     browser = ensure_browser(chrome_bin)
     page = _find_blank_page(browser)
@@ -475,7 +498,9 @@ def _do_open_page(url: str, chrome_bin: str | None = None, setup_js: str | None 
     return page
 
 
-def open_page(url: str, chrome_bin: str | None = None, setup_js: str | None = None) -> Page:
+def open_page(
+    url: str, chrome_bin: str | None = None, setup_js: str | None = None
+) -> Page:
     """Open a URL in a new page/tab. Returns the page."""
     if _is_browser_thread():
         return _do_open_page(url, chrome_bin, setup_js)
@@ -594,9 +619,50 @@ def _normalize_response(result: Any) -> dict:
     }
 
 
-def capture_response(page: Page, extract_js: str) -> dict:
-    """Capture the current assistant response from a page."""
-    return _normalize_response(run_js_value(page, extract_js))
+def capture_response(
+    page: Page, extract_js: str, retries: int = 2, base_delay: float = 0.15
+) -> dict:
+    """Capture the current assistant response from a page.
+
+    Retries transient Playwright errors (page mid-navigation, connection
+    retry, detached frame) with a short exponential backoff. A single blip
+    used to abort the whole request; retrying inside the poll keeps the stream
+    alive across momentary hiccups instead of surfacing a 502 to the client.
+
+    Args:
+        page: The Playwright page to query.
+        extract_js: The extraction script returned by ``extract_js``.
+        retries: Number of additional attempts after the first failure.
+        base_delay: Seconds between attempts (doubles each retry).
+
+    Returns:
+        Normalized extraction result dict.
+    """
+    last_error: BaseException | None = None
+    for attempt in range(retries + 1):
+        try:
+            return _normalize_response(run_js_value(page, extract_js))
+        except BrowserOperationTimeout:
+            # A wedged worker thread will not recover on retry; re-raise
+            # immediately so the caller can end the request.
+            raise
+        except PlaywrightError as e:
+            last_error = e
+            if not is_transient_error(e) or attempt >= retries:
+                raise
+            delay = min(base_delay * (2**attempt), 1.0)
+            logger.debug(
+                "capture_response transient error on attempt %d/%d: %s; retrying in %.2fs",
+                attempt + 1,
+                retries + 1,
+                e,
+                delay,
+            )
+            time.sleep(delay)
+    # Unreachable: the loop either returns or raises. Kept for clarity.
+    if last_error is not None:  # pragma: no cover - defensive
+        raise last_error
+    raise BrowserError("capture_response failed after retries")  # pragma: no cover
 
 
 def is_new_response(response: dict, baseline: dict | None) -> bool:
@@ -630,6 +696,7 @@ def wait_for_response(
     idle_timeout: float | None = None,
     baseline: dict | None = None,
     done_confirm: float = 0.75,
+    thinking_patience: float = 120.0,
 ) -> dict:
     """Poll a page until a new assistant response is complete or timeout.
 
@@ -677,9 +744,16 @@ def wait_for_response(
             ):
                 current["done"] = True
                 return current
+            # A thinking-only stall gets far more patience than an answer
+            # stall: reasoning traces pause naturally between chunks, and
+            # thinking models think for minutes.
+            if busy and not content and thinking and stable_for >= thinking_patience:
+                current["thinking_timeout"] = True
+                return current
         last = current
         time.sleep(max(float(poll_interval), 0.01))
     return {**last, "timed_out": True}
+
 
 def _do_inject_and_submit(
     page: Page, inject_js: str, submit_js: str, tab_index: int

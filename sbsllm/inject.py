@@ -21,7 +21,13 @@ def escape_prompt(prompt: str) -> str:
 
 
 def inject_prompt(site_id: str, prompt: str) -> str:
-    """Get the injection JS for a site with the prompt filled in."""
+    """Get the injection JS for a site with the prompt filled in.
+
+    If the site defines a ``post_inject_js`` block, it is appended after the
+    main inject IIFE. This lets sites that use composite editors
+    (TipTap/ProseMirror, Google ``ms-autosize-textarea``) sync internal state
+    that a plain ``value``/``textContent`` assignment does not reach.
+    """
     site = get_site(site_id)
     # site["inject"] is already a fully-resolved IIFE (selectors filled in by
     # _inject_js at config-build time). Only the prompt value still needs
@@ -29,7 +35,13 @@ def inject_prompt(site_id: str, prompt: str) -> str:
     # that returns NO_INPUT.
     js = site["inject"]
     escaped = escape_prompt(prompt)
-    return js.replace(PLACEHOLDER, escaped)
+    result = js.replace(PLACEHOLDER, escaped)
+    post = site.get("post_inject_js")
+    if post:
+        # Add a semicolon so the post-inject IIFE is a separate statement
+        # rather than being parsed as calling the return value of the main IIFE.
+        result = result + ";\n" + post
+    return result
 
 
 def submit_js(site_id: str) -> str:

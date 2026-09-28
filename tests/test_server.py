@@ -286,6 +286,7 @@ class TestOpenAIHandlerChatCompletions:
         assert call_args[3] == "test-request-id"
 
     def test_inject_failure(self):
+        """Inject failure must surface as a 502, not a fake assistant message."""
         body = json.dumps(
             {"model": "gpt-4", "messages": [{"role": "user", "content": "Hello!"}]}
         ).encode()
@@ -299,10 +300,15 @@ class TestOpenAIHandlerChatCompletions:
                     mock_submit_js.return_value = "submit_js"
                     OpenAIHandler._handle_chat_completions(handler)
 
-        data = handler._send_json.call_args[0][1]
-        assert "Failed to inject" in data["choices"][0]["message"]["content"]
+        handler._send_error.assert_called_once()
+        call_args = handler._send_error.call_args[0]
+        assert call_args[0] == 502
+        assert "Failed to inject" in call_args[1]
+        assert call_args[2] == "server_error"
+        assert call_args[3] == "test-request-id"
 
     def test_submit_failure(self):
+        """Submit failure must surface as a 502, not a fake assistant message."""
         body = json.dumps(
             {"model": "gpt-4", "messages": [{"role": "user", "content": "Hello!"}]}
         ).encode()
@@ -316,8 +322,12 @@ class TestOpenAIHandlerChatCompletions:
                     mock_submit_js.return_value = "submit_js"
                     OpenAIHandler._handle_chat_completions(handler)
 
-        data = handler._send_json.call_args[0][1]
-        assert "Failed to submit" in data["choices"][0]["message"]["content"]
+        handler._send_error.assert_called_once()
+        call_args = handler._send_error.call_args[0]
+        assert call_args[0] == 502
+        assert "Failed to submit" in call_args[1]
+        assert call_args[2] == "server_error"
+        assert call_args[3] == "test-request-id"
 
     def test_browser_error(self):
         from sbsllm.browser import BrowserError
@@ -339,7 +349,10 @@ class TestOpenAIHandlerChatCompletions:
                 OpenAIHandler._handle_chat_completions(handler)
 
         handler._send_error.assert_called_once_with(
-            502, "Browser error: fail. Try restarting the browser.", "server_error", "test-request-id"
+            502,
+            "Browser error: fail. Try restarting the browser.",
+            "server_error",
+            "test-request-id",
         )
 
     def test_browser_page_error_returns_502(self):
@@ -386,6 +399,136 @@ class TestOpenAIHandlerChatCompletions:
         call_args = handler._send_error.call_args[0]
         assert call_args[0] == 500
         assert "Internal error" in call_args[1]
+        assert call_args[3] == "test-request-id"
+
+    def _patch_success(self, response_result):
+        """Patch the non-streaming path to return a successful response."""
+        return (
+            patch(
+                "sbsllm.server.inject_and_submit",
+                return_value={"tab": 1, "inject": "OK", "submit": "OK"},
+            ),
+            patch("sbsllm.server.inject_prompt", return_value="inject_js"),
+            patch("sbsllm.server.submit_js", return_value="submit_js"),
+            patch("sbsllm.server.extract_js", return_value="EXTRACT_JS"),
+            patch("sbsllm.server.wait_for_response", return_value=response_result),
+            patch(
+                "sbsllm.server.get_page_snapshot",
+                return_value={"url": "http://x", "title": "t", "text_preview": ""},
+            ),
+        )
+
+    def test_successful_completion_returns_200(self):
+        """Non-streaming success must return 200 with the assistant content."""
+        body = json.dumps(
+            {"model": "gpt-4", "messages": [{"role": "user", "content": "Hello!"}]}
+        ).encode()
+        handler = self._make_handler(body)
+
+        patches = self._patch_success(
+            {"found": True, "content": "4", "thinking": None, "done": True}
+        )
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
+            OpenAIHandler._handle_chat_completions(handler)
+
+        handler._send_json.assert_called_once()
+        call_args = handler._send_json.call_args[0]
+        assert call_args[0] == 200
+        data = call_args[1]
+        assert data["choices"][0]["message"]["content"] == "4"
+        assert data["choices"][0]["finish_reason"] == "stop"
+
+    def test_non_streaming_returns_thinking(self):
+        """Non-streaming path must surface thinking in the response body."""
+        body = json.dumps(
+            {"model": "gpt-4", "messages": [{"role": "user", "content": "Hello!"}]}
+        ).encode()
+        handler = self._make_handler(body)
+
+        patches = self._patch_success(
+            {"found": True, "content": "4", "thinking": "2+2=4", "done": True}
+        )
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
+            OpenAIHandler._handle_chat_completions(handler)
+
+        handler._send_json.assert_called_once()
+        call_args = handler._send_json.call_args[0]
+        data = call_args[1]
+        assert data["thinking"] == "2+2=4"
+
+    def test_non_streaming_timeout_returns_504(self):
+        """A timed-out non-streaming request must surface as 504, not 200."""
+        body = json.dumps(
+            {"model": "gpt-4", "messages": [{"role": "user", "content": "Hello!"}]}
+        ).encode()
+        handler = self._make_handler(body)
+
+        patches = self._patch_success(
+            {
+                "found": False,
+                "content": "",
+                "thinking": None,
+                "timed_out": True,
+                "done": False,
+            }
+        )
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
+            OpenAIHandler._handle_chat_completions(handler)
+
+        handler._send_error.assert_called_once()
+        call_args = handler._send_error.call_args[0]
+        assert call_args[0] == 504
+        assert "timeout" in call_args[1].lower()
+        assert call_args[3] == "test-request-id"
+
+    def test_non_streaming_no_response_returns_504(self):
+        """No assistant response detected must surface as 504."""
+        body = json.dumps(
+            {"model": "gpt-4", "messages": [{"role": "user", "content": "Hello!"}]}
+        ).encode()
+        handler = self._make_handler(body)
+
+        patches = self._patch_success(
+            {
+                "found": False,
+                "content": "",
+                "thinking": None,
+                "login_wall": False,
+                "done": False,
+            }
+        )
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
+            OpenAIHandler._handle_chat_completions(handler)
+
+        handler._send_error.assert_called_once()
+        call_args = handler._send_error.call_args[0]
+        assert call_args[0] == 504
+        assert "No assistant response" in call_args[1]
+        assert call_args[3] == "test-request-id"
+
+    def test_non_streaming_login_wall_returns_502(self):
+        """A login wall must surface as 502 with a sign-in hint, not 504."""
+        body = json.dumps(
+            {"model": "gpt-4", "messages": [{"role": "user", "content": "Hello!"}]}
+        ).encode()
+        handler = self._make_handler(body)
+
+        patches = self._patch_success(
+            {
+                "found": False,
+                "content": "",
+                "thinking": None,
+                "login_wall": True,
+                "done": False,
+            }
+        )
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
+            OpenAIHandler._handle_chat_completions(handler)
+
+        handler._send_error.assert_called_once()
+        call_args = handler._send_error.call_args[0]
+        assert call_args[0] == 502
+        assert "signed-in session" in call_args[1]
         assert call_args[3] == "test-request-id"
 
 
@@ -821,7 +964,9 @@ class TestPageRecovery:
         with (
             patch("sbsllm.server.check_page_health", side_effect=fake_health),
             patch("sbsllm.server.inject_and_submit", side_effect=fake_submit),
-            patch.object(handler, "_recover_page", return_value=new_page) as mock_recover,
+            patch.object(
+                handler, "_recover_page", return_value=new_page
+            ) as mock_recover,
         ):
             status, final_page = handler._inject_and_submit_with_recovery(
                 old_page, "gpt-4", "chatgpt", "Hello!", 1
@@ -858,7 +1003,7 @@ class TestPageRecovery:
             patch.object(handler, "_recover_page") as mock_recover,
         ):
             mock_submit.return_value = {"tab": 1, "inject": "NO_INPUT", "submit": None}
-            status, final_page = handler._inject_and_submit_with_recovery(
+            status, _final_page = handler._inject_and_submit_with_recovery(
                 page, "gpt-4", "chatgpt", "Hello!", 1
             )
         mock_recover.assert_not_called()

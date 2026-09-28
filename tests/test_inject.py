@@ -85,6 +85,29 @@ class TestInjectPrompt:
         result = inject_prompt("chatgpt", "")
         assert "PROMPT_PLACEHOLDER" not in result
 
+    def test_post_inject_js_appended_for_grok(self):
+        """Sites with post_inject_js should have it appended."""
+        result = inject_prompt("grok", "test")
+        assert "post_inject_js" not in result  # not the literal key
+        # The post_inject block dispatches an input event; verify it's present.
+        assert "data-sbsllm-input" in result
+
+    def test_post_inject_js_appended_for_google(self):
+        result = inject_prompt("google", "test")
+        assert "data-value" in result  # google post_inject syncs data-value
+
+    def test_post_inject_js_appended_for_zai(self):
+        result = inject_prompt("zai", "test")
+        assert "NO_MARKED_INPUT" in result  # zai post_inject checks for marked input
+
+    def test_post_inject_separated_by_semicolon(self):
+        """post_inject_js must be separated from the main IIFE by a semicolon."""
+        result = inject_prompt("grok", "test")
+        # The main IIFE ends with })() and the post_inject starts with (() =>
+        # Without a semicolon separator, the two IIFEs are parsed as a call chain.
+        assert "});\n" in result or "});\n\n" in result or "})();\n" in result
+        assert "(() =>" in result  # post_inject starts a new IIFE
+
 
 class TestSubmitJs:
     def test_returns_string(self):

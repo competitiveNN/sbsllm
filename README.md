@@ -83,7 +83,7 @@ The server runs until interrupted. Stopping it also closes the Chromium pages.
 - `grok` — https://grok.com/
 - `google` — https://aistudio.google.com/
 - `mistral` — https://chat.mistral.ai
-- `kimi` — https://www.kimi.com/
+- `kimi` — https://kimi.ai/
 - `perplexity` — https://www.perplexity.ai/
 - `poe` — https://poe.com/
 - `cohere` — https://cohere.com/chat

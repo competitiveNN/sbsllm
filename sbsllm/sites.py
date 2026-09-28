@@ -22,13 +22,24 @@ _INJECT_TEMPLATE = """
         // injection would leave the previous prompt in the box on repeat requests.
         input.focus();
         if (isEditable) {
+            // For contenteditable/TipTap editors, dispatch beforeinput first.
+            // ProseMirror editors (including TipTap) listen for beforeinput
+            // to update their internal document model. Simply setting
+            // textContent does not trigger the editor's update cycle.
+            try {
+                const beforeInputEvent = new InputEvent('beforeinput', {
+                    bubbles: true, cancelable: true,
+                    inputType: 'insertText', data: value
+                });
+                input.dispatchEvent(beforeInputEvent);
+            } catch (_) {}
             try {
                 const selection = window.getSelection();
                 selection?.selectAllChildren(input);
                 document.execCommand('delete', false, null);
                 document.execCommand('insertText', false, value);
             } catch (_) {}
-            // execCommand may not work on all editors; ensure textContent is set
+            // execCommand may not work or may be ignored by editors; ensure textContent is set
             if ((input.textContent || '') !== value) {
                 input.textContent = value;
             }
@@ -394,12 +405,8 @@ def _response_js(
         _RESPONSE_TEMPLATE.replace(
             "__RESPONSE_SELECTORS__", json.dumps(list(response_selectors or []))
         )
-        .replace(
-            "__THINKING_SELECTORS__", json.dumps(list(thinking_selectors or []))
-        )
-        .replace(
-            "__LOADING_SELECTORS__", json.dumps(list(loading_selectors or []))
-        )
+        .replace("__THINKING_SELECTORS__", json.dumps(list(thinking_selectors or [])))
+        .replace("__LOADING_SELECTORS__", json.dumps(list(loading_selectors or [])))
     )
 
 
@@ -420,7 +427,7 @@ SITES: dict[str, dict] = {
         """),
         "response_selectors": [
             'div[data-message-author-role="assistant"]',
-            '.markdown',
+            ".markdown",
             'div[data-testid="conversation"] > div > div',
         ],
         "thinking_selectors": [
@@ -446,7 +453,7 @@ SITES: dict[str, dict] = {
         """),
         "response_selectors": [
             '[data-message-author-role="assistant"]',
-            '.assistant-message',
+            ".assistant-message",
             '[class*="assistant"] .message',
         ],
         "thinking_selectors": [
@@ -484,9 +491,9 @@ SITES: dict[str, dict] = {
         ),
         "response_selectors": [
             '[data-message-author-role="assistant"]',
-            '.assistant-message',
+            ".assistant-message",
             '[class*="assistant"]',
-            'article .markdown',
+            "article .markdown",
         ],
         "thinking_selectors": [
             '[class*="thinking"]',
@@ -511,9 +518,9 @@ SITES: dict[str, dict] = {
         """),
         "response_selectors": [
             '[data-message-author-role="assistant"]',
-            '.assistant-message',
+            ".assistant-message",
             '[class*="assistant"]',
-            'article .markdown',
+            "article .markdown",
         ],
         "thinking_selectors": [
             '[class*="thinking"]',
@@ -534,7 +541,25 @@ SITES: dict[str, dict] = {
                 || document.querySelector('textarea[placeholder*="Ask" i]')
                 || document.querySelector('textarea')
         """),
-        "submit_js": _submit_js("""
+        "post_inject_js": """
+            (() => {
+                // TipTap/ProseMirror editors sometimes do not accept the
+                // textContent assignment above, or they accept it but do not
+                // update their internal document model. After the main inject
+                // IIFE runs, dispatch a fresh input event so the editor's
+                // listeners (which fire on `input`) register the new value.
+                const el = document.querySelector('[data-sbsllm-input="true"]');
+                if (!el) return 'NO_MARKED_INPUT';
+                try {
+                    el.dispatchEvent(new InputEvent('input', {
+                        bubbles: true, inputType: 'insertText'
+                    }));
+                } catch (_) {}
+                return 'OK';
+            })()
+        """,
+        "submit_js": _submit_js(
+            """
             document.querySelector('button[data-testid="chat-submit"]:not([disabled])')
                 || document.querySelector('button[aria-label="Submit"]:not([disabled])')
                 || document.querySelector('button[data-testid*="send" i]:not([disabled])')
@@ -542,7 +567,9 @@ SITES: dict[str, dict] = {
                 || document.querySelector('button[aria-label*="Send" i]:not([disabled])')
                 || document.querySelector('button[type="submit"]:not([disabled])')
                 || document.querySelector('.tiptap, [contenteditable], textarea')?.closest('form')?.querySelector('button:not([disabled])')
-        """, "document.querySelector('.tiptap, [contenteditable], textarea')"),
+        """,
+            "document.querySelector('.tiptap, [contenteditable], textarea')",
+        ),
         "response_selectors": [
             '.message-bubble:not([data-testid="user-message"])',
             '[data-testid="assistant-message"]',
@@ -570,7 +597,27 @@ SITES: dict[str, dict] = {
                 || document.querySelector('textarea[aria-label="Type something"]')
                 || document.querySelector('textarea')
         """),
-        "submit_js": _submit_js("""
+        "post_inject_js": """
+            (() => {
+                // Google AI Studio's ms-autosize-textarea web component keeps
+                // internal state (data-value attribute, disabled flag on the
+                // Run button) that does not sync when .value is set via the
+                // property setter. Sync the wrapper so the Run button enables.
+                const el = document.querySelector('[data-sbsllm-input="true"]');
+                if (!el) return 'NO_MARKED_INPUT';
+                const autosize = el.closest('ms-autosize-textarea');
+                if (autosize) {
+                    autosize.setAttribute('data-value', el.value || '');
+                }
+                try {
+                    el.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                } catch (_) {}
+                return 'OK';
+            })()
+        """,
+        "submit_js": _submit_js(
+            """
             document.querySelector('ms-prompt-box ms-run-button button[aria-label="Run"]')
                 || document.querySelector('ms-prompt-box button[aria-label="Run"][type="submit"]')
                 || document.querySelector('button[aria-label="Run"].run-button')
@@ -584,9 +631,11 @@ SITES: dict[str, dict] = {
                 || document.querySelector('ms-prompt-box textarea')?.closest('form')?.querySelector('button:not([disabled])')
                 || document.querySelector('ms-prompt-box textarea')?.parentElement?.querySelector('button:not([disabled])')
                 || document.querySelector('ms-prompt-box textarea')?.parentElement?.parentElement?.querySelector('button:not([disabled])')
-        """, "document.querySelector('ms-prompt-box textarea, textarea')"),
+        """,
+            "document.querySelector('ms-prompt-box textarea, textarea')",
+        ),
         "response_selectors": [
-            'ms-chat-turn .chat-turn-container.model',
+            "ms-chat-turn .chat-turn-container.model",
             'ms-chat-turn:has([data-turn-role="Model"])',
             'ms-chat-turn [data-turn-role="Model"]',
         ],
@@ -596,7 +645,7 @@ SITES: dict[str, dict] = {
         ],
         "loading_selectors": [
             *_LOADING_SELECTORS,
-            'ms-run-button .stoppable-spinner',
+            "ms-run-button .stoppable-spinner",
         ],
     },
     "mistral": {
@@ -616,9 +665,9 @@ SITES: dict[str, dict] = {
         """),
         "response_selectors": [
             '[data-message-author-role="assistant"]',
-            '.assistant-message',
+            ".assistant-message",
             '[class*="assistant"]',
-            'article .markdown',
+            "article .markdown",
         ],
         "thinking_selectors": [
             '[class*="thinking"]',
@@ -639,19 +688,22 @@ SITES: dict[str, dict] = {
                 || document.querySelector('div.chat-input-editor[contenteditable="true"]')
                 || document.querySelector('div[contenteditable="true"]')
         """),
-        "submit_js": _submit_js("""
+        "submit_js": _submit_js(
+            """
             document.querySelector('button[aria-label="Submit"]')
                 || document.querySelector('button.send')
                 || document.querySelector('button[type="submit"]:not([disabled])')
                 || document.querySelector('textarea.ph, textarea[name="message"], textarea, div.chat-input-editor')?.closest('form')?.querySelector('button:not([disabled])')
                 || document.querySelector('.chat-input-editor')?.parentElement?.querySelector('button:not([disabled])')
-        """, "document.querySelector('textarea.ph, textarea[name=\"message\"], textarea, div.chat-input-editor')"),
+        """,
+            "document.querySelector('textarea.ph, textarea[name=\"message\"], textarea, div.chat-input-editor')",
+        ),
         "response_selectors": [
             '[data-role="assistant"]',
             '[data-message-author-role="assistant"]',
-            '.message.assistant',
+            ".message.assistant",
             '[class*="assistant"] .markdown',
-            'article .markdown',
+            "article .markdown",
         ],
         "thinking_selectors": [
             '[class*="thinking"]',
@@ -677,9 +729,9 @@ SITES: dict[str, dict] = {
         """),
         "response_selectors": [
             '[data-message-author-role="assistant"]',
-            '.assistant-message',
+            ".assistant-message",
             '[class*="assistant"]',
-            'article .markdown',
+            "article .markdown",
         ],
         "thinking_selectors": [
             '[class*="thinking"]',
@@ -704,9 +756,9 @@ SITES: dict[str, dict] = {
         """),
         "response_selectors": [
             '[data-message-author-role="assistant"]',
-            '.assistant-message',
+            ".assistant-message",
             '[class*="assistant"]',
-            'article .markdown',
+            "article .markdown",
         ],
         "thinking_selectors": [
             '[class*="thinking"]',
@@ -731,9 +783,9 @@ SITES: dict[str, dict] = {
         """),
         "response_selectors": [
             '[data-message-author-role="assistant"]',
-            '.assistant-message',
+            ".assistant-message",
             '[class*="assistant"]',
-            'article .markdown',
+            "article .markdown",
         ],
         "thinking_selectors": [
             '[class*="thinking"]',
@@ -751,10 +803,26 @@ SITES: dict[str, dict] = {
                 || document.querySelector('textarea[placeholder*="Message"]')
                 || document.querySelector('textarea')
         """),
-        "submit_js": _submit_js("""
-            // z.ai's send button is a custom element that may not respond to
-            // synthetic click events reliably. Prefer Enter-key dispatch on
-            // the textarea, which is the most reliable path for React SPA.
+        "post_inject_js": """
+            (() => {
+                // z.ai's textarea value is already set by the main inject IIFE.
+                // No post-inject sync needed here. Previously this block
+                // dispatched Enter key events, which triggered the form's
+                // native submit handler -- then submit_js clicked the send
+                // button again, causing the prompt to be sent twice.
+                const el = document.querySelector('[data-sbsllm-input="true"]');
+                if (!el) return 'NO_MARKED_INPUT';
+                return 'OK';
+            })()
+        """,
+        "submit_js": _submit_js(
+            """
+            // z.ai's send button is a custom element. Click it directly --
+            // the _SUBMIT_TEMPLATE already disables the button after clicking
+            // to prevent the form's native submit handler from firing a
+            // second time. Do NOT add Enter-key dispatch here: post_inject_js
+            // must also stay free of Enter events, otherwise the form submits
+            // once via the key listener and again via the button click.
             document.querySelector('button#send-message-button:not([disabled])')
                 || document.querySelector('button#send-message-button:not([class*="upload"]):not([class*="image"])')
                 || document.querySelector('button[aria-label="Send"]:not([disabled]):not([class*="upload"]):not([class*="image"])')
@@ -763,7 +831,9 @@ SITES: dict[str, dict] = {
                 // Fallback: find submit button in form that is not upload/attach
                 || form?.querySelector('button[type="submit"]:not([disabled]):not([id*="upload"]):not([id*="attach"]):not([id*="file"])')
                 || form?.querySelector('button[type="submit"]:not([disabled])')
-        """, "document.querySelector('textarea#chat-input, textarea')"),
+        """,
+            "document.querySelector('textarea#chat-input, textarea')",
+        ),
         "setup_js": """
             (() => {
                 // Click the Deep Think dropdown and select "High" if not already set.
@@ -786,25 +856,25 @@ SITES: dict[str, dict] = {
             })()
         """,
         "response_selectors": [
-            '#response-content-container .markdown-prose',
-            '#response-content-container',
+            "#response-content-container .markdown-prose",
+            "#response-content-container",
             '[data-message-author-role="assistant"]',
-            '.message.assistant .markdown',
-            '.chat-assistant .markdown',
-            '.assistant-message .markdown',
-            'article .markdown',
+            ".message.assistant .markdown",
+            ".chat-assistant .markdown",
+            ".assistant-message .markdown",
+            "article .markdown",
             # Fallbacks from external automation scripts
             'div[class*="prose"]',
             'div[class*="markdown"]',
             'div[class*="chat-assistant"]',
             'div[class*="response"]',
             '[data-message-role="assistant"]',
-            'div.chat-message',
+            "div.chat-message",
             'div[id*="message"]',
         ],
         "thinking_selectors": [
-            '.thinking-block',
-            '.thinking-chain-container',
+            ".thinking-block",
+            ".thinking-chain-container",
             '[class*="thinking"]',
             '[class*="reasoning"]',
             '[data-testid*="thinking"]',
@@ -815,8 +885,8 @@ SITES: dict[str, dict] = {
             # while a reply is being generated. Without this, `busy` is always
             # False and the server terminates the stream before any content
             # arrives.
-            '#response-content-container .dot',
-            '.skeleton.loading',
+            "#response-content-container .dot",
+            ".skeleton.loading",
         ],
     },
     "meta": {
@@ -838,9 +908,9 @@ SITES: dict[str, dict] = {
         "response_selectors": [
             '[data-testid="ai-message"]',
             '[data-message-author-role="assistant"]',
-            '.assistant-message',
+            ".assistant-message",
             '[class*="assistant-message"]',
-            'article .markdown',
+            "article .markdown",
         ],
         "thinking_selectors": [
             '[class*="thinking"]',
@@ -849,7 +919,7 @@ SITES: dict[str, dict] = {
         ],
         "loading_selectors": [
             *_LOADING_SELECTORS,
-                ],
+        ],
     },
     "huggingface": {
         "url": "https://huggingface.co/chat",
@@ -867,9 +937,9 @@ SITES: dict[str, dict] = {
         """),
         "response_selectors": [
             '[data-message-author-role="assistant"]',
-            '.assistant-message',
+            ".assistant-message",
             '[class*="assistant"]',
-            'article .markdown',
+            "article .markdown",
         ],
         "thinking_selectors": [
             '[class*="thinking"]',
@@ -877,7 +947,7 @@ SITES: dict[str, dict] = {
         ],
         "loading_selectors": [
             *_LOADING_SELECTORS,
-                ],
+        ],
     },
     "tencent": {
         "url": "https://aistudio.tencent.ai/",
@@ -899,9 +969,9 @@ SITES: dict[str, dict] = {
         """),
         "response_selectors": [
             '[data-message-author-role="assistant"]',
-            '.assistant-message',
+            ".assistant-message",
             '[class*="assistant"]',
-            'article .markdown',
+            "article .markdown",
         ],
         "thinking_selectors": [
             '[class*="thinking"]',
@@ -909,7 +979,7 @@ SITES: dict[str, dict] = {
         ],
         "loading_selectors": [
             *_LOADING_SELECTORS,
-                ],
+        ],
     },
 }
 
