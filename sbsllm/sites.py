@@ -234,6 +234,7 @@ _RESPONSE_TEMPLATE = """
         const responseSelectors = __RESPONSE_SELECTORS__;
         const thinkingSelectors = __THINKING_SELECTORS__;
         const loadingSelectors = __LOADING_SELECTORS__;
+        const loginWallSelectors = __LOGIN_WALL_SELECTORS__;
         const isVisible = (element) => {
             if (!element) return false;
             const style = window.getComputedStyle(element);
@@ -401,6 +402,17 @@ _RESPONSE_TEMPLATE = """
                 break;
             }
         }
+        // Site-specific login-wall selectors (e.g., a "Sign in" button that
+        // only appears on auth-gated pages). These are positive signals only.
+        if (!loginWall && loginWallSelectors.length) {
+            loginWall = loginWallSelectors.some((sel) => {
+                try {
+                    return document.querySelector(sel) !== null;
+                } catch (_) {
+                    return false;
+                }
+            });
+        }
         return {
             found: response !== null,
             content: content,
@@ -427,6 +439,7 @@ def _response_js(
     response_selectors: list[str] | tuple[str, ...] | None,
     thinking_selectors: list[str] | tuple[str, ...] | None = None,
     loading_selectors: list[str] | tuple[str, ...] | None = None,
+    login_wall_selectors: list[str] | tuple[str, ...] | None = None,
 ) -> str:
     """Build JS that extracts the newest assistant response from a page."""
     return (
@@ -435,6 +448,9 @@ def _response_js(
         )
         .replace("__THINKING_SELECTORS__", json.dumps(list(thinking_selectors or [])))
         .replace("__LOADING_SELECTORS__", json.dumps(list(loading_selectors or [])))
+        .replace(
+            "__LOGIN_WALL_SELECTORS__", json.dumps(list(login_wall_selectors or []))
+        )
     )
 
 
@@ -462,6 +478,11 @@ SITES: dict[str, dict] = {
         "thinking_selectors": [
             '[class*="thinking"]',
             '[class*="reasoning"]',
+        ],
+        "login_wall_selectors": [
+            'a[href*="login" i]',
+            'button[aria-label*="Sign in" i]',
+            'button[aria-label*="Log in" i]',
         ],
         "loading_selectors": [
             *_LOADING_SELECTORS,
@@ -511,6 +532,11 @@ SITES: dict[str, dict] = {
         "thinking_selectors": [
             '[class*="thinking"]',
             '[class*="reasoning"]',
+        ],
+        "login_wall_selectors": [
+            'div[data-testid="signin-button"]',
+            'button[data-testid*="signin" i]',
+            'a[href*="login" i]',
         ],
         "loading_selectors": [
             *_LOADING_SELECTORS,
@@ -574,6 +600,11 @@ SITES: dict[str, dict] = {
             '[class*="thinking"]',
             '[class*="reasoning"]',
         ],
+        "login_wall_selectors": [
+            "#login-wrap",
+            'button[aria-label*="Sign in" i]',
+            'a[href*="signin" i]',
+        ],
         "loading_selectors": [
             *_LOADING_SELECTORS,
         ],
@@ -601,6 +632,11 @@ SITES: dict[str, dict] = {
         "thinking_selectors": [
             '[class*="thinking"]',
             '[class*="reasoning"]',
+        ],
+        "login_wall_selectors": [
+            'button[aria-label*="Sign in" i]',
+            'a[href*="login" i]',
+            'button[data-testid*="login" i]',
         ],
         "loading_selectors": [
             *_LOADING_SELECTORS,
@@ -667,6 +703,11 @@ SITES: dict[str, dict] = {
             '[data-testid*="thinking"]',
             '[class*="thinking"]',
             '[class*="reasoning"]',
+        ],
+        "login_wall_selectors": [
+            'a[href*="login" i]',
+            'button[aria-label*="Sign in" i]',
+            'button[data-testid*="login" i]',
         ],
         "loading_selectors": [
             *_LOADING_SELECTORS,
@@ -756,6 +797,11 @@ SITES: dict[str, dict] = {
             'ms-chat-turn [class*="thinking"]',
             'ms-chat-turn [class*="reasoning"]',
         ],
+        "login_wall_selectors": [
+            'button[aria-label*="Sign in" i]',
+            'a[href*="login" i]',
+            'button[data-testid*="login" i]',
+        ],
         "loading_selectors": [
             *_LOADING_SELECTORS,
             "ms-run-button .stoppable-spinner",
@@ -808,6 +854,11 @@ SITES: dict[str, dict] = {
         "thinking_selectors": [
             '[class*="thinking"]',
             '[class*="reasoning"]',
+        ],
+        "login_wall_selectors": [
+            'button[class*="login"]',
+            'a[href*="login" i]',
+            'button[data-testid*="login" i]',
         ],
         "loading_selectors": [
             *_LOADING_SELECTORS,
@@ -870,6 +921,11 @@ SITES: dict[str, dict] = {
             '[class*="reasoning"]',
             '[data-testid*="thinking"]',
         ],
+        "login_wall_selectors": [
+            'button[data-testid*="login" i]',
+            'a[href*="login" i]',
+            'div[class*="login"]',
+        ],
         "loading_selectors": [
             *_LOADING_SELECTORS,
         ],
@@ -897,6 +953,11 @@ SITES: dict[str, dict] = {
         "thinking_selectors": [
             '[class*="thinking"]',
             '[class*="reasoning"]',
+        ],
+        "login_wall_selectors": [
+            'button[aria-label*="Log in" i]',
+            'a[href*="login" i]',
+            'button[data-testid*="login" i]',
         ],
         "loading_selectors": [
             *_LOADING_SELECTORS,
@@ -926,6 +987,11 @@ SITES: dict[str, dict] = {
             '[class*="thinking"]',
             '[class*="reasoning"]',
         ],
+        "login_wall_selectors": [
+            'button[aria-label*="Log in" i]',
+            'a[href*="login" i]',
+            'button[data-testid*="login" i]',
+        ],
         "loading_selectors": [
             *_LOADING_SELECTORS,
         ],
@@ -953,6 +1019,11 @@ SITES: dict[str, dict] = {
         "thinking_selectors": [
             '[class*="thinking"]',
             '[class*="reasoning"]',
+        ],
+        "login_wall_selectors": [
+            'button[aria-label*="Log in" i]',
+            'a[href*="login" i]',
+            'div[class*="login"]',
         ],
         "loading_selectors": [
             *_LOADING_SELECTORS,
@@ -1046,6 +1117,11 @@ SITES: dict[str, dict] = {
             '[class*="reasoning"]',
             '[data-testid*="thinking"]',
         ],
+        "login_wall_selectors": [
+            'a[href*="login" i]',
+            'button[aria-label*="Sign in" i]',
+            'button[aria-label*="Log in" i]',
+        ],
         "loading_selectors": [
             *_LOADING_SELECTORS,
             # z.ai uses an animated dot loader inside the response container
@@ -1105,6 +1181,11 @@ SITES: dict[str, dict] = {
             '[class*="reasoning"]',
             '[data-testid*="thinking"]',
         ],
+        "login_wall_selectors": [
+            'a[href*="login" i]',
+            'button[aria-label*="Log in" i]',
+            'button[aria-label*="Sign in" i]',
+        ],
         "loading_selectors": [
             *_LOADING_SELECTORS,
         ],
@@ -1133,6 +1214,11 @@ SITES: dict[str, dict] = {
         "thinking_selectors": [
             '[class*="thinking"]',
             '[class*="reasoning"]',
+        ],
+        "login_wall_selectors": [
+            'a[href*="login" i]',
+            'button[aria-label*="Log in" i]',
+            'button[aria-label*="Sign in" i]',
         ],
         "loading_selectors": [
             *_LOADING_SELECTORS,
@@ -1166,6 +1252,11 @@ SITES: dict[str, dict] = {
         "thinking_selectors": [
             '[class*="thinking"]',
             '[class*="reasoning"]',
+        ],
+        "login_wall_selectors": [
+            'button[data-testid*="login" i]',
+            'a[href*="login" i]',
+            ".login-box",
         ],
         "loading_selectors": [
             *_LOADING_SELECTORS,

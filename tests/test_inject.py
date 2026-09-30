@@ -255,6 +255,43 @@ class TestInjectPrompt:
                 f"{site_id} post_inject missing marker selector"
             )
 
+    @pytest.mark.parametrize(
+        "site_id", list(__import__("sbsllm.sites", fromlist=["SITES"]).SITES.keys())
+    )
+    def test_all_sites_have_login_wall_selectors(self, site_id):
+        """Every site must define login_wall_selectors for auth detection."""
+        from sbsllm.sites import SITES
+
+        assert "login_wall_selectors" in SITES[site_id]
+        assert isinstance(SITES[site_id]["login_wall_selectors"], list)
+        assert len(SITES[site_id]["login_wall_selectors"]) > 0
+
+    def test_login_wall_selectors_embedded_in_extract_js(self):
+        """extract_js must include loginWallSelectors in the output."""
+        from sbsllm.inject import extract_js
+
+        result = extract_js("chatgpt")
+        assert "loginWallSelectors" in result
+
+    def test_login_wall_selectors_empty_when_not_defined(self):
+        """Sites without login_wall_selectors get an empty array."""
+        import sbsllm.inject as inject_module
+        from sbsllm.inject import extract_js
+
+        original = inject_module.get_site
+        try:
+            inject_module.get_site = lambda sid: {
+                "url": "https://example.com/",
+                "response_selectors": ["div.reply"],
+                "thinking_selectors": [],
+                "loading_selectors": [],
+            }
+            result = extract_js("fake")
+            assert "loginWallSelectors" in result
+            assert "[]" in result
+        finally:
+            inject_module.get_site = original
+
 
 class TestSubmitJs:
     def test_returns_string(self):
