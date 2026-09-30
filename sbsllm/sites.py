@@ -22,6 +22,9 @@ _INJECT_TEMPLATE = """
         // injection would leave the previous prompt in the box on repeat requests.
         input.focus();
         if (isEditable) {
+            // Store the value for a post-inject hook that may need to
+            // re-apply it via editor-specific APIs (e.g. TipTap/ProseMirror).
+            try { input.dataset.sbsllmValue = value; } catch (_) {}
             // For contenteditable/TipTap editors, dispatch beforeinput first.
             // ProseMirror editors (including TipTap) listen for beforeinput
             // to update their internal document model. Simply setting
@@ -543,14 +546,25 @@ SITES: dict[str, dict] = {
         """),
         "post_inject_js": """
             (() => {
-                // TipTap/ProseMirror editors sometimes do not accept the
-                // textContent assignment above, or they accept it but do not
-                // update their internal document model. After the main inject
-                // IIFE runs, dispatch a fresh input event so the editor's
-                // listeners (which fire on `input`) register the new value.
+                // Grok uses TipTap/ProseMirror. The main inject above sets
+                // textContent, but that does NOT update the editor's internal
+                // document model. We must use innerText + execCommand +
+                // beforeinput to make the editor register the new value.
+                // This matches the pattern used by working grok automation scripts.
                 const el = document.querySelector('[data-sbsllm-input="true"]');
                 if (!el) return 'NO_MARKED_INPUT';
                 try {
+                    // Clear existing content
+                    el.focus();
+                    el.innerText = '';
+                    // Use execCommand to insert text (works with ProseMirror)
+                    document.execCommand('insertText', false, el.dataset.sbsllmValue || '');
+                    // Dispatch beforeinput for TipTap listeners
+                    el.dispatchEvent(new InputEvent('beforeinput', {
+                        bubbles: true, cancelable: true,
+                        inputType: 'insertText', data: el.dataset.sbsllmValue || ''
+                    }));
+                    // Dispatch input event
                     el.dispatchEvent(new InputEvent('input', {
                         bubbles: true, inputType: 'insertText'
                     }));
@@ -610,18 +624,44 @@ SITES: dict[str, dict] = {
                     autosize.setAttribute('data-value', el.value || '');
                 }
                 try {
-                    el.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+                    // Dispatch a proper InputEvent (not just Event) so the
+                    // web component's internal listener updates its state.
+                    el.dispatchEvent(new InputEvent('input', {
+                        bubbles: true, cancelable: true,
+                        inputType: 'insertText', data: el.value
+                    }));
                     el.dispatchEvent(new Event('change', { bubbles: true }));
-                } catch (_) {}
+                } catch (_) {
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+                // The Run button lives inside ms-run-button; enable it directly
+                // so the submit step can click it. The component may keep its
+                // own disabled flag, but removing ours helps.
+                const runButton = document.querySelector('ms-run-button');
+                if (runButton) {
+                    try {
+                        runButton.removeAttribute('disabled');
+                        const inner = runButton.querySelector('button');
+                        if (inner) {
+                            inner.removeAttribute('disabled');
+                            inner.setAttribute('aria-disabled', 'false');
+                        }
+                    } catch (_) {}
+                }
                 return 'OK';
             })()
         """,
         "submit_js": _submit_js(
             """
-            document.querySelector('ms-prompt-box ms-run-button button[aria-label="Run"]')
-                || document.querySelector('ms-prompt-box button[aria-label="Run"][type="submit"]')
-                || document.querySelector('button[aria-label="Run"].run-button')
+            // Google AI Studio: click the Run button inside ms-run-button or the
+            // ms-prompt-box. If no button is found, dispatch Enter on the
+            // textarea — AI Studio submits on Enter.
+            document.querySelector('ms-run-button button[aria-label="Run"]')
+                || document.querySelector('ms-prompt-box ms-run-button button[aria-label="Run"]')
+                || document.querySelector('ms-prompt-box ms-run-button button[type="submit"]')
                 || document.querySelector('ms-run-button button[type="submit"].run-button')
+                || document.querySelector('button[aria-label="Run"].run-button')
                 || document.querySelector('button[aria-label*="Run" i]')
                 || document.querySelector('button[aria-label*="Send" i]')
                 || document.querySelector('button[aria-label*="Submit" i]')
@@ -796,7 +836,7 @@ SITES: dict[str, dict] = {
         ],
     },
     "zai": {
-        "url": "https://chat.z.ai/",
+        "url": "https://chat.z.ai/auth",
         "inject": _inject_js("""
             document.querySelector('textarea#chat-input')
                 || document.querySelector('textarea[placeholder*="Ask"]')
@@ -836,23 +876,27 @@ SITES: dict[str, dict] = {
         ),
         "setup_js": """
             (() => {
-                // Click the Deep Think dropdown and select "High" if not already set.
-                const trigger = document.querySelector('#bits-c286[aria-haspopup="menu"]');
-                if (!trigger || trigger.getAttribute('aria-expanded') === 'true') return 'SKIP';
-                trigger.click();
-                return new Promise(resolve => {
-                    setTimeout(() => {
-                        const items = document.querySelectorAll('[role="menu"] button');
-                        for (const item of items) {
-                            if (item.textContent.trim().toLowerCase() === 'high') {
-                                item.click();
-                                resolve('SET_HIGH');
-                                return;
+                try {
+                    // Click the Deep Think dropdown and select "High" if not already set.
+                    const trigger = document.querySelector('#bits-c286[aria-haspopup="menu"]');
+                    if (!trigger || trigger.getAttribute('aria-expanded') === 'true') return 'SKIP';
+                    trigger.click();
+                    return new Promise(resolve => {
+                        setTimeout(() => {
+                            const items = document.querySelectorAll('[role="menu"] button');
+                            for (const item of items) {
+                                if (item.textContent.trim().toLowerCase() === 'high') {
+                                    item.click();
+                                    resolve('SET_HIGH');
+                                    return;
+                                }
                             }
-                        }
-                        resolve('NO_HIGH_FOUND');
-                    }, 300);
-                });
+                            resolve('NO_HIGH_FOUND');
+                        }, 300);
+                    });
+                } catch (e) {
+                    return 'SKIP_ERROR: ' + e.message;
+                }
             })()
         """,
         "response_selectors": [

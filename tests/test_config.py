@@ -261,6 +261,13 @@ class TestLoadConfig:
         with pytest.raises(SystemExit):
             load_config(config_file)
 
+    def test_parse_config_rejects_non_mapping(self, capsys):
+        """parse_config must exit when the YAML root is not a mapping."""
+        with pytest.raises(SystemExit):
+            parse_config(["not", "a", "dict"])  # type: ignore[arg-type]
+        captured = capsys.readouterr()
+        assert "expected a YAML mapping" in captured.err
+
     def test_malformed_yaml_exits(self, tmp_path, capsys):
         config_file = tmp_path / "config.yaml"
         config_file.write_text("chats: [unterminated\n")

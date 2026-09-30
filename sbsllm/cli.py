@@ -85,6 +85,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Seconds to wait for login (overrides config; 0 waits for Enter; max 86400)",
     )
     parser.add_argument(
+        "--timeout",
+        type=non_negative_int,
+        default=None,
+        help="Per-request browser timeout in seconds (overrides config.browser_timeout)",
+    )
+    parser.add_argument(
         "--list-sites",
         action="store_true",
         help="List available chat sites and exit",
@@ -237,7 +243,10 @@ def _wait_for_server_shutdown(
     """Wait for server thread to finish, with timeout to avoid hanging."""
     if server_thread is None:
         return
-    server_thread.join(timeout=timeout)
+    try:
+        server_thread.join(timeout=timeout)
+    except KeyboardInterrupt:
+        pass
 
 
 def run(
@@ -248,6 +257,7 @@ def run(
     host: str = "127.0.0.1",
     port: int = 8080,
     json_log: bool = False,
+    browser_timeout: int | None = None,
 ) -> int:
     """Main orchestration. Returns exit code."""
     # Setup logging
@@ -298,7 +308,7 @@ def run(
             tab_map=successful_tabs,
             host=host,
             port=port,
-            browser_timeout=config.browser_timeout,
+            browser_timeout=browser_timeout or config.browser_timeout,
             browser_lock_timeout=config.browser_lock_timeout,
             response_idle_timeout=config.response_idle_timeout,
             thinking_patience=config.thinking_patience,
@@ -365,10 +375,6 @@ def run(
         except KeyboardInterrupt:
             print("\nShutting down server...")
             return 0
-        finally:
-            if server is not None:
-                server.stop()
-            _wait_for_server_shutdown(server_thread)
     finally:
         if server is not None:
             server.stop()
@@ -377,7 +383,12 @@ def run(
 
 
 def run_server(
-    config, host: str, port: int, chrome_bin: str | None = None, json_log: bool = False
+    config,
+    host: str,
+    port: int,
+    chrome_bin: str | None = None,
+    json_log: bool = False,
+    browser_timeout: int | None = None,
 ) -> int:
     """Run the OpenAI-compatible server."""
     chats = config.chats
@@ -422,7 +433,7 @@ def run_server(
             tab_map=tab_map,
             host=host,
             port=port,
-            browser_timeout=config.browser_timeout,
+            browser_timeout=browser_timeout or config.browser_timeout,
             browser_lock_timeout=config.browser_lock_timeout,
             response_idle_timeout=config.response_idle_timeout,
             thinking_patience=config.thinking_patience,
@@ -455,10 +466,6 @@ def run_server(
         except KeyboardInterrupt:
             print("\nShutting down server...")
             return 0
-        finally:
-            if server is not None:
-                server.stop()
-            _wait_for_server_shutdown(server_thread)
     finally:
         if server is not None:
             server.stop()

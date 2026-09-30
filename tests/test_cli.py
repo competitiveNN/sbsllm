@@ -1,6 +1,7 @@
 """Tests for cli.py."""
 
 import argparse
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -198,6 +199,87 @@ class TestRun:
             result = run(config, "hello", None)
             assert result == 0
 
+    def test_no_tabs_available_aborts(self, capsys):
+        """When every tab fails to open and the user declines to continue."""
+        config = Config(chats=["chatgpt"], login_wait=0, chrome_bin=None)
+        with (
+            patch("sbsllm.cli.ensure_browser"),
+            patch("sbsllm.cli.open_page", side_effect=[None]),
+            patch("builtins.input", side_effect=["n"]),
+            patch("sbsllm.cli.create_server"),
+            patch("sbsllm.cli.close_browser"),
+        ):
+            result = run(config, "hello", None)
+            assert result == 1
+            captured = capsys.readouterr()
+            assert "Some tabs failed" in captured.out
+
+    def test_no_tabs_after_continue_aborts(self, capsys):
+        """When the user says 'y' but no tabs succeeded, exit 1."""
+        config = Config(chats=["chatgpt"], login_wait=0, chrome_bin=None)
+        with (
+            patch("sbsllm.cli.ensure_browser"),
+            patch("sbsllm.cli.open_page", side_effect=[None]),
+            patch("builtins.input", side_effect=["y"]),
+            patch("sbsllm.cli.create_server"),
+            patch("sbsllm.cli.close_browser"),
+        ):
+            result = run(config, "hello", None)
+            assert result == 1
+            captured = capsys.readouterr()
+            assert "No browser tabs are available" in captured.err
+
+    def test_enter_sent_status_prints_warning(self, capsys):
+        """ENTER_SENT_UNVERIFIED must print the verify-in-browser message."""
+        config = Config(chats=["chatgpt"], login_wait=0, chrome_bin=None)
+        with (
+            patch("sbsllm.cli.ensure_browser"),
+            patch("sbsllm.cli.open_page", side_effect=[MagicMock()]),
+            patch("builtins.input"),
+            patch("sbsllm.cli.inject_and_submit") as mock_inject,
+            patch("sbsllm.cli.create_server"),
+            patch("sbsllm.cli.close_browser"),
+        ):
+            mock_inject.return_value = {
+                "tab": 1,
+                "inject": "OK",
+                "submit": "ENTER_SENT_UNVERIFIED",
+            }
+            result = run(config, "hello", None)
+            assert result == 0
+            captured = capsys.readouterr()
+            assert "ENTER SENT (verify in browser)" in captured.out
+
+    def test_keyboard_interrupt_during_server_join(self, capsys):
+        """A KeyboardInterrupt while the server is running must exit 0."""
+        config = Config(chats=["chatgpt"], login_wait=0, chrome_bin=None)
+        server = MagicMock()
+        server.url = "http://127.0.0.1:8080/"
+        server_thread = MagicMock()
+        server_thread.join.side_effect = KeyboardInterrupt()
+
+        with (
+            patch("sbsllm.cli.ensure_browser"),
+            patch("sbsllm.cli.open_page", side_effect=[MagicMock()]),
+            patch("builtins.input"),
+            patch("sbsllm.cli.inject_and_submit") as mock_inject,
+            patch("sbsllm.cli.create_server", return_value=server),
+            patch("sbsllm.cli._start_server", return_value=server_thread),
+            patch("sbsllm.cli.close_browser") as mock_close,
+        ):
+            mock_inject.return_value = {
+                "tab": 1,
+                "inject": "OK",
+                "submit": "OK",
+            }
+            result = run(config, "hello", None)
+
+        assert result == 0
+        captured = capsys.readouterr()
+        assert "Shutting down server" in captured.out
+        server.stop.assert_called_once()
+        mock_close.assert_called_once()
+
     def test_inject_failure_status(self, capsys):
         config = Config(chats=["chatgpt"], login_wait=0, chrome_bin=None)
         with (
@@ -244,6 +326,26 @@ class TestRun:
             patch("sbsllm.cli.ensure_browser"),
             patch("sbsllm.cli.open_page", side_effect=[MagicMock()]),
             patch("builtins.input", lambda: ""),
+            patch("sbsllm.cli.create_server") as mock_create,
+            patch("sbsllm.cli._start_server", return_value=MagicMock()),
+            patch("sbsllm.cli.close_browser"),
+        ):
+            mock_create.return_value = MagicMock(stop=MagicMock())
+            result = run(config, None, None)
+            assert result == 1
+            captured = capsys.readouterr()
+            assert "No prompt provided" in captured.err
+
+    def test_empty_prompt_after_get_prompt_returns_1(self, capsys):
+        """If get_prompt returns whitespace-only, exit 1."""
+        config = Config(chats=["chatgpt"], login_wait=0, chrome_bin=None)
+        with (
+            patch("sbsllm.cli.ensure_browser"),
+            patch("sbsllm.cli.open_page", side_effect=[MagicMock()]),
+            patch("sbsllm.cli.get_prompt", return_value="   \n  "),
+            patch("builtins.input", side_effect=EOFError()),
+            patch("sbsllm.cli.create_server"),
+            patch("sbsllm.cli.close_browser"),
         ):
             result = run(config, None, None)
             assert result == 1
@@ -352,6 +454,69 @@ class TestRun:
         monkeypatch.setattr("builtins.input", lambda: next(inputs))
         wait_for_login(0)
 
+    def test_non_negative_int_rejects_non_integer(self):
+        from sbsllm.cli import non_negative_int
+
+        with pytest.raises(argparse.ArgumentTypeError, match="must be an integer"):
+            non_negative_int("abc")
+
+    def test_server_port_rejects_out_of_range(self):
+        from sbsllm.cli import server_port
+
+        with pytest.raises(argparse.ArgumentTypeError, match="must be at most 65535"):
+            server_port("70000")
+
+    def test_login_wait_rejects_above_max(self):
+        from sbsllm.cli import login_wait
+
+        with pytest.raises(argparse.ArgumentTypeError, match="must be at most 86400"):
+            login_wait(str(25 * 60 * 60))
+
+    def test_wait_for_login_select_input_then_return(self, monkeypatch):
+        """select returns ready -> input() is consumed -> loop returns."""
+        inputs = iter([""])
+        monkeypatch.setattr("builtins.input", lambda: next(inputs))
+        with patch("sbsllm.cli.select.select", return_value=([sys.stdin], [], [])):
+            wait_for_login(5)
+
+    def test_wait_for_login_select_eof_handled(self, monkeypatch):
+        """If input() raises EOFError after select returns ready, still returns."""
+
+        def raise_eof():
+            raise EOFError()
+
+        monkeypatch.setattr("builtins.input", raise_eof)
+        with patch("sbsllm.cli.select.select", return_value=([sys.stdin], [], [])):
+            wait_for_login(5)
+
+    def test_wait_for_login_select_oserror_handled(self):
+        """An OSError from select must be caught and retried, not raised."""
+        with (
+            patch(
+                "sbsllm.cli.select.select",
+                side_effect=OSError("bad fd"),
+            ),
+            patch("builtins.input", side_effect=EOFError()),
+            patch("sys.stdin.isatty", return_value=True),
+        ):
+            # Use wait=1 so the loop enters at least one iteration.
+            # select raises OSError, which is caught; input() raises
+            # EOFError which is also caught; then remaining drops to 0
+            # and the loop exits.
+            wait_for_login(1)
+
+    def test_wait_for_login_select_oserror_not_tty(self):
+        """An OSError from select when stdin is not a TTY returns early."""
+        with (
+            patch(
+                "sbsllm.cli.select.select",
+                side_effect=OSError("bad fd"),
+            ),
+            patch("sys.stdin.isatty", return_value=False),
+        ):
+            # The branch at line 178-179 returns early when not a TTY.
+            wait_for_login(1)
+
 
 class TestRunServer:
     def test_server_browser_error(self, capsys):
@@ -420,6 +585,43 @@ class TestRunServer:
             assert url_calls
             for call in url_calls:
                 assert call.kwargs.get("flush") is True
+
+    def test_server_no_tabs_available(self, capsys):
+        """run_server must exit 1 when no tabs could be opened."""
+        config = Config(chats=["chatgpt"], login_wait=0, chrome_bin=None)
+        with (
+            patch("sbsllm.cli.ensure_browser"),
+            patch("sbsllm.cli.open_page", side_effect=[None]),
+            patch("sbsllm.cli.create_server"),
+            patch("sbsllm.cli.close_browser"),
+        ):
+            result = run_server(config, "127.0.0.1", 8080)
+            assert result == 1
+            captured = capsys.readouterr()
+            assert "No browser tabs are available" in captured.err
+
+    def test_server_keyboard_interrupt_during_join(self, capsys):
+        """A KeyboardInterrupt while the server thread is running exits 0."""
+        config = Config(chats=["chatgpt"], login_wait=0, chrome_bin=None)
+        server = MagicMock()
+        server.url = "http://127.0.0.1:8080/"
+        server_thread = MagicMock()
+        server_thread.join.side_effect = KeyboardInterrupt()
+
+        with (
+            patch("sbsllm.cli.ensure_browser"),
+            patch("sbsllm.cli.open_page", side_effect=[MagicMock()]),
+            patch("sbsllm.cli.create_server", return_value=server),
+            patch("sbsllm.cli._start_server", return_value=server_thread),
+            patch("sbsllm.cli.close_browser") as mock_close,
+        ):
+            result = run_server(config, "127.0.0.1", 8080)
+
+        assert result == 0
+        captured = capsys.readouterr()
+        assert "Shutting down server" in captured.out
+        server.stop.assert_called_once()
+        mock_close.assert_called_once()
 
     def test_server_startup_failure_cleans_up(self):
         config = Config(chats=["chatgpt"], login_wait=0, chrome_bin=None)

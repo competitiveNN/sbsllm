@@ -17,6 +17,11 @@ from playwright.sync_api import Error as PlaywrightError
 
 logger = logging.getLogger(__name__)
 
+# Logger for structured JSON state transition events in wait_for_response.
+# Separate from the module logger so callers can filter these without
+# disabling general debug noise.
+_state_logger = logging.getLogger(__name__ + ".response_state")
+
 # Isolated user data directory for Chromium profile
 USER_DATA_DIR = "/tmp/sbsllm-chrome"
 
@@ -537,7 +542,12 @@ def close_browser() -> None:
         _do_close()
         return
 
-    run_in_browser_thread(_do_close)
+    if _context is None:
+        return
+    try:
+        return run_in_browser_thread(_do_close)
+    except (RuntimeError, BrowserOperationTimeout):
+        pass
     _stop_browser_worker()
 
 
@@ -730,11 +740,28 @@ def wait_for_response(
 
         if is_new_response(current, baseline):
             now = time.monotonic()
-            if current != last or busy:
-                # Mid-generation pauses are normal; never count them as done.
+            # Track only real payload movement. Resetting on `busy` as well
+            # made the elapsed time always ~0, so the busy-patience guard
+            # could never fire and a thinking model held the tab until the
+            # overall deadline.
+            if current != last:
                 last_change_at = now
+                _state_logger.debug(
+                    "response_state: payload_changed",
+                    extra={
+                        "content_len": len(content),
+                        "thinking_len": len(thinking),
+                        "busy": busy,
+                        "done": current.get("done"),
+                        "count": current.get("count"),
+                    },
+                )
             stable_for = now - last_change_at if last_change_at is not None else 0.0
             if saw_busy and current.get("done") and stable_for >= done_confirm:
+                _state_logger.debug(
+                    "response_state: done_after_stable",
+                    extra={"stable_for": stable_for, "count": current.get("count")},
+                )
                 return current
             if (
                 not busy
@@ -742,16 +769,42 @@ def wait_for_response(
                 and idle_timeout
                 and stable_for >= idle_timeout
             ):
+                _state_logger.debug(
+                    "response_state: idle_complete",
+                    extra={"stable_for": stable_for, "count": current.get("count")},
+                )
                 current["done"] = True
                 return current
             # A thinking-only stall gets far more patience than an answer
             # stall: reasoning traces pause naturally between chunks, and
             # thinking models think for minutes.
             if busy and not content and thinking and stable_for >= thinking_patience:
+                _state_logger.debug(
+                    "response_state: thinking_timeout",
+                    extra={
+                        "stable_for": stable_for,
+                        "thinking_len": len(thinking),
+                        "patience": thinking_patience,
+                    },
+                )
                 current["thinking_timeout"] = True
                 return current
+            _state_logger.debug(
+                "response_state: polling",
+                extra={
+                    "busy": busy,
+                    "done": current.get("done"),
+                    "content_len": len(content),
+                    "thinking_len": len(thinking),
+                    "stable_for": stable_for,
+                },
+            )
         last = current
         time.sleep(max(float(poll_interval), 0.01))
+    _state_logger.debug(
+        "response_state: budget_exhausted",
+        extra={"timed_out": True, "count": last.get("count")},
+    )
     return {**last, "timed_out": True}
 
 

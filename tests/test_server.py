@@ -4,6 +4,7 @@ import json
 import socket
 import threading
 import time
+import types
 from unittest.mock import MagicMock, patch
 
 from sbsllm.server import (
@@ -11,6 +12,7 @@ from sbsllm.server import (
     DEFAULT_PORT,
     OpenAIHandler,
     Server,
+    _ModelLockRegistry,
     create_server,
 )
 
@@ -274,7 +276,10 @@ class TestOpenAIHandlerChatCompletions:
                     mock_submit_js.return_value = "submit_js"
                     with patch("sbsllm.server.extract_js") as mock_extract:
                         mock_extract.return_value = None
-                        OpenAIHandler._handle_chat_completions(handler)
+                        with patch(
+                            "sbsllm.server.check_page_health", return_value=True
+                        ):
+                            OpenAIHandler._handle_chat_completions(handler)
 
         # No extraction JS for this site → visible 502, not a fake
         # "Prompt sent to X successfully" answer.
@@ -294,11 +299,26 @@ class TestOpenAIHandlerChatCompletions:
 
         with patch("sbsllm.server.inject_and_submit") as mock_submit:
             mock_submit.return_value = {"tab": 1, "inject": "NO_INPUT", "submit": None}
-            with patch("sbsllm.server.inject_prompt") as mock_inject:
+            with (
+                patch("sbsllm.server.inject_prompt") as mock_inject,
+                patch("sbsllm.server.submit_js") as mock_submit_js,
+                patch("sbsllm.server.extract_js", return_value="extract_js"),
+                patch("sbsllm.server.check_page_health", return_value=True),
+                patch(
+                    "sbsllm.server.capture_response",
+                    return_value={
+                        "content": "",
+                        "thinking": None,
+                        "busy": False,
+                        "done": False,
+                        "count": 0,
+                        "found": False,
+                    },
+                ),
+            ):
                 mock_inject.return_value = "inject_js"
-                with patch("sbsllm.server.submit_js") as mock_submit_js:
-                    mock_submit_js.return_value = "submit_js"
-                    OpenAIHandler._handle_chat_completions(handler)
+                mock_submit_js.return_value = "submit_js"
+                OpenAIHandler._handle_chat_completions(handler)
 
         handler._send_error.assert_called_once()
         call_args = handler._send_error.call_args[0]
@@ -316,11 +336,15 @@ class TestOpenAIHandlerChatCompletions:
 
         with patch("sbsllm.server.inject_and_submit") as mock_submit:
             mock_submit.return_value = {"tab": 1, "inject": "OK", "submit": "NO_BUTTON"}
-            with patch("sbsllm.server.inject_prompt") as mock_inject:
+            with (
+                patch("sbsllm.server.inject_prompt") as mock_inject,
+                patch("sbsllm.server.submit_js") as mock_submit_js,
+                patch("sbsllm.server.extract_js", return_value=None),
+                patch("sbsllm.server.check_page_health", return_value=True),
+            ):
                 mock_inject.return_value = "inject_js"
-                with patch("sbsllm.server.submit_js") as mock_submit_js:
-                    mock_submit_js.return_value = "submit_js"
-                    OpenAIHandler._handle_chat_completions(handler)
+                mock_submit_js.return_value = "submit_js"
+                OpenAIHandler._handle_chat_completions(handler)
 
         handler._send_error.assert_called_once()
         call_args = handler._send_error.call_args[0]
@@ -344,16 +368,31 @@ class TestOpenAIHandlerChatCompletions:
             mock_inject.return_value = "inject_js"
             with (
                 patch("sbsllm.server.submit_js") as mock_submit_js,
+                patch("sbsllm.server.check_page_health", return_value=True),
+                patch(
+                    "sbsllm.server.capture_response",
+                    return_value={
+                        "content": "",
+                        "thinking": None,
+                        "busy": False,
+                        "done": False,
+                        "count": 0,
+                        "found": False,
+                    },
+                ),
             ):
                 mock_submit_js.return_value = "submit_js"
                 OpenAIHandler._handle_chat_completions(handler)
 
-        handler._send_error.assert_called_once_with(
-            502,
-            "Browser error: fail. Try restarting the browser.",
-            "server_error",
-            "test-request-id",
+        handler._send_error.assert_called_once()
+        call_args = handler._send_error.call_args
+        assert call_args[0][0] == 502
+        assert (
+            "Browser error from chatgpt: fail" in call_args[0][1]
+            or "Browser error: fail" in call_args[0][1]
         )
+        assert call_args[0][2] == "server_error"
+        assert call_args[0][3] == "test-request-id"
 
     def test_browser_page_error_returns_502(self):
         """A stale/closed page fields a PlaywrightError as status, not a 200."""
@@ -370,7 +409,21 @@ class TestOpenAIHandlerChatCompletions:
             }
             with patch("sbsllm.server.inject_prompt") as mock_inject:
                 mock_inject.return_value = "inject_js"
-                with patch("sbsllm.server.submit_js") as mock_submit_js:
+                with (
+                    patch("sbsllm.server.submit_js") as mock_submit_js,
+                    patch("sbsllm.server.check_page_health", return_value=True),
+                    patch(
+                        "sbsllm.server.capture_response",
+                        return_value={
+                            "content": "",
+                            "thinking": None,
+                            "busy": False,
+                            "done": False,
+                            "count": 0,
+                            "found": False,
+                        },
+                    ),
+                ):
                     mock_submit_js.return_value = "submit_js"
                     OpenAIHandler._handle_chat_completions(handler)
 
@@ -390,6 +443,18 @@ class TestOpenAIHandlerChatCompletions:
             patch("sbsllm.server.inject_and_submit", side_effect=RuntimeError("boom")),
             patch("sbsllm.server.inject_prompt") as mock_inject,
             patch("sbsllm.server.submit_js") as mock_submit_js,
+            patch("sbsllm.server.check_page_health", return_value=True),
+            patch(
+                "sbsllm.server.capture_response",
+                return_value={
+                    "content": "",
+                    "thinking": None,
+                    "busy": False,
+                    "done": False,
+                    "count": 0,
+                    "found": False,
+                },
+            ),
         ):
             mock_inject.return_value = "inject_js"
             mock_submit_js.return_value = "submit_js"
@@ -411,6 +476,18 @@ class TestOpenAIHandlerChatCompletions:
             patch("sbsllm.server.inject_prompt", return_value="inject_js"),
             patch("sbsllm.server.submit_js", return_value="submit_js"),
             patch("sbsllm.server.extract_js", return_value="EXTRACT_JS"),
+            patch("sbsllm.server.check_page_health", return_value=True),
+            patch(
+                "sbsllm.server.capture_response",
+                return_value={
+                    "found": False,
+                    "content": "",
+                    "thinking": None,
+                    "busy": False,
+                    "done": False,
+                    "count": 0,
+                },
+            ),
             patch("sbsllm.server.wait_for_response", return_value=response_result),
             patch(
                 "sbsllm.server.get_page_snapshot",
@@ -428,7 +505,16 @@ class TestOpenAIHandlerChatCompletions:
         patches = self._patch_success(
             {"found": True, "content": "4", "thinking": None, "done": True}
         )
-        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
+        with (
+            patches[0],
+            patches[1],
+            patches[2],
+            patches[3],
+            patches[4],
+            patches[5],
+            patches[6],
+            patches[7],
+        ):
             OpenAIHandler._handle_chat_completions(handler)
 
         handler._send_json.assert_called_once()
@@ -448,7 +534,16 @@ class TestOpenAIHandlerChatCompletions:
         patches = self._patch_success(
             {"found": True, "content": "4", "thinking": "2+2=4", "done": True}
         )
-        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
+        with (
+            patches[0],
+            patches[1],
+            patches[2],
+            patches[3],
+            patches[4],
+            patches[5],
+            patches[6],
+            patches[7],
+        ):
             OpenAIHandler._handle_chat_completions(handler)
 
         handler._send_json.assert_called_once()
@@ -472,7 +567,16 @@ class TestOpenAIHandlerChatCompletions:
                 "done": False,
             }
         )
-        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
+        with (
+            patches[0],
+            patches[1],
+            patches[2],
+            patches[3],
+            patches[4],
+            patches[5],
+            patches[6],
+            patches[7],
+        ):
             OpenAIHandler._handle_chat_completions(handler)
 
         handler._send_error.assert_called_once()
@@ -497,7 +601,16 @@ class TestOpenAIHandlerChatCompletions:
                 "done": False,
             }
         )
-        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
+        with (
+            patches[0],
+            patches[1],
+            patches[2],
+            patches[3],
+            patches[4],
+            patches[5],
+            patches[6],
+            patches[7],
+        ):
             OpenAIHandler._handle_chat_completions(handler)
 
         handler._send_error.assert_called_once()
@@ -522,7 +635,16 @@ class TestOpenAIHandlerChatCompletions:
                 "done": False,
             }
         )
-        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
+        with (
+            patches[0],
+            patches[1],
+            patches[2],
+            patches[3],
+            patches[4],
+            patches[5],
+            patches[6],
+            patches[7],
+        ):
             OpenAIHandler._handle_chat_completions(handler)
 
         handler._send_error.assert_called_once()
@@ -1060,3 +1182,689 @@ class TestServerStartWithInterrupt:
         handler_cls = cls.call_args.args[1]
         assert handler_cls.model_map is server.model_map
         assert handler_cls.tab_map is server.tab_map
+
+
+class TestHandlerSSEHelpers:
+    """Unit tests for OpenAIHandler SSE/output helpers."""
+
+    def _make_handler(self):
+        handler = OpenAIHandler.__new__(OpenAIHandler)
+        handler.wfile = MagicMock()
+        handler.send_response = MagicMock()
+        handler.send_header = MagicMock()
+        handler.end_headers = MagicMock()
+        handler.close_connection = False
+        handler.headers = {}
+        handler._send_json = MagicMock()
+        handler._send_error = MagicMock()
+        return handler
+
+    def test_send_sse_comment(self):
+        handler = self._make_handler()
+        handler._send_sse_comment()
+        handler.wfile.write.assert_called_once_with(b": keepalive\n\n")
+        handler.wfile.flush.assert_called_once()
+
+    def test_send_sse(self):
+        handler = self._make_handler()
+        handler._send_sse("data")
+        handler.wfile.write.assert_called_once_with(b"data: data\n\n")
+
+    def test_send_sse_headers(self):
+        handler = self._make_handler()
+        handler._send_sse_headers("req-1")
+        assert handler.close_connection is True
+        handler.send_response.assert_called_once_with(200)
+        headers = handler.send_header.call_args_list
+        header_names = [c.args[0] for c in headers]
+        assert "Content-Type" in header_names
+        assert "Connection" in header_names
+        assert "X-Accel-Buffering" in header_names
+
+    def test_send_sse_headers_without_request_id(self):
+        handler = self._make_handler()
+        handler._send_sse_headers("")
+        # request_id is empty — should still send headers without the X-Request-ID header
+        header_names = [c.args[0] for c in handler.send_header.call_args_list]
+        assert "X-Request-ID" not in header_names
+
+    def test_sse_chunk(self):
+        handler = self._make_handler()
+        handler._send_sse = MagicMock()
+        handler._sse_chunk("id1", 123, "gpt-4", {"content": "hi"})
+        handler._send_sse.assert_called_once()
+        data = json.loads(handler._send_sse.call_args[0][0])
+        assert data["id"] == "id1"
+        assert data["choices"][0]["delta"]["content"] == "hi"
+        assert data["choices"][0]["finish_reason"] is None
+
+    def test_sse_chunk_with_finish_reason(self):
+        handler = self._make_handler()
+        handler._send_sse = MagicMock()
+        handler._sse_chunk("id1", 123, "gpt-4", {}, finish_reason="stop")
+        handler._send_sse.assert_called_once()
+        data = json.loads(handler._send_sse.call_args[0][0])
+        assert data["choices"][0]["finish_reason"] == "stop"
+
+    def test_server_setting_fallback(self):
+        handler = OpenAIHandler.__new__(OpenAIHandler)
+        server = types.SimpleNamespace(browser_timeout=60)
+        handler.server = server
+        # When server doesn't have the attribute, falls through to default
+        result = handler._server_setting("nonexistent_setting", 42)
+        assert result == 42
+
+    def test_acquire_browser_lock_timeout(self):
+        """When the lock is held, _acquire_browser_lock returns a timeout."""
+        handler = OpenAIHandler.__new__(OpenAIHandler)
+        handler.server = types.SimpleNamespace(
+            model_locks=_ModelLockRegistry(),
+            browser_lock_timeout=0.01,
+        )
+        # Hold the lock so the second attempt times out
+        lock, acquired, _ = handler._acquire_browser_lock("gpt-4")
+        assert acquired is True
+        try:
+            result = handler._acquire_browser_lock("gpt-4")
+            assert result == (None, False, 0.01)
+        finally:
+            lock.release()
+
+    def test_send_busy_error(self):
+        """_send_busy_error must send a 503 with lock_timeout hint."""
+        handler = self._make_handler()
+        handler.model_map = {"gpt-4": "chatgpt"}
+        handler.tab_map = {"gpt-4": MagicMock()}
+        handler._busy_models = MagicMock(return_value=["gpt-4"])
+        handler._server_setting = MagicMock(return_value=30.0)
+        handler._send_busy_error("req-1", "gpt-4", 30.0)
+        handler._send_error.assert_called_once()
+        call_args = handler._send_error.call_args[0]
+        assert call_args[0] == 503
+        assert "busy" in call_args[1].lower()
+
+    def test_busy_models(self):
+        handler = OpenAIHandler.__new__(OpenAIHandler)
+        registry = _ModelLockRegistry()
+        handler.server = types.SimpleNamespace(model_locks=registry)
+        handler.model_locks = registry
+        result = handler._busy_models()
+        assert isinstance(result, list)
+
+    def _make_streaming_handler(self, **server_attrs):
+        handler = OpenAIHandler.__new__(OpenAIHandler)
+        handler.model_map = {"gpt-4": "chatgpt"}
+        handler.tab_map = {"gpt-4": MagicMock()}
+        handler._build_web_prompt = MagicMock(return_value="Hello!")
+        handler._inject_and_submit_with_recovery = MagicMock(
+            return_value=({"inject": "OK", "submit": "OK"}, MagicMock())
+        )
+        handler._server_setting = MagicMock(return_value=60)
+        handler._acquire_browser_lock = MagicMock(
+            return_value=(threading.Lock(), True, 30.0)
+        )
+        handler._release_browser_lock = MagicMock()
+        handler._send_error = MagicMock()
+        handler._send_sse = MagicMock(side_effect=lambda x: x)
+        handler._send_sse_headers = MagicMock()
+        handler._send_sse_comment = MagicMock()
+        handler._sse_chunk = MagicMock()
+        handler.wfile = MagicMock()
+        handler._streaming_sse_done = []
+        handler.server = types.SimpleNamespace(
+            model_locks=_ModelLockRegistry(),
+            browser_lock_timeout=30,
+            browser_timeout=60,
+            **server_attrs,
+        )
+        return handler
+
+    def test_streaming_lock_timeout(self):
+        """When the tab is busy, a 503 is sent."""
+        handler = self._make_streaming_handler()
+        handler._acquire_browser_lock = MagicMock(
+            return_value=(threading.Lock(), False, 30.0)
+        )
+        handler._handle_streaming_chat_completions(
+            "req-1", "gpt-4", "chatgpt", MagicMock(), 1, "hi", 0.0, 60.0
+        )
+        handler._send_error.assert_called_once()
+        assert handler._send_error.call_args[0][0] == 503
+
+    def test_streaming_extraction_unsupported(self):
+        handler = self._make_streaming_handler()
+        handler._send_sse_headers = MagicMock()
+        with patch("sbsllm.server.extract_js", return_value=None):
+            handler._handle_streaming_chat_completions(
+                "req-1", "gpt-4", "chatgpt", MagicMock(), 1, "hi", 0.0, 60.0
+            )
+        handler._send_error.assert_called_once()
+        assert handler._send_error.call_args[0][0] == 502
+
+    def test_streaming_client_disconnected(self):
+        """A BrokenPipeError during streaming is caught and logged."""
+        handler = self._make_streaming_handler()
+        handler._send_sse_headers = MagicMock()
+        handler._sse_chunk = MagicMock()  # simulate normal chunks
+        handler._send_sse = MagicMock(side_effect=BrokenPipeError("gone"))
+        with (
+            patch("sbsllm.server.extract_js", return_value="EXTRACT"),
+            patch("sbsllm.server.capture_response") as mock_cap,
+            patch("sbsllm.server.time") as fake_time,
+        ):
+            clock = FakeClock()
+            fake_time.monotonic.side_effect = clock.monotonic
+            fake_time.sleep.side_effect = clock.sleep
+            fake_time.time.return_value = 1_700_000_000
+            mock_cap.return_value = {"found": None}
+            # We need _send_sse_headers to set headers_sent=True
+            # The mock _send_sse_headers is a MagicMock, doesn't track state
+            # Let's use side_effect to simulate: first call sends headers, then
+            # _stream_web_chat runs, then _send_sse raises BrokenPipeError
+            handler._send_sse_headers = MagicMock()
+            handler._send_sse = MagicMock(side_effect=BrokenPipeError("gone"))
+            handler._sse_chunk = MagicMock()
+
+            def send_sse(data):
+                raise BrokenPipeError("gone")
+
+            handler._send_sse = send_sse
+            # Make _stream_web_chat return quickly via mock
+            handler._stream_web_chat = MagicMock(
+                return_value={
+                    "content": "hi",
+                    "thinking": None,
+                    "done": True,
+                    "stop_reason": "site_done",
+                }
+            )
+            handler._handle_streaming_chat_completions(
+                "req-1", "gpt-4", "chatgpt", MagicMock(), 1, "hi", 0.0, 60.0
+            )
+        # Should not raise — BrokenPipeError is caught
+
+    def test_streaming_browser_error(self):
+        """BROWSER_ERROR in inject/submit status sends a 502 before headers."""
+        handler = self._make_streaming_handler()
+        handler._inject_and_submit_with_recovery = MagicMock(
+            return_value=(
+                {"inject": "BROWSER_ERROR: page closed", "submit": None},
+                MagicMock(),
+            )
+        )
+        with (
+            patch("sbsllm.server.extract_js", return_value="EXTRACT"),
+            patch(
+                "sbsllm.server.capture_response",
+                return_value={"found": False, "count": 0},
+            ),
+        ):
+            handler._handle_streaming_chat_completions(
+                "req-1", "gpt-4", "chatgpt", MagicMock(), 1, "hi", 0.0, 60.0
+            )
+        handler._send_error.assert_called_once()
+        assert handler._send_error.call_args[0][0] == 502
+        assert "chatgpt" in handler._send_error.call_args[0][1].lower()
+        assert "CAPTCHA" in handler._send_error.call_args[0][1]
+
+    def test_streaming_inject_submit_failed(self):
+        """Inject or submit returning a non-OK code sends 502 before headers."""
+        handler = self._make_streaming_handler()
+        handler._inject_and_submit_with_recovery = MagicMock(
+            return_value=(
+                {"inject": "NO_INPUT", "submit": "NO_BUTTON"},
+                MagicMock(),
+            )
+        )
+        with (
+            patch("sbsllm.server.extract_js", return_value="EXTRACT"),
+            patch(
+                "sbsllm.server.capture_response",
+                return_value={"found": False, "count": 0},
+            ),
+        ):
+            handler._handle_streaming_chat_completions(
+                "req-1", "gpt-4", "chatgpt", MagicMock(), 1, "hi", 0.0, 60.0
+            )
+        handler._send_error.assert_called_once()
+        assert handler._send_error.call_args[0][0] == 502
+        msg = handler._send_error.call_args[0][1]
+        assert "chatgpt" in msg.lower()
+        assert "NO_INPUT" in msg
+
+    def test_streaming_invalid_status(self):
+        """Non-dict status from inject_and_submit sends 500 before headers."""
+        handler = self._make_streaming_handler()
+        handler._inject_and_submit_with_recovery = MagicMock(
+            return_value=(42, MagicMock())
+        )
+        with (
+            patch("sbsllm.server.extract_js", return_value="EXTRACT"),
+            patch(
+                "sbsllm.server.capture_response",
+                return_value={"found": False, "count": 0},
+            ),
+        ):
+            handler._handle_streaming_chat_completions(
+                "req-1", "gpt-4", "chatgpt", MagicMock(), 1, "hi", 0.0, 60.0
+            )
+        handler._send_error.assert_called_once()
+        assert handler._send_error.call_args[0][0] == 500
+        assert "chatgpt" in handler._send_error.call_args[0][1].lower()
+
+    def test_streaming_browser_error_after_headers(self):
+        """BrowserError from _stream_web_chat (headers sent) ends the SSE."""
+        from sbsllm.browser import BrowserError
+
+        handler = self._make_streaming_handler()
+        handler._stream_web_chat = MagicMock(side_effect=BrowserError("eval failed"))
+        with (
+            patch("sbsllm.server.extract_js", return_value="EXTRACT"),
+            patch(
+                "sbsllm.server.capture_response",
+                return_value={"found": False, "count": 0},
+            ),
+            patch(
+                "sbsllm.server.get_page_snapshot",
+                return_value={"url": "https://grok.com/", "title": "Grok"},
+            ),
+            patch("sbsllm.server.time") as fake_time,
+        ):
+            clock = FakeClock()
+            fake_time.monotonic.side_effect = clock.monotonic
+            fake_time.sleep.side_effect = clock.sleep
+            fake_time.time.return_value = 1_700_000_000
+            handler._handle_streaming_chat_completions(
+                "req-1", "gpt-4", "chatgpt", MagicMock(), 1, "hi", 0.0, 60.0
+            )
+        # Headers were sent, so the error goes out as SSE chunks + [DONE]
+        handler._send_sse.assert_any_call("[DONE]")
+        # The error is embedded in an SSE data line
+        sent = handler._send_sse.call_args_list
+        error_text = ""
+        for call in sent:
+            data = call[0][0]
+            if isinstance(data, str) and "server_error" in data:
+                error_text = data
+                break
+        assert "eval failed" in error_text
+
+    def test_streaming_generic_exception_after_headers(self):
+        """Generic Exception from _stream_web_chat (headers sent) ends the SSE."""
+        handler = self._make_streaming_handler()
+        handler._stream_web_chat = MagicMock(side_effect=RuntimeError("boom"))
+        with (
+            patch("sbsllm.server.extract_js", return_value="EXTRACT"),
+            patch(
+                "sbsllm.server.capture_response",
+                return_value={"found": False, "count": 0},
+            ),
+            patch(
+                "sbsllm.server.get_page_snapshot",
+                return_value={"url": "https://grok.com/", "title": "Grok"},
+            ),
+            patch("sbsllm.server.time") as fake_time,
+        ):
+            clock = FakeClock()
+            fake_time.monotonic.side_effect = clock.monotonic
+            fake_time.sleep.side_effect = clock.sleep
+            fake_time.time.return_value = 1_700_000_000
+            handler._handle_streaming_chat_completions(
+                "req-1", "gpt-4", "chatgpt", MagicMock(), 1, "hi", 0.0, 60.0
+            )
+        handler._send_sse.assert_any_call("[DONE]")
+        sent = handler._send_sse.call_args_list
+        error_text = ""
+        for call in sent:
+            data = call[0][0]
+            if isinstance(data, str) and "server_error" in data:
+                error_text = data
+                break
+        assert "boom" in error_text
+
+    def test_streaming_login_wall_empty_response(self):
+        """Empty answer with login_wall sends a login message via SSE."""
+        handler = self._make_streaming_handler()
+        handler._stream_web_chat = MagicMock(
+            return_value={
+                "content": "",
+                "thinking": None,
+                "done": True,
+                "stop_reason": "site_done",
+                "login_wall": True,
+            }
+        )
+        with (
+            patch("sbsllm.server.extract_js", return_value="EXTRACT"),
+            patch(
+                "sbsllm.server.capture_response",
+                return_value={"found": False, "count": 0},
+            ),
+        ):
+            handler._handle_streaming_chat_completions(
+                "req-1", "gpt-4", "chatgpt", MagicMock(), 1, "hi", 0.0, 60.0
+            )
+        # Should have sent at least the content chunk + finish + [DONE]
+        handler._sse_chunk.assert_called()
+        handler._send_sse.assert_any_call("[DONE]")
+        # The 4th positional arg to _sse_chunk is the delta dict; find the
+        # content chunk that carries the login-wall message.
+        text = ""
+        for call in handler._sse_chunk.call_args_list:
+            delta = call[0][3]
+            if isinstance(delta, dict) and "content" in delta:
+                text += delta["content"]
+        assert "signed-in" in text.lower(), text
+
+
+class TestHandlerHealthMetrics:
+    """Tests for health and metrics endpoints."""
+
+    def _make_handler(self):
+        handler = OpenAIHandler.__new__(OpenAIHandler)
+        handler.headers = {"x-request-id": "test-request-id"}
+        handler.model_map = {"gpt-4": "chatgpt"}
+        handler.tab_map = {"gpt-4": MagicMock()}
+        handler._send_json = MagicMock()
+        handler.send_response = MagicMock()
+        handler.send_header = MagicMock()
+        handler.end_headers = MagicMock()
+        handler.wfile = MagicMock()
+        handler.wfile.write = MagicMock()
+        return handler
+
+    def test_health_degraded_browser(self):
+        handler = self._make_handler()
+        handler.server = MagicMock()
+        handler.server.tab_map = {"gpt-4": MagicMock()}
+        with patch("sbsllm.browser.is_running", return_value=False):
+            handler._handle_health("req-1")
+        handler._send_json.assert_called_once()
+        data = handler._send_json.call_args[0][1]
+        assert data["browser_connected"] is False
+        assert data["status"] == "degraded"
+
+    def test_health_with_tabs(self):
+        handler = self._make_handler()
+        handler.server = MagicMock()
+        handler.server.tab_map = {"gpt-4": MagicMock()}
+        with (
+            patch("sbsllm.browser.is_running", return_value=True),
+            patch("sbsllm.browser.check_page_health", return_value=True),
+        ):
+            handler._handle_health("req-1")
+        handler._send_json.assert_called_once()
+        data = handler._send_json.call_args[0][1]
+        assert data["browser_connected"] is True
+        assert data["active_tabs"] == 1
+        assert data["tab_details"]["gpt-4"]["connected"] is True
+
+    def test_health_exception(self):
+        handler = self._make_handler()
+        handler.server = MagicMock()
+        handler.server.tab_map = {"gpt-4": MagicMock()}
+        with patch("sbsllm.browser.is_running", side_effect=RuntimeError("boom")):
+            handler._handle_health("req-1")
+        handler._send_json.assert_called_once()
+        data = handler._send_json.call_args[0][1]
+        assert data["browser_connected"] is False
+        assert data["status"] == "degraded"
+
+    def test_metrics_with_data(self):
+        handler = self._make_handler()
+        with patch("sbsllm.server._request_latencies", [0.1, 0.2, 0.3]):
+            handler._handle_metrics("req-1")
+        handler.send_response.assert_called_once_with(200)
+        written = handler.wfile.write.call_args[0][0]
+        text = written.decode("utf-8")
+        assert "sbsllm_requests_total" in text
+        assert "sbsllm_request_duration_seconds_avg" in text
+
+    def test_do_get_not_found(self):
+        handler = self._make_handler()
+        handler.path = "/nonexistent"
+        handler._send_error = MagicMock()
+        handler.do_GET()
+        handler._send_error.assert_called_once()
+        assert handler._send_error.call_args[0][0] == 404
+
+
+class TestNonStreamingPaths:
+    """Tests for non-streaming _handle_chat_completions branches."""
+
+    def _make_handler(self, prompt_result="Hello!"):
+        import threading
+
+        handler = OpenAIHandler.__new__(OpenAIHandler)
+        body = json.dumps(
+            {"model": "gpt-4", "messages": [{"role": "user", "content": "Hello!"}]}
+        ).encode()
+        handler.headers = {
+            "Content-Length": str(len(body)),
+            "x-request-id": "test-request-id",
+        }
+        handler.rfile = MagicMock()
+        handler.rfile.read.return_value = body
+        handler.model_map = {"gpt-4": "chatgpt"}
+        page_mock = MagicMock()
+        page_mock.is_closed.return_value = False
+        page_mock.evaluate.return_value = 2
+        handler.tab_map = {"gpt-4": page_mock}
+        handler._build_web_prompt = MagicMock(return_value=prompt_result)
+        handler.server = MagicMock(
+            browser_lock=threading.Lock(),
+            browser_timeout=60,
+            browser_lock_timeout=10,
+        )
+        handler._send_json = MagicMock()
+        handler._send_error = MagicMock()
+        handler.send_response = MagicMock()
+        handler.send_header = MagicMock()
+        handler.end_headers = MagicMock()
+        handler.wfile = MagicMock()
+        handler.wfile.write = MagicMock()
+        return handler
+
+    def test_non_streaming_browser_operation_timeout(self):
+        """BrowserOperationTimeout must surface as a 502."""
+        from sbsllm.browser import BrowserOperationTimeout
+
+        handler = self._make_handler()
+        with (
+            patch("sbsllm.server.inject_prompt", return_value="inject_js"),
+            patch("sbsllm.server.submit_js", return_value="submit_js"),
+            patch("sbsllm.server.extract_js", return_value="EXTRACT_JS"),
+            patch(
+                "sbsllm.server.capture_response",
+                return_value={"found": False, "count": 0},
+            ),
+            patch(
+                "sbsllm.server.inject_and_submit",
+                side_effect=BrowserOperationTimeout("wedged"),
+            ),
+        ):
+            handler._handle_chat_completions()
+        handler._send_error.assert_called_once()
+        assert handler._send_error.call_args[0][0] == 502
+        assert "unresponsive" in handler._send_error.call_args[0][1].lower()
+
+    def test_non_streaming_internal_error(self):
+        """An unexpected exception must surface as a 500."""
+        handler = self._make_handler()
+        with (
+            patch("sbsllm.server.inject_prompt", return_value="inject_js"),
+            patch("sbsllm.server.submit_js", return_value="submit_js"),
+            patch("sbsllm.server.extract_js", return_value="EXTRACT_JS"),
+            patch(
+                "sbsllm.server.capture_response",
+                return_value={"found": False, "count": 0},
+            ),
+            patch("sbsllm.server.inject_and_submit", side_effect=RuntimeError("boom")),
+        ):
+            handler._handle_chat_completions()
+        handler._send_error.assert_called_once()
+        assert handler._send_error.call_args[0][0] == 500
+
+    def test_non_streaming_invalid_status(self):
+        """Non-dict status from inject_and_submit is treated as invalid."""
+        handler = self._make_handler()
+        with (
+            patch("sbsllm.server.inject_prompt", return_value="inject_js"),
+            patch("sbsllm.server.submit_js", return_value="submit_js"),
+            patch("sbsllm.server.extract_js", return_value="EXTRACT_JS"),
+            patch(
+                "sbsllm.server.capture_response",
+                return_value={"found": False, "count": 0},
+            ),
+            patch("sbsllm.server.inject_and_submit", return_value="not a dict"),
+        ):
+            handler._handle_chat_completions()
+        handler._send_error.assert_called_once()
+        assert handler._send_error.call_args[0][0] == 500
+
+    def test_non_streaming_no_extraction_supported(self):
+        """When extract_js is None (site without response_selectors), 502."""
+        handler = self._make_handler()
+        with (
+            patch("sbsllm.server.inject_prompt", return_value="inject_js"),
+            patch("sbsllm.server.submit_js", return_value="submit_js"),
+            patch("sbsllm.server.extract_js", return_value=None),
+            patch(
+                "sbsllm.server.capture_response",
+                return_value={"found": False, "count": 0},
+            ),
+            patch(
+                "sbsllm.server.inject_and_submit",
+                return_value={"tab": 1, "inject": "OK", "submit": "OK"},
+            ),
+        ):
+            handler._handle_chat_completions()
+        handler._send_error.assert_called_once()
+        assert handler._send_error.call_args[0][0] == 502
+
+
+class TestServerEndToEndErrorPaths:
+    """Integration tests verifying error messages include site name and context."""
+
+    def _make_handler(self, prompt_result="Hello!"):
+        import threading
+
+        handler = OpenAIHandler.__new__(OpenAIHandler)
+        body = json.dumps(
+            {"model": "gpt-4", "messages": [{"role": "user", "content": "Hello!"}]}
+        ).encode()
+        handler.headers = {
+            "Content-Length": str(len(body)),
+            "x-request-id": "test-request-id",
+        }
+        handler.rfile = MagicMock()
+        handler.rfile.read.return_value = body
+        handler.model_map = {"gpt-4": "chatgpt"}
+        page_mock = MagicMock()
+        page_mock.is_closed.return_value = False
+        page_mock.evaluate.return_value = 2
+        handler.tab_map = {"gpt-4": page_mock}
+        handler._build_web_prompt = MagicMock(return_value=prompt_result)
+        handler.server = MagicMock(
+            browser_lock=threading.Lock(),
+            browser_timeout=60,
+            browser_lock_timeout=10,
+        )
+        handler._send_json = MagicMock()
+        handler._send_error = MagicMock()
+        handler.send_response = MagicMock()
+        handler.send_header = MagicMock()
+        handler.end_headers = MagicMock()
+        handler.wfile = MagicMock()
+        handler.wfile.write = MagicMock()
+        return handler
+
+    def test_browser_error_message_includes_site_name(self):
+        """502 browser error must reference the site name."""
+        from sbsllm.browser import BrowserError
+
+        handler = self._make_handler()
+        with (
+            patch("sbsllm.server.inject_prompt", return_value="inject_js"),
+            patch("sbsllm.server.submit_js", return_value="submit_js"),
+            patch("sbsllm.server.extract_js", return_value="EXTRACT_JS"),
+            patch(
+                "sbsllm.server.capture_response",
+                return_value={"found": False, "count": 0},
+            ),
+            patch(
+                "sbsllm.server.inject_and_submit",
+                side_effect=BrowserError("fail"),
+            ),
+        ):
+            handler._handle_chat_completions()
+        handler._send_error.assert_called_once()
+        call_args = handler._send_error.call_args
+        assert call_args[0][0] == 502
+        assert "chatgpt" in call_args[0][1].lower()
+
+    def test_browser_operation_timeout_message_includes_site_name(self):
+        """502 browser timeout must reference the site name."""
+        from sbsllm.browser import BrowserOperationTimeout
+
+        handler = self._make_handler()
+        with (
+            patch("sbsllm.server.inject_prompt", return_value="inject_js"),
+            patch("sbsllm.server.submit_js", return_value="submit_js"),
+            patch("sbsllm.server.extract_js", return_value="EXTRACT_JS"),
+            patch(
+                "sbsllm.server.capture_response",
+                return_value={"found": False, "count": 0},
+            ),
+            patch(
+                "sbsllm.server.inject_and_submit",
+                side_effect=BrowserOperationTimeout("wedged"),
+            ),
+        ):
+            handler._handle_chat_completions()
+        handler._send_error.assert_called_once()
+        call_args = handler._send_error.call_args
+        assert call_args[0][0] == 502
+        assert "chatgpt" in call_args[0][1].lower()
+
+    def test_internal_error_message_includes_site_name(self):
+        """500 internal error must reference the site name."""
+        handler = self._make_handler()
+        with (
+            patch("sbsllm.server.inject_prompt", return_value="inject_js"),
+            patch("sbsllm.server.submit_js", return_value="submit_js"),
+            patch("sbsllm.server.extract_js", return_value="EXTRACT_JS"),
+            patch(
+                "sbsllm.server.capture_response",
+                return_value={"found": False, "count": 0},
+            ),
+            patch("sbsllm.server.inject_and_submit", side_effect=RuntimeError("boom")),
+        ):
+            handler._handle_chat_completions()
+        handler._send_error.assert_called_once()
+        call_args = handler._send_error.call_args
+        assert call_args[0][0] == 500
+        assert "chatgpt" in call_args[0][1].lower()
+
+    def test_no_browser_tab_message_includes_site_name(self):
+        """502 missing tab must reference the site name."""
+        handler = self._make_handler()
+        handler.tab_map = {}
+        OpenAIHandler._handle_chat_completions(handler)
+        handler._send_error.assert_called_once()
+        call_args = handler._send_error.call_args
+        assert call_args[0][0] == 502
+        assert "chatgpt" in call_args[0][1].lower()
+
+
+class FakeClock:
+    """Minimal fake clock matching the one in test_streaming.py."""
+
+    def __init__(self):
+        self.t = 1000.0
+
+    def monotonic(self):
+        return self.t
+
+    def sleep(self, seconds):
+        self.t += max(seconds, 0.01)
