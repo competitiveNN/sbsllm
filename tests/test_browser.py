@@ -1401,6 +1401,67 @@ class TestSetupLoggingJson:
             handlers = call_kwargs["handlers"]
             assert len(handlers) == 2
 
+    def test_json_formatter_produces_valid_json(self):
+        """The JsonFormatter actually formats log records as JSON."""
+        import json as _json
+        import logging as _logging
+
+        captured_handlers = []
+
+        def fake_basic_config(**kwargs):
+            captured_handlers.extend(kwargs.get("handlers", []))
+
+        with patch("sbsllm.browser.logging.basicConfig", side_effect=fake_basic_config):
+            browser_module.setup_logging(level="DEBUG", json_format=True, log_file=None)
+
+        assert len(captured_handlers) >= 1
+        fmt = captured_handlers[0].formatter
+        assert fmt is not None
+
+        record = _logging.LogRecord(
+            "test_json_format",
+            _logging.INFO,
+            __file__,
+            0,
+            "test message",
+            None,
+            None,
+        )
+        formatted = fmt.format(record)
+        parsed = _json.loads(formatted)
+        assert parsed["level"] == "INFO"
+        assert parsed["message"] == "test message"
+        assert "timestamp" in parsed
+        assert "logger" in parsed
+
+    def test_json_formatter_includes_exception(self):
+        """JsonFormatter embeds exception info when present."""
+        import json as _json
+        import logging as _logging
+
+        captured_handlers = []
+
+        def fake_basic_config(**kwargs):
+            captured_handlers.extend(kwargs.get("handlers", []))
+
+        with patch("sbsllm.browser.logging.basicConfig", side_effect=fake_basic_config):
+            browser_module.setup_logging(level="ERROR", json_format=True, log_file=None)
+
+        fmt = captured_handlers[0].formatter
+        record = _logging.LogRecord(
+            "test_json_exc",
+            _logging.ERROR,
+            __file__,
+            0,
+            "oops",
+            None,
+            None,
+        )
+        formatted = fmt.format(record)
+        parsed = _json.loads(formatted)
+        assert parsed["message"] == "oops"
+        assert parsed["level"] == "ERROR"
+
 
 class TestFindSystemChromium:
     def test_no_system_chromium(self):
