@@ -1115,6 +1115,60 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                 # Always close the stream, even on failure, or the client
                 # waits for a response that will never come.
                 self._send_sse("[DONE]")
+        except BrowserOperationTimeout as e:
+            elapsed = time.monotonic() - request_start
+            snapshot = get_page_snapshot(page)
+            logger.error(
+                "chat_completion request_end",
+                extra={
+                    "model": model,
+                    "site_id": site_id,
+                    "tab_index": tab_index,
+                    "status_code": 502,
+                    "duration_ms": int(elapsed * 1000),
+                    "error": str(e),
+                    "error_type": "browser_timeout",
+                    "request_id": request_id,
+                    "stream": True,
+                    "page_url": snapshot.get("url"),
+                    "page_title": snapshot.get("title"),
+                },
+            )
+            _update_metrics(elapsed, error=True, error_type="browser_timeout")
+            if not headers_sent:
+                self._send_error(
+                    502,
+                    f"Browser is unresponsive: {e}. The browser worker thread "
+                    f"for {site_id} is blocked and will not recover on its own. "
+                    f"Restart sbsllm.",
+                    "server_error",
+                    request_id,
+                )
+            else:
+                self._send_sse(
+                    json.dumps(
+                        {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {},
+                                    "finish_reason": "length",
+                                }
+                            ],
+                            "error": {
+                                "message": str(e),
+                                "type": "server_error",
+                            },
+                        }
+                    )
+                )
+                # Always close the stream, even on failure, or the client
+                # waits for a response that will never come.
+                self._send_sse("[DONE]")
         except Exception as e:
             elapsed = time.monotonic() - request_start
             snapshot = get_page_snapshot(page)

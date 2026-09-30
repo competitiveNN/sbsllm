@@ -1556,6 +1556,201 @@ class TestHandlerSSEHelpers:
                 text += delta["content"]
         assert "signed-in" in text.lower(), text
 
+    def test_streaming_success_sends_terminal_and_done(self):
+        """A normal streaming response sends a finish_reason chunk + [DONE]."""
+        handler = self._make_streaming_handler()
+        handler._stream_web_chat = MagicMock(
+            return_value={
+                "content": "Here is the answer.",
+                "thinking": "Let me reason about this.",
+                "done": True,
+                "stop_reason": "site_done",
+            }
+        )
+        with (
+            patch("sbsllm.server.extract_js", return_value="EXTRACT"),
+            patch(
+                "sbsllm.server.capture_response",
+                return_value={"found": False, "count": 0},
+            ),
+        ):
+            handler._handle_streaming_chat_completions(
+                "req-1", "gpt-4", "chatgpt", MagicMock(), 1, "hi", 0.0, 60.0
+            )
+        # The handler must emit a terminal SSE chunk with finish_reason
+        terminal_call = None
+        for call in handler._sse_chunk.call_args_list:
+            if call[1].get("finish_reason"):
+                terminal_call = call
+                break
+        assert terminal_call is not None
+        assert terminal_call[1]["finish_reason"] == "stop"
+        handler._send_sse.assert_any_call("[DONE]")
+
+    def test_streaming_partial_content_on_timeout(self):
+        """Partial content with a non-clean stop_reason still terminates the SSE."""
+        handler = self._make_streaming_handler()
+        handler._stream_web_chat = MagicMock(
+            return_value={
+                "content": "Partial answer",
+                "thinking": None,
+                "done": False,
+                "stop_reason": "no_output",
+            }
+        )
+        with (
+            patch("sbsllm.server.extract_js", return_value="EXTRACT"),
+            patch(
+                "sbsllm.server.capture_response",
+                return_value={"found": False, "count": 0},
+            ),
+        ):
+            handler._handle_streaming_chat_completions(
+                "req-1", "gpt-4", "chatgpt", MagicMock(), 1, "hi", 0.0, 60.0
+            )
+        # Content was present, so the handler skips the empty-response path
+        # and sends the terminal chunk with finish_reason.
+        terminal_call = None
+        for call in handler._sse_chunk.call_args_list:
+            if call[1].get("finish_reason"):
+                terminal_call = call
+                break
+        assert terminal_call is not None
+        assert terminal_call[1]["finish_reason"] == "length"
+        handler._send_sse.assert_any_call("[DONE]")
+
+    def test_streaming_browser_operation_timeout_before_headers(self):
+        """BrowserOperationTimeout from inject/submit (before headers) → 502."""
+        from sbsllm.browser import BrowserOperationTimeout
+
+        handler = self._make_streaming_handler()
+        handler._inject_and_submit_with_recovery = MagicMock(
+            side_effect=BrowserOperationTimeout("worker thread blocked")
+        )
+        with (
+            patch("sbsllm.server.extract_js", return_value="EXTRACT"),
+            patch(
+                "sbsllm.server.capture_response",
+                return_value={"found": False, "count": 0},
+            ),
+            patch("sbsllm.server.time") as fake_time,
+        ):
+            fake_time.monotonic.return_value = 0.0
+            fake_time.time.return_value = 1_700_000_000
+            handler._handle_streaming_chat_completions(
+                "req-1", "gpt-4", "chatgpt", MagicMock(), 1, "hi", 0.0, 60.0
+            )
+        # Headers were NOT sent, so _send_error is used (not SSE)
+        handler._send_error.assert_called_once()
+        call_args = handler._send_error.call_args[0]
+        assert call_args[0] == 502
+        assert "chatgpt" in call_args[1].lower()
+        assert "unresponsive" in call_args[1].lower()
+        handler._send_sse_headers.assert_not_called()
+
+    def test_stream_web_chat_thinking_then_content_deltas(self):
+        """_stream_web_chat emits role, thinking, and content as ordered deltas."""
+        handler = self._make_streaming_handler()
+
+        def mock_setting(name, default):
+            values = {
+                "response_idle_timeout": 1.0,
+                "response_done_confirm": 0.01,
+                "busy_patience": 60.0,
+                "thinking_patience": 60.0,
+                "first_token_timeout": 5.0,
+                "poll_interval": 0.01,
+                "keepalive_interval": 60.0,
+            }
+            return values.get(name, default)
+
+        handler._server_setting = MagicMock(side_effect=mock_setting)
+
+        responses = [
+            {
+                "found": True,
+                "content": "",
+                "thinking": "Let me think",
+                "busy": True,
+                "done": False,
+                "count": 1,
+            },
+            {
+                "found": True,
+                "content": "Answer",
+                "thinking": "Let me think",
+                "busy": True,
+                "done": False,
+                "count": 2,
+            },
+            {
+                "found": True,
+                "content": "Answer",
+                "thinking": "Let me think",
+                "busy": False,
+                "done": True,
+                "count": 3,
+            },
+            {
+                "found": True,
+                "content": "Answer",
+                "thinking": "Let me think",
+                "busy": False,
+                "done": True,
+                "count": 4,
+            },
+        ]
+        call_state = {"i": 0}
+
+        def mock_capture(*_args, **_kwargs):
+            idx = min(call_state["i"], len(responses) - 1)
+            call_state["i"] += 1
+            return responses[idx]
+
+        with (
+            patch("sbsllm.server.capture_response", side_effect=mock_capture),
+            patch("sbsllm.server.time") as fake_time,
+        ):
+            clock = FakeClock()
+            fake_time.monotonic.side_effect = clock.monotonic
+            fake_time.sleep.side_effect = clock.sleep
+            fake_time.time.return_value = 1_700_000_000
+
+            result = handler._stream_web_chat(
+                MagicMock(),
+                "EXTRACT",
+                None,
+                "chatcmpl-test",
+                1234567890,
+                "gpt-4",
+                60.0,
+            )
+
+        assert result["stop_reason"] == "site_done"
+        assert result["done"] is True
+
+        chunk_calls = handler._sse_chunk.call_args_list
+        assert len(chunk_calls) >= 2
+
+        # First delta carries the role announcement
+        first_delta = chunk_calls[0][0][3]
+        assert first_delta.get("role") == "assistant"
+
+        # Thinking delta is sent on the first chunk (with role)
+        thinking_deltas = [
+            c[0][3].get("thinking", "") for c in chunk_calls if "thinking" in c[0][3]
+        ]
+        assert "".join(thinking_deltas) == "Let me think"
+
+        # Content delta appears after thinking, with just the content
+        content_deltas = [
+            c[0][3]
+            for c in chunk_calls
+            if "content" in c[0][3] and "role" not in c[0][3]
+        ]
+        assert len(content_deltas) >= 1
+        assert content_deltas[0]["content"] == "Answer"
+
 
 class TestHandlerHealthMetrics:
     """Tests for health and metrics endpoints."""
