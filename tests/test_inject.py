@@ -166,6 +166,95 @@ class TestInjectPrompt:
         assert SITES["kimi"]["url"] == "https://kimi.ai/"
         assert "kimi.com" not in SITES["kimi"]["url"]
 
+    @pytest.mark.parametrize(
+        "site_id",
+        [
+            "chatgpt",
+            "claude",
+            "deepseek",
+            "qwen",
+            "grok",
+            "google",
+            "mistral",
+            "kimi",
+            "perplexity",
+            "poe",
+            "cohere",
+            "zai",
+            "meta",
+            "huggingface",
+            "tencent",
+        ],
+    )
+    def test_all_sites_have_post_inject_js(self, site_id):
+        """Every site must define post_inject_js for robust editor sync."""
+        from sbsllm.sites import SITES
+
+        assert "post_inject_js" in SITES[site_id]
+
+    @pytest.mark.parametrize(
+        "site_id",
+        [
+            "claude",
+            "deepseek",
+            "mistral",
+            "kimi",
+            "perplexity",
+            "poe",
+            "cohere",
+            "meta",
+            "huggingface",
+            "tencent",
+            "chatgpt",
+            "qwen",
+        ],
+    )
+    def test_contenteditable_sites_use_execcommand(self, site_id):
+        """Sites with contenteditable inputs must use execCommand for TipTap."""
+        from sbsllm.sites import SITES
+
+        post_inject = SITES[site_id].get("post_inject_js", "")
+        assert "execCommand('insertText'" in post_inject
+        assert "beforeinput" in post_inject
+        assert "innerText" in post_inject
+
+    def test_zai_post_inject_no_enter_dispatch(self):
+        """Zai post_inject must NOT dispatch Enter key (prevents double-send)."""
+        from sbsllm.sites import SITES
+
+        post_inject = SITES["zai"].get("post_inject_js", "")
+        assert "keydown" not in post_inject
+        assert "KeyboardEvent" not in post_inject
+
+    def test_meta_setup_js_dismisses_welcome(self):
+        """Meta setup_js should handle welcome screen dismissal."""
+        from sbsllm.sites import SITES
+
+        setup_js = SITES["meta"].get("setup_js", "")
+        assert "welcome" in setup_js.lower()
+        assert "dialog" in setup_js.lower()
+
+    def test_all_setup_js_have_error_handling(self):
+        """All setup_js blocks must be wrapped in try/catch."""
+        from sbsllm.sites import SITES
+
+        for site_id, cfg in SITES.items():
+            if "setup_js" in cfg:
+                assert "try" in cfg["setup_js"], f"{site_id} setup_js missing try/catch"
+                assert "catch" in cfg["setup_js"], (
+                    f"{site_id} setup_js missing try/catch"
+                )
+
+    def test_post_inject_all_sites_contain_marked_input_selector(self):
+        """All post_inject_js must reference the marked input element."""
+        from sbsllm.sites import SITES
+
+        for site_id, cfg in SITES.items():
+            post_inject = cfg.get("post_inject_js", "")
+            assert "data-sbsllm-input" in post_inject, (
+                f"{site_id} post_inject missing marker selector"
+            )
+
 
 class TestSubmitJs:
     def test_returns_string(self):

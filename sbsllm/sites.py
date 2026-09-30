@@ -192,6 +192,31 @@ def _submit_js(button_selectors: str, input_selector: str | None = None) -> str:
     )
 
 
+# Shared post-inject JS for contenteditable-based editors (ProseMirror/TipTap).
+# These editors keep an internal document model that plain textContent/execCommand
+# mutations in _INJECT_TEMPLATE may not fully sync. This block performs a second
+# pass: focus, clear via innerText, re-insert via execCommand('insertText'), and
+# fire beforeinput/input events so the editor's listeners catch up.
+_POST_INJECT_CONTENTEDITABLE = """
+    (() => {
+        const el = document.querySelector('[data-sbsllm-input="true"]');
+        if (!el) return 'NO_MARKED_INPUT';
+        try {
+            el.focus();
+            el.innerText = '';
+            document.execCommand('insertText', false, el.dataset.sbsllmValue || '');
+            el.dispatchEvent(new InputEvent('beforeinput', {
+                bubbles: true, cancelable: true,
+                inputType: 'insertText', data: el.dataset.sbsllmValue || ''
+            }));
+            el.dispatchEvent(new InputEvent('input', {
+                bubbles: true, inputType: 'insertText'
+            }));
+        } catch (_) {}
+        return 'OK';
+    })()
+"""
+
 # Selectors that positively indicate the site is still generating a reply.
 # Bare `[class*="loading"]` is deliberately excluded: sites keep decorative
 # skeletons and spinners in the DOM (often at zero opacity) long after
@@ -422,6 +447,7 @@ SITES: dict[str, dict] = {
                 || document.querySelector('textarea[placeholder*="message"]')
                 || document.querySelector('textarea')
         """),
+        "post_inject_js": _POST_INJECT_CONTENTEDITABLE,
         "submit_js": _submit_js("""
             document.querySelector('button[data-testid="send-button"]')
                 || document.querySelector('button[aria-label="Send prompt"]')
@@ -459,6 +485,29 @@ SITES: dict[str, dict] = {
             ".assistant-message",
             '[class*="assistant"] .message',
         ],
+        "post_inject_js": """
+            (() => {
+                // Claude uses ProseMirror/contenteditable. The main inject sets
+                // textContent, but that does NOT update the editor's internal
+                // document model. We must use innerText + execCommand +
+                // beforeinput to make the editor register the new value.
+                const el = document.querySelector('[data-sbsllm-input="true"]');
+                if (!el) return 'NO_MARKED_INPUT';
+                try {
+                    el.focus();
+                    el.innerText = '';
+                    document.execCommand('insertText', false, el.dataset.sbsllmValue || '');
+                    el.dispatchEvent(new InputEvent('beforeinput', {
+                        bubbles: true, cancelable: true,
+                        inputType: 'insertText', data: el.dataset.sbsllmValue || ''
+                    }));
+                    el.dispatchEvent(new InputEvent('input', {
+                        bubbles: true, inputType: 'insertText'
+                    }));
+                } catch (_) {}
+                return 'OK';
+            })()
+        """,
         "thinking_selectors": [
             '[class*="thinking"]',
             '[class*="reasoning"]',
@@ -492,6 +541,29 @@ SITES: dict[str, dict] = {
             """,
             "document.querySelector('textarea, #chat-input, [contenteditable], input[type=\"text\"]')",
         ),
+        "post_inject_js": """
+            (() => {
+                // DeepSeek uses contenteditable. The main inject sets textContent,
+                // but that does NOT update the editor's internal document model.
+                // We must use innerText + execCommand + beforeinput to make the
+                // editor register the new value.
+                const el = document.querySelector('[data-sbsllm-input="true"]');
+                if (!el) return 'NO_MARKED_INPUT';
+                try {
+                    el.focus();
+                    el.innerText = '';
+                    document.execCommand('insertText', false, el.dataset.sbsllmValue || '');
+                    el.dispatchEvent(new InputEvent('beforeinput', {
+                        bubbles: true, cancelable: true,
+                        inputType: 'insertText', data: el.dataset.sbsllmValue || ''
+                    }));
+                    el.dispatchEvent(new InputEvent('input', {
+                        bubbles: true, inputType: 'insertText'
+                    }));
+                } catch (_) {}
+                return 'OK';
+            })()
+        """,
         "response_selectors": [
             '[data-message-author-role="assistant"]',
             ".assistant-message",
@@ -513,6 +585,7 @@ SITES: dict[str, dict] = {
                 || document.querySelector('textarea[placeholder*="ask"]')
                 || document.querySelector('textarea')
         """),
+        "post_inject_js": _POST_INJECT_CONTENTEDITABLE,
         "submit_js": _submit_js("""
             document.querySelector('button[aria-label="Send"]:not([disabled])')
                 || document.querySelector('button[aria-label*="Send"]:not([disabled])')
@@ -703,6 +776,29 @@ SITES: dict[str, dict] = {
                 || document.querySelector('textarea')?.closest('form')?.querySelector('button')
                 || document.querySelector('.ProseMirror')?.closest('form')?.querySelector('button')
         """),
+        "post_inject_js": """
+            (() => {
+                // Mistral uses ProseMirror/contenteditable. The main inject sets
+                // textContent, but that does NOT update the editor's internal
+                // document model. We must use innerText + execCommand +
+                // beforeinput to make the editor register the new value.
+                const el = document.querySelector('[data-sbsllm-input="true"]');
+                if (!el) return 'NO_MARKED_INPUT';
+                try {
+                    el.focus();
+                    el.innerText = '';
+                    document.execCommand('insertText', false, el.dataset.sbsllmValue || '');
+                    el.dispatchEvent(new InputEvent('beforeinput', {
+                        bubbles: true, cancelable: true,
+                        inputType: 'insertText', data: el.dataset.sbsllmValue || ''
+                    }));
+                    el.dispatchEvent(new InputEvent('input', {
+                        bubbles: true, inputType: 'insertText'
+                    }));
+                } catch (_) {}
+                return 'OK';
+            })()
+        """,
         "response_selectors": [
             '[data-message-author-role="assistant"]',
             ".assistant-message",
@@ -738,6 +834,30 @@ SITES: dict[str, dict] = {
         """,
             "document.querySelector('textarea.ph, textarea[name=\"message\"], textarea, div.chat-input-editor')",
         ),
+        "post_inject_js": """
+            (() => {
+                // Kimi uses a contenteditable div (chat-input-editor) as a
+                // fallback. The main inject sets textContent, but that does
+                // NOT update the editor's internal document model. We must
+                // use innerText + execCommand + beforeinput to make the
+                // editor register the new value.
+                const el = document.querySelector('[data-sbsllm-input="true"]');
+                if (!el) return 'NO_MARKED_INPUT';
+                try {
+                    el.focus();
+                    el.innerText = '';
+                    document.execCommand('insertText', false, el.dataset.sbsllmValue || '');
+                    el.dispatchEvent(new InputEvent('beforeinput', {
+                        bubbles: true, cancelable: true,
+                        inputType: 'insertText', data: el.dataset.sbsllmValue || ''
+                    }));
+                    el.dispatchEvent(new InputEvent('input', {
+                        bubbles: true, inputType: 'insertText'
+                    }));
+                } catch (_) {}
+                return 'OK';
+            })()
+        """,
         "response_selectors": [
             '[data-role="assistant"]',
             '[data-message-author-role="assistant"]',
@@ -767,6 +887,7 @@ SITES: dict[str, dict] = {
                 || document.querySelector('button[aria-label*="Send"]')
                 || document.querySelector('textarea')?.closest('form')?.querySelector('button')
         """),
+        "post_inject_js": _POST_INJECT_CONTENTEDITABLE,
         "response_selectors": [
             '[data-message-author-role="assistant"]',
             ".assistant-message",
@@ -794,6 +915,7 @@ SITES: dict[str, dict] = {
                 || document.querySelector('button[class*="send"]')
                 || document.querySelector('textarea')?.closest('form')?.querySelector('button')
         """),
+        "post_inject_js": _POST_INJECT_CONTENTEDITABLE,
         "response_selectors": [
             '[data-message-author-role="assistant"]',
             ".assistant-message",
@@ -816,9 +938,10 @@ SITES: dict[str, dict] = {
                 || document.querySelector('textarea')
                 || document.querySelector('[contenteditable="true"]')
         """),
+        "post_inject_js": _POST_INJECT_CONTENTEDITABLE,
         "submit_js": _submit_js("""
-            document.querySelector('button[aria-label*="Send"]')
-                || document.querySelector('button[type="submit"]')
+            document.querySelector('button[aria-label*=\"Send\"]')
+                || document.querySelector('button[type=\"submit\"]')
                 || document.querySelector('textarea')?.closest('form')?.querySelector('button')
         """),
         "response_selectors": [
@@ -944,6 +1067,27 @@ SITES: dict[str, dict] = {
                 || document.querySelector('textarea')
                 || document.querySelector('[contenteditable="true"]')
         """),
+        "post_inject_js": _POST_INJECT_CONTENTEDITABLE,
+        "setup_js": """
+            (() => {
+                // Meta AI shows a welcome screen on first load. Dismiss it so
+                // the input is ready for the prompt. The "Get Started" button
+                // appears in the welcome overlay; clicking it or pressing Escape
+                // closes the overlay.
+                try {
+                    const overlay = document.querySelector('[role="dialog"]')
+                        || document.querySelector('.welcome')
+                        || document.querySelector('[class*="onboarding"]');
+                    if (overlay) {
+                        const dismiss = overlay.querySelector('button')
+                            || document.querySelector('button[aria-label="Dismiss"]')
+                            || document.querySelector('button[aria-label="Close"]');
+                        if (dismiss) { dismiss.click(); return 'DISMISSED'; }
+                    }
+                } catch (_) {}
+                return 'OK';
+            })()
+        """,
         "submit_js": _submit_js("""
             document.querySelector('button[aria-label*="Send"]')
                 || document.querySelector('button[class*="send"]')
@@ -973,10 +1117,11 @@ SITES: dict[str, dict] = {
                 || document.querySelector('textarea')
                 || document.querySelector('[contenteditable="true"]')
         """),
+        "post_inject_js": _POST_INJECT_CONTENTEDITABLE,
         "submit_js": _submit_js("""
-            document.querySelector('button[aria-label*="Send"]')
-                || document.querySelector('button[aria-label*="Submit"]')
-                || document.querySelector('button[class*="send"]')
+            document.querySelector('button[aria-label*=\"Send\"]')
+                || document.querySelector('button[aria-label*=\"Submit\"]')
+                || document.querySelector('button[class*=\"send\"]')
                 || document.querySelector('textarea')?.closest('form')?.querySelector('button')
         """),
         "response_selectors": [
@@ -1002,6 +1147,7 @@ SITES: dict[str, dict] = {
                 || document.querySelector('div[contenteditable="true"]')
                 || document.querySelector('[contenteditable]')
         """),
+        "post_inject_js": _POST_INJECT_CONTENTEDITABLE,
         "submit_js": _submit_js("""
             document.querySelector('button[data-testid="send-button"]')
                 || document.querySelector('button[aria-label="Send"]')
