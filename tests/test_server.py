@@ -551,6 +551,64 @@ class TestOpenAIHandlerChatCompletions:
         data = call_args[1]
         assert data["thinking"] == "2+2=4"
 
+    def test_non_streaming_exposes_reasoning_content_in_message(self):
+        """Thinking must also appear in choices[0].message.reasoning_content
+        so OpenAI-compatible clients reading the message object see the trace."""
+        body = json.dumps(
+            {"model": "gpt-4", "messages": [{"role": "user", "content": "Hello!"}]}
+        ).encode()
+        handler = self._make_handler(body)
+
+        patches = self._patch_success(
+            {"found": True, "content": "4", "thinking": "2+2=4", "done": True}
+        )
+        with (
+            patches[0],
+            patches[1],
+            patches[2],
+            patches[3],
+            patches[4],
+            patches[5],
+            patches[6],
+            patches[7],
+        ):
+            OpenAIHandler._handle_chat_completions(handler)
+
+        call_args = handler._send_json.call_args[0]
+        data = call_args[1]
+        message = data["choices"][0]["message"]
+        assert message["reasoning_content"] == "2+2=4"
+        assert message["content"] == "4"
+
+    def test_non_streaming_returns_web_chat_response_not_placeholder(self):
+        """Regression: non-streaming must return the actual captured web-chat
+        response, never a placeholder like 'Prompt sent to X successfully.'"""
+        body = json.dumps(
+            {"model": "gpt-4", "messages": [{"role": "user", "content": "Hello!"}]}
+        ).encode()
+        handler = self._make_handler(body)
+
+        real_answer = "The capital of France is Paris."
+        patches = self._patch_success(
+            {"found": True, "content": real_answer, "thinking": None, "done": True}
+        )
+        with (
+            patches[0],
+            patches[1],
+            patches[2],
+            patches[3],
+            patches[4],
+            patches[5],
+            patches[6],
+            patches[7],
+        ):
+            OpenAIHandler._handle_chat_completions(handler)
+
+        handler._send_json.assert_called_once()
+        data = handler._send_json.call_args[0][1]
+        assert data["choices"][0]["message"]["content"] == real_answer
+        assert "prompt sent" not in data["choices"][0]["message"]["content"].lower()
+
     def test_non_streaming_timeout_returns_504(self):
         """A timed-out non-streaming request must surface as 504, not 200."""
         body = json.dumps(
@@ -1750,6 +1808,123 @@ class TestHandlerSSEHelpers:
         ]
         assert len(content_deltas) >= 1
         assert content_deltas[0]["content"] == "Answer"
+
+    def test_stream_web_chat_thinking_only_times_out(self):
+        """A thinking-only turn (no content) times out via thinking_patience."""
+        handler = self._make_streaming_handler()
+
+        def mock_setting(name, default):
+            values = {
+                "response_idle_timeout": 1.0,
+                "response_done_confirm": 0.01,
+                "busy_patience": 60.0,
+                "thinking_patience": 0.02,
+                "first_token_timeout": 5.0,
+                "poll_interval": 0.01,
+                "keepalive_interval": 60.0,
+            }
+            return values.get(name, default)
+
+        handler._server_setting = MagicMock(side_effect=mock_setting)
+
+        responses = [
+            {
+                "found": True,
+                "content": "",
+                "thinking": "Deep reasoning...",
+                "busy": True,
+                "done": False,
+                "count": 1,
+            },
+            {
+                "found": True,
+                "content": "",
+                "thinking": "Deep reasoning...",
+                "busy": True,
+                "done": False,
+                "count": 2,
+            },
+            {
+                "found": True,
+                "content": "",
+                "thinking": "Deep reasoning...",
+                "busy": True,
+                "done": False,
+                "count": 3,
+            },
+        ]
+        call_state = {"i": 0}
+
+        def mock_capture(*_args, **_kwargs):
+            idx = min(call_state["i"], len(responses) - 1)
+            call_state["i"] += 1
+            return responses[idx]
+
+        with (
+            patch("sbsllm.server.capture_response", side_effect=mock_capture),
+            patch("sbsllm.server.time") as fake_time,
+        ):
+            clock = FakeClock()
+            fake_time.monotonic.side_effect = clock.monotonic
+            fake_time.sleep.side_effect = clock.sleep
+            fake_time.time.return_value = 1_700_000_000
+
+            result = handler._stream_web_chat(
+                MagicMock(),
+                "EXTRACT",
+                None,
+                "chatcmpl-test",
+                1234567890,
+                "gpt-4",
+                60.0,
+            )
+
+        assert result["stop_reason"] == "thinking_timeout"
+        assert result["done"] is False
+
+        # Thinking delta was emitted on the first poll with role
+        chunk_calls = handler._sse_chunk.call_args_list
+        assert len(chunk_calls) >= 1
+        first_delta = chunk_calls[0][0][3]
+        assert first_delta.get("role") == "assistant"
+        assert first_delta.get("thinking") == "Deep reasoning..."
+        # No content deltas for a thinking-only turn
+        content_deltas = [
+            c for c in chunk_calls if "content" in c[0][3] and "role" not in c[0][3]
+        ]
+        assert len(content_deltas) == 0
+
+    def test_streaming_thinking_only_response_terminates(self):
+        """A thinking-only response from _stream_web_chat still gets [DONE]."""
+        handler = self._make_streaming_handler()
+        handler._stream_web_chat = MagicMock(
+            return_value={
+                "content": "",
+                "thinking": "Just reasoning, no answer yet.",
+                "done": True,
+                "stop_reason": "budget_exhausted",
+            }
+        )
+        with (
+            patch("sbsllm.server.extract_js", return_value="EXTRACT"),
+            patch(
+                "sbsllm.server.capture_response",
+                return_value={"found": False, "count": 0},
+            ),
+        ):
+            handler._handle_streaming_chat_completions(
+                "req-1", "gpt-4", "chatgpt", MagicMock(), 1, "hi", 0.0, 60.0
+            )
+        # Thinking is present, so the empty-response error path is skipped.
+        # The handler still sends the terminal chunk + [DONE].
+        terminal_call = None
+        for call in handler._sse_chunk.call_args_list:
+            if call[1].get("finish_reason"):
+                terminal_call = call
+                break
+        assert terminal_call is not None
+        assert terminal_call[1]["finish_reason"] == "stop"
+        handler._send_sse.assert_any_call("[DONE]")
 
 
 class TestHandlerHealthMetrics:

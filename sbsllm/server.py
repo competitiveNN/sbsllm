@@ -496,16 +496,26 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         """Strip the local chat's meta-instruction wrapper, keeping only the
         actual user message.
 
-        The local chat may bundle a system instruction (task, guidelines,
-        output format, chat history) together with the actual user message in
-        a single user-role message. Web chats receive only the trailing user
-        message — i.e. the last "USER:" turn inside the <chat_history> block
-        that the local chat appends to the instruction. If there is no
-        <chat_history> block, the message is assumed to already be the user
-        message and is returned as-is (stripped).
+        Local chats (open-webui, ChatGPT, Claude web) bundle a system
+        instruction (task, guidelines, output format, chat history) together
+        with the actual user message in a single user-role message.  The web
+        chats we drive only need the trailing user message, so we strip the
+        wrapper.
+
+        Recognised formats (checked in order):
+        1. <chat_history>USER: ... ASSISTANT: ... USER: ... </chat_history>
+           → last USER: turn
+        2. [INST] <<SYS>>...<</SYS>> ... [/INST]  (open-webui LLaMA format)
+           → content after [/INST]
+        3. Plain USER: ... / ASSISTANT: ... blocks (no chat_history wrapper)
+           → last USER: turn
+        4. Fallback: return the text stripped of leading meta-instruction
+           headers (lines starting with ###, ##, **, or "Task:").
         """
         if not text:
             return ""
+
+        # 1. <chat_history> block
         history_match = re.search(
             r"<chat_history>(.*?)</chat_history>",
             text,
@@ -519,6 +529,30 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             )
             if user_turns:
                 return user_turns[-1].strip()
+            # Empty <chat_history> — no user turns at all.
+            return ""
+
+        # 2. Open-WebUI / LLaMA [INST] <<SYS>> ... <</SYS>> ... [/INST]
+        inst_match = re.search(
+            r"\[INST\].*?<</SYS>>\s*(.*?)\[/INST\]\s*(.*)",
+            text,
+            re.DOTALL | re.IGNORECASE,
+        )
+        if inst_match:
+            return inst_match.group(2).strip()
+
+        # 3. Plain USER: / ASSISTANT: blocks without a chat_history wrapper
+        user_turns = re.findall(
+            r"USER:\s*(.*?)(?=\n\s*ASSISTANT:|\Z)",
+            text,
+            re.DOTALL | re.IGNORECASE,
+        )
+        if user_turns:
+            return user_turns[-1].strip()
+
+        # 4. Fallback: no recognised wrapper — return the text as-is so
+        #    nothing is silently dropped. The caller (web chat) can parse
+        #    or ignore leading instructions itself.
         return text.strip()
 
     def _build_web_prompt(self, messages: list[dict]) -> str:
@@ -718,6 +752,9 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             if thinking and thinking != last_thinking:
                 changed = True
                 delta["thinking"] = thinking.removeprefix(last_thinking)
+                # OpenAI-compatible clients look for `reasoning_content` in the
+                # delta; surface the same growing trace there too.
+                delta["reasoning_content"] = delta["thinking"]
                 last_thinking = thinking
 
             if delta:
@@ -1724,6 +1761,7 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                     "message": {
                         "role": "assistant",
                         "content": content,
+                        **({"reasoning_content": thinking} if thinking else {}),
                     },
                     "finish_reason": "stop",
                 }
@@ -1736,6 +1774,10 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             "request_id": request_id,
         }
         if thinking:
+            # Keep the custom top-level `thinking` field for existing sbsllm
+            # clients, but also expose the trace in the OpenAI-standard location
+            # (choices[0].message.reasoning_content) so OpenAI-compatible
+            # consumers that parse the message object see the reasoning trace.
             response["thinking"] = thinking
 
         elapsed = time.monotonic() - request_start
