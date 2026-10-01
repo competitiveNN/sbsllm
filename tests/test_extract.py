@@ -116,6 +116,7 @@ def _extract(page, html, site_id="zai"):
         SITES[site_id]["response_selectors"],
         SITES[site_id]["thinking_selectors"],
         SITES[site_id]["loading_selectors"],
+        SITES[site_id].get("login_wall_selectors", []),
     )
     return page.evaluate(js)
 
@@ -392,6 +393,87 @@ class TestZaiLoadingDots:
             <a>Privacy Policy</a>
             <a>Contact us</a>
         </footer>
+        """
+        result = _extract(extract_page, html)
+        assert result["login_wall"] is False
+
+
+class TestLoginWallSelectors:
+    """Site-specific login-wall selectors must trigger login_wall=True when
+    a visible login element is present, but NOT when the element is hidden."""
+
+    # zai selectors: ['a[href*="login" i]', 'button[aria-label*="Log in" i]']
+    # (Note: 'button[aria-label*="Sign in" i]' was removed from zai because
+    # the persistent nav sign-in button on the working chat page caused false
+    # positives. Real login walls are still caught by text-pattern + the
+    # remaining 'Log in' button / login-link selectors.)
+
+    def test_login_wall_detected_via_visible_selector(self, extract_page):
+        """A visible 'Sign in' button matching site selectors triggers
+        login_wall=True even without any text-pattern match."""
+        html = """
+        <div id="response-content-container">
+            <div class="markdown-prose"><p></p></div>
+        </div>
+        <button aria-label="Log in to your account">Log in</button>
+        """
+        result = _extract(extract_page, html)
+        assert result["login_wall"] is True
+
+    def test_login_wall_not_triggered_by_hidden_element(self, extract_page):
+        """A hidden login button (display:none) must NOT trigger login_wall."""
+        html = """
+        <div id="response-content-container">
+            <div class="markdown-prose"><p>42</p></div>
+        </div>
+        <button aria-label="Sign in" style="display:none">Sign in</button>
+        """
+        result = _extract(extract_page, html)
+        assert result["login_wall"] is False
+
+    def test_login_wall_not_triggered_by_invisible_aria_hidden(self, extract_page):
+        """A login link with aria-hidden that takes no space must NOT trigger."""
+        html = """
+        <div id="response-content-container">
+            <div class="markdown-prose"><p>42</p></div>
+        </div>
+        <a href="/login" aria-hidden="true" style="opacity:0">Login</a>
+        """
+        result = _extract(extract_page, html)
+        assert result["login_wall"] is False
+
+    def test_login_wall_selector_with_response_content(self, extract_page):
+        """When the page has a real response AND a login button is visible,
+        login_wall should still be True — the server uses it to warn even
+        if content exists."""
+        html = """
+        <div id="response-content-container">
+            <div class="markdown-prose"><p>Hello!</p></div>
+        </div>
+        <button aria-label="Log in">Log in</button>
+        """
+        result = _extract(extract_page, html)
+        assert result["login_wall"] is True
+
+    def test_login_wall_combined_text_and_selector(self, extract_page):
+        """Both text-pattern and selector paths can fire; result is still True."""
+        html = """
+        <div id="response-content-container">
+            <div class="markdown-prose"><p>hello</p></div>
+        </div>
+        <div>Please log in to continue</div>
+        <a href="/login">Login</a>
+        """
+        result = _extract(extract_page, html)
+        assert result["login_wall"] is True
+
+    def test_login_wall_none_when_no_login_elements(self, extract_page):
+        """A page with no login elements must report login_wall=False."""
+        html = """
+        <div id="response-content-container">
+            <div class="markdown-prose"><p>42</p></div>
+        </div>
+        <nav><a href="/home">Home</a><a href="/about">About</a></nav>
         """
         result = _extract(extract_page, html)
         assert result["login_wall"] is False

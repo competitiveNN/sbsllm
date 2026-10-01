@@ -1077,6 +1077,28 @@ class TestStripMetaTags:
         text = "### Task:\nDo something"
         assert self._strip(text) == "### Task:\nDo something"
 
+    def test_empty_chat_history_returns_empty(self):
+        """An empty <chat_history> block means no user message was sent."""
+        text = "### Task: Summarize\n<chat_history>\n</chat_history>"
+        assert self._strip(text) == ""
+
+    def test_open_webui_inst_format(self):
+        """Open-WebUI wraps instructions in [INST] <<SYS>>...<</SYS>> ... [/INST]."""
+        text = (
+            "[INST] <<SYS>>You are a helpful assistant.<</SYS>>\n"
+            "USER: Hello\n"
+            "ASSISTANT: Hi there\n"
+            "[/INST]\n"
+            "What is Python?"
+        )
+        assert self._strip(text) == "What is Python?"
+
+    def test_plain_user_assistant_blocks_without_history_wrapper(self):
+        """Plain USER: / ASSISTANT: blocks (no <chat_history> wrapper)
+        should still extract the last user turn."""
+        text = "Task: Respond briefly.\nUSER: Hello\nASSISTANT: Hi there\nUSER: Goodbye"
+        assert self._strip(text) == "Goodbye"
+
 
 class TestPageRecovery:
     """Test _inject_and_submit_with_recovery and _recover_page."""

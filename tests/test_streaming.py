@@ -276,6 +276,20 @@ class TestThinkingStreaming:
         assert text == "Hi there"
         assert thinking == "Let me check the greeting. Then answer."
 
+    def test_thinking_deltas_also_carry_reasoning_content(self):
+        """OpenAI-compatible clients look for `reasoning_content`; the same
+        growing thinking trace must be mirrored there as it is for `thinking`."""
+        _t, events = _stream(_handler(idle_timeout=1.0), self.THINKING)
+        reasoning = "".join(
+            d.get("reasoning_content", "") for d, _ in events if isinstance(d, dict)
+        )
+        assert reasoning == "Let me check the greeting. Then answer."
+        # Every delta that carries a thinking trace must also carry the alias.
+        thinking_deltas = [
+            d for d, _ in events if isinstance(d, dict) and d.get("thinking")
+        ]
+        assert all(d.get("reasoning_content") == d["thinking"] for d in thinking_deltas)
+
 
 class TestThinkingStallPatience:
     """A thinking-only stall (content empty, reasoning present, site still

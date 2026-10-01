@@ -193,6 +193,7 @@ class TestJSTemplates:
                     _ZAI["response_selectors"],
                     _ZAI["thinking_selectors"],
                     _ZAI["loading_selectors"],
+                    _ZAI.get("login_wall_selectors", []),
                 )
 
                 # Simulate a completed response already in the DOM.
@@ -224,6 +225,7 @@ class TestJSTemplates:
                     _ZAI["response_selectors"],
                     _ZAI["thinking_selectors"],
                     _ZAI["loading_selectors"],
+                    _ZAI.get("login_wall_selectors", []),
                 )
 
                 # Put thinking + answer in the DOM (exactly the case we fixed).
@@ -259,6 +261,7 @@ class TestJSTemplates:
                     _ZAI["response_selectors"],
                     _ZAI["thinking_selectors"],
                     _ZAI["loading_selectors"],
+                    _ZAI.get("login_wall_selectors", []),
                 )
 
                 # Set up a response with loading dots (z.ai animating during generation).
@@ -324,6 +327,7 @@ class TestJSTemplates:
                     _ZAI["response_selectors"],
                     _ZAI["thinking_selectors"],
                     _ZAI["loading_selectors"],
+                    _ZAI.get("login_wall_selectors", []),
                 )
                 result = page.evaluate(extraction)
 
@@ -463,9 +467,193 @@ class TestGrokIntegration:
                     _GROK["response_selectors"],
                     _GROK["thinking_selectors"],
                     _GROK["loading_selectors"],
+                    _GROK.get("login_wall_selectors", []),
                 )
                 result = page.evaluate(extraction)
                 assert result["found"] or result["content"], f"no content: {result}"
+                assert prompt in result["content"], (
+                    f"prompt not in answer: {result['content']!r}"
+                )
+            finally:
+                browser.close()
+
+    def test_grok_post_inject_clears_existing_content(self, mock_grok_server):
+        """post_inject_js must clear existing editor content before inserting."""
+        with pw.sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+            page = browser.new_page()
+            page.goto(mock_grok_server, wait_until="networkidle")
+            try:
+                # Pre-populate the composer with stale content.
+                page.evaluate(
+                    """
+                    () => {
+                        document.getElementById('composer').textContent =
+                            'stale content from a previous turn';
+                    }
+                    """
+                )
+                # Run full inject (inject + post_inject combined).
+                status = page.evaluate(inject_prompt("grok", "fresh prompt"))
+                assert status == "OK"
+                # post_inject should have cleared stale content and replaced it.
+                text = page.evaluate("document.getElementById('composer').textContent")
+                assert "fresh prompt" in text, f"textContent: {text!r}"
+                assert "stale content" not in text, (
+                    f"stale content should have been cleared: {text!r}"
+                )
+            finally:
+                browser.close()
+
+    def test_grok_post_inject_dispatches_input_events(self, mock_grok_server):
+        """post_inject_js must dispatch beforeinput and input events so editors
+        with internal state models (TipTap/ProseMirror) sync up."""
+        with pw.sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+            page = browser.new_page()
+            page.goto(mock_grok_server, wait_until="networkidle")
+            try:
+                # Set up event counters before injection.
+                page.evaluate(
+                    """
+                    () => {
+                        window.__sbsllmEventCounts = { beforeinput: 0, input: 0 };
+                        const el = document.getElementById('composer');
+                        el.addEventListener('beforeinput', () => {
+                            window.__sbsllmEventCounts.beforeinput++;
+                        });
+                        el.addEventListener('input', () => {
+                            window.__sbsllmEventCounts.input++;
+                        });
+                    }
+                    """
+                )
+                status = page.evaluate(inject_prompt("grok", "event test"))
+                assert status == "OK"
+                counts = page.evaluate("window.__sbsllmEventCounts")
+                assert counts["beforeinput"] >= 1, (
+                    f"beforeinput event not dispatched: {counts}"
+                )
+                assert counts["input"] >= 1, f"input event not dispatched: {counts}"
+            finally:
+                browser.close()
+
+
+# --- Grok textarea fallback tests ---
+
+_GROK_TEXTAREA_MOCK_PAGE_HTML = """<!doctype html>
+<html><head><meta charset="utf-8"><title>mock grok textarea</title></head>
+<body>
+  <form id="chat-form">
+    <textarea id="grok-input" aria-label="Ask Grok anything" placeholder="Ask anything"></textarea>
+    <button data-testid="chat-submit" type="submit">Send</button>
+  </form>
+  <div id="response-container">
+    <div class="message-bubble assistant">
+      <div class="prose-chat"></div>
+    </div>
+  </div>
+  <script>
+    var form = document.getElementById('chat-form');
+    var input = document.getElementById('grok-input');
+    var responseDiv = document.querySelector('.prose-chat');
+    var stopBtn = document.createElement('button');
+    stopBtn.setAttribute('aria-label', 'Stop generating');
+    var submitted = false;
+    // Enable submit button when input has value (mirrors real grok behavior)
+    input.addEventListener('input', function() {
+      document.querySelector('button[data-testid="chat-submit"]').disabled = !this.value.trim();
+    });
+    form.addEventListener('submit', function(e) {
+      e.preventDefault();
+      if (submitted) return;
+      submitted = true;
+      var prompt = input.value;
+      responseDiv.innerHTML = '<p>' + prompt + '</p>';
+      document.body.appendChild(stopBtn);
+    });
+  </script>
+</body></html>
+"""
+
+
+class _GrokTextareaHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(_GROK_TEXTAREA_MOCK_PAGE_HTML.encode())
+
+    def log_message(self, *args):
+        pass
+
+
+@pytest.fixture(scope="module")
+def mock_grok_textarea_server():
+    with socketserver.TCPServer(("127.0.0.1", 0), _GrokTextareaHandler) as httpd:
+        port = httpd.server_address[1]
+        url = f"http://127.0.0.1:{port}"
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        yield url
+        thread.join(timeout=5)
+
+
+class TestGrokTextareaIntegration:
+    """Tests that grok inject/submit/extract JS works when the input falls
+    back to a plain textarea (non-contenteditable) instead of TipTap."""
+
+    def test_grok_textarea_inject_sets_value(self, mock_grok_textarea_server):
+        """The grok inject JS must find the textarea and set its value."""
+        with pw.sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+            page = browser.new_page()
+            page.goto(mock_grok_textarea_server, wait_until="networkidle")
+            try:
+                inject_js = inject_prompt("grok", "textarea prompt")
+                status = page.evaluate(inject_js)
+                assert status == "OK", f"inject should find textarea, got {status}"
+                val = page.evaluate("document.getElementById('grok-input').value")
+                assert "textarea prompt" in val, f"textarea value: {val!r}"
+            finally:
+                browser.close()
+
+    def test_grok_textarea_post_inject_preserves_value(self, mock_grok_textarea_server):
+        """post_inject_js must NOT wipe the textarea value (regression: the old
+        contenteditable-only post_inject did innerText='' + execCommand('insertText')
+        which clobbered textarea values when sbsllmValue was unset)."""
+        with pw.sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+            page = browser.new_page()
+            page.goto(mock_grok_textarea_server, wait_until="networkidle")
+            try:
+                page.evaluate(inject_prompt("grok", "preserved"))
+                val = page.evaluate("document.getElementById('grok-input').value")
+                assert "preserved" in val, f"value wiped by post_inject: {val!r}"
+            finally:
+                browser.close()
+
+    def test_grok_textarea_full_cycle(self, mock_grok_textarea_server):
+        """End-to-end: inject, submit, extract response from grok textarea mock."""
+        with pw.sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+            page = browser.new_page()
+            page.goto(mock_grok_textarea_server, wait_until="networkidle")
+            try:
+                prompt = "hello textarea grok"
+                inject_status = page.evaluate(inject_prompt("grok", prompt))
+                assert inject_status == "OK", f"inject: {inject_status}"
+                submit_status = page.evaluate(submit_js("grok"))
+                assert submit_status == "OK", f"submit: {submit_status}"
+                page.wait_for_timeout(100)
+                extraction = _response_js(
+                    _GROK["response_selectors"],
+                    _GROK["thinking_selectors"],
+                    _GROK["loading_selectors"],
+                    _GROK.get("login_wall_selectors", []),
+                )
+                result = page.evaluate(extraction)
+                assert result["content"], f"no content: {result}"
                 assert prompt in result["content"], (
                     f"prompt not in answer: {result['content']!r}"
                 )
@@ -609,6 +797,7 @@ class TestGoogleIntegration:
                     _GOOGLE["response_selectors"],
                     _GOOGLE["thinking_selectors"],
                     _GOOGLE["loading_selectors"],
+                    _GOOGLE.get("login_wall_selectors", []),
                 )
                 result = page.evaluate(extraction)
                 assert result["found"] or result["content"], f"no content: {result}"
@@ -619,7 +808,122 @@ class TestGoogleIntegration:
                 browser.close()
 
 
-# --- z.ai post_inject_js integration test ---
+# --- Google Shadow DOM integration test ---
+
+# Mock page that mirrors Google AI Studio's ms-* web components with Shadow DOM.
+# The Run button lives inside ms-run-button's shadow root, which standard
+# querySelector cannot reach. This reproduces the real-world DOM structure.
+_GOOGLE_SHADOW_MOCK_HTML = """<!doctype html>
+<html><head><meta charset="utf-8"><title>mock google shadow</title></head>
+<body>
+  <ms-prompt-box></ms-prompt-box>
+  <ms-run-button></ms-run-button>
+  <ms-chat-turn>
+    <div class="chat-turn-container model"></div>
+  </ms-chat-turn>
+  <script>
+    // Attach shadow roots and wire up behaviour to mirror Google AI Studio.
+    (function() {
+        var promptBox = document.querySelector('ms-prompt-box');
+        var shadow1 = promptBox.attachShadow({mode: 'open'});
+        var taWrapper = document.createElement('ms-autosize-textarea');
+        taWrapper.setAttribute('data-value', '');
+        var shadow2 = taWrapper.attachShadow({mode: 'open'});
+        var textarea = document.createElement('textarea');
+        textarea.setAttribute('aria-label', 'Enter a prompt');
+        shadow2.appendChild(textarea);
+        shadow1.appendChild(taWrapper);
+
+        var runButtonHost = document.querySelector('ms-run-button');
+        var runShadow = runButtonHost.attachShadow({mode: 'open'});
+        var runBtn = document.createElement('button');
+        runBtn.setAttribute('aria-label', 'Run');
+        runBtn.className = 'run-button';
+        runBtn.type = 'submit';
+        runBtn.disabled = true;
+        runShadow.appendChild(runBtn);
+
+        textarea.addEventListener('input', function() {
+            taWrapper.setAttribute('data-value', textarea.value);
+            runBtn.disabled = !textarea.value.trim();
+        });
+        runBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            var modelDiv = document.querySelector('.chat-turn-container.model');
+            modelDiv.innerHTML = '<p>' + textarea.value + '</p>';
+        });
+    })();
+  </script>
+</body></html>
+"""
+
+
+class _GoogleShadowHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(_GOOGLE_SHADOW_MOCK_HTML.encode())
+
+    def log_message(self, *args):
+        pass
+
+
+@pytest.fixture(scope="module")
+def mock_google_shadow_server():
+    with socketserver.TCPServer(("127.0.0.1", 0), _GoogleShadowHandler) as httpd:
+        port = httpd.server_address[1]
+        url = f"http://127.0.0.1:{port}"
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        yield url
+    thread.join(timeout=5)
+
+
+class TestGoogleShadowDom:
+    """Google AI Studio uses ms-* web components with Shadow DOM.
+    The submit and post_inject JS must traverse shadowRoot to find the Run button."""
+
+    def test_google_shadow_submit_clicks_run_button(self, mock_google_shadow_server):
+        """submit_js must find the Run button inside ms-run-button's shadow root."""
+        with pw.sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+            page = browser.new_page()
+            page.goto(mock_google_shadow_server, wait_until="networkidle")
+            try:
+                page.evaluate(inject_prompt("google", "shadow test prompt"))
+                status = page.evaluate(submit_js("google"))
+                assert status == "OK", f"submit failed in shadow DOM: {status}"
+                page.wait_for_timeout(100)
+                has_answer = page.evaluate(
+                    "!!document.querySelector('.chat-turn-container.model p')"
+                )
+                assert has_answer, "answer should appear after shadow DOM submit"
+                answer = page.evaluate(
+                    "document.querySelector('.chat-turn-container.model p').textContent"
+                )
+                assert "shadow test prompt" in answer, f"unexpected answer: {answer!r}"
+            finally:
+                browser.close()
+
+    def test_google_shadow_post_inject_enables_button(self, mock_google_shadow_server):
+        """post_inject_js must enable the Run button inside the shadow root."""
+        with pw.sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+            page = browser.new_page()
+            page.goto(mock_google_shadow_server, wait_until="networkidle")
+            try:
+                page.evaluate(inject_prompt("google", "enable me"))
+                is_disabled = page.evaluate(
+                    "document.querySelector('ms-run-button').shadowRoot"
+                    ".querySelector('button.run-button').disabled"
+                )
+                assert not is_disabled, (
+                    "Run button should be enabled after post_inject via shadow DOM"
+                )
+            finally:
+                browser.close()
+
 
 _ZAI = SITES["zai"]
 
@@ -760,6 +1064,7 @@ class TestZaiPostInject:
                     _ZAI["response_selectors"],
                     _ZAI["thinking_selectors"],
                     _ZAI["loading_selectors"],
+                    _ZAI.get("login_wall_selectors", []),
                 )
                 thinking_phase = page.evaluate(extraction)
                 assert thinking_phase["busy"] is True, (

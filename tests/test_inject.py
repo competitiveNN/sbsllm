@@ -103,10 +103,13 @@ class TestInjectPrompt:
     def test_post_inject_separated_by_semicolon(self):
         """post_inject_js must be separated from the main IIFE by a semicolon."""
         result = inject_prompt("grok", "test")
-        # The main IIFE ends with })() and the post_inject starts with (() =>
-        # Without a semicolon separator, the two IIFEs are parsed as a call chain.
-        assert "});\n" in result or "});\n\n" in result or "})();\n" in result
-        assert "(() =>" in result  # post_inject starts a new IIFE
+        # The main IIFE is followed by ";\n" then the post_inject IIFE which
+        # starts with "(() =>". Without the semicolon, the two IIFEs would
+        # be parsed as a function call chain.
+        post_inject_idx = result.rfind("(() =>")
+        assert result.rfind(";\n", 0, post_inject_idx) != -1, (
+            "semicolon separator missing before post_inject IIFE"
+        )
 
     def test_grok_post_inject_uses_execcommand_for_tipTap(self):
         """Grok's post_inject_js must use execCommand for TipTap/ProseMirror editors."""
@@ -130,11 +133,11 @@ class TestInjectPrompt:
         assert "try" in setup_js
         assert "catch" in setup_js
 
-    def test_zai_url_uses_auth_path(self):
-        """Zai URL should point to the auth page for login flow."""
+    def test_zai_url_uses_chat_path(self):
+        """Zai URL should point to the chat page, not the auth wall."""
         from sbsllm.sites import SITES
 
-        assert SITES["zai"]["url"] == "https://chat.z.ai/auth"
+        assert SITES["zai"]["url"] == "https://chat.z.ai/"
 
     def test_google_post_inject_syncs_data_value(self):
         """Google's post_inject_js syncs data-value on ms-autosize-textarea."""
@@ -163,7 +166,7 @@ class TestInjectPrompt:
         """Kimi URL should be kimi.ai, not kimi.com."""
         from sbsllm.sites import SITES
 
-        assert SITES["kimi"]["url"] == "https://kimi.ai/"
+        assert SITES["kimi"]["url"] == "https://www.kimi.ai/"
         assert "kimi.com" not in SITES["kimi"]["url"]
 
     @pytest.mark.parametrize(
@@ -197,6 +200,7 @@ class TestInjectPrompt:
         [
             "claude",
             "deepseek",
+            "grok",
             "mistral",
             "kimi",
             "perplexity",
@@ -339,3 +343,75 @@ class TestExtractJs:
             assert extract_js("fake") is None
         finally:
             inject_module.get_site = original
+
+
+class TestPostInjectSharedConstant:
+    """Regression tests ensuring contenteditable sites use the shared
+    _POST_INJECT_CONTENTEDITABLE constant rather than duplicated custom blocks."""
+
+    def test_all_non_custom_sites_use_shared_constant(self):
+        """Every site except google and zai must reference the shared
+        _POST_INJECT_CONTENTEDITABLE constant, preventing re-introduction of
+        duplicated contenteditable-sync IIFEs."""
+        from sbsllm.sites import _POST_INJECT_CONTENTEDITABLE, SITES
+
+        custom_sites = {"google", "zai"}
+        for site_id, cfg in SITES.items():
+            if site_id in custom_sites:
+                continue
+            post_inject = cfg.get("post_inject_js")
+            assert post_inject is not None, f"{site_id} missing post_inject_js"
+            assert post_inject == _POST_INJECT_CONTENTEDITABLE, (
+                f"{site_id} post_inject_js should use _POST_INJECT_CONTENTEDITABLE, "
+                f"got a custom block instead"
+            )
+
+    def test_custom_post_inject_sites_exactly_google_and_zai(self):
+        """Only google and zai should have custom post_inject_js blocks."""
+        from sbsllm.sites import _POST_INJECT_CONTENTEDITABLE, SITES
+
+        custom_sites = {
+            sid
+            for sid, cfg in SITES.items()
+            if cfg.get("post_inject_js") != _POST_INJECT_CONTENTEDITABLE
+        }
+        assert custom_sites == {"google", "zai"}, (
+            f"Expected custom sites {{google, zai}}, got {custom_sites}"
+        )
+
+    def test_no_site_duplicated_contenteditable_logic(self):
+        """No site should have a custom post_inject_js that duplicates the
+        shared constant's execCommand/innerText/beforeinput pattern — only
+        google (ms-autosize-textarea) and zai (no-op) are allowed custom blocks."""
+        from sbsllm.sites import _POST_INJECT_CONTENTEDITABLE, SITES
+
+        for site_id, cfg in SITES.items():
+            post_inject = cfg.get("post_inject_js", "")
+            if post_inject == _POST_INJECT_CONTENTEDITABLE:
+                continue
+            # Custom blocks are allowed only for google and zai.
+            assert site_id in {"google", "zai"}, (
+                f"{site_id} has a custom post_inject_js that should use "
+                f"the shared constant"
+            )
+            # google must sync data-value on ms-autosize-textarea.
+            # zai must be a minimal no-op (no execCommand needed).
+            if site_id == "google":
+                assert "data-value" in post_inject
+                assert "ms-autosize-textarea" in post_inject
+            if site_id == "zai":
+                assert "execCommand" not in post_inject
+
+    def test_shared_constant_has_no_dead_code(self):
+        """The shared constant must not carry unused variables (e.g. isTextLike)."""
+        from sbsllm.sites import _POST_INJECT_CONTENTEDITABLE
+
+        assert "isTextLike" not in _POST_INJECT_CONTENTEDITABLE
+        assert "is_text_like" not in _POST_INJECT_CONTENTEDITABLE
+
+    def test_shared_constant_has_shadow_dom_fallback(self):
+        """The shared constant must search shadow roots for the marker input."""
+        from sbsllm.sites import _POST_INJECT_CONTENTEDITABLE
+
+        assert "shadowRoot" in _POST_INJECT_CONTENTEDITABLE
+        assert "[data-sbsllm-input" in _POST_INJECT_CONTENTEDITABLE

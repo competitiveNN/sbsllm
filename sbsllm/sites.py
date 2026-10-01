@@ -56,16 +56,12 @@ _INJECT_TEMPLATE = """
                 input.dispatchEvent(new Event('input', { bubbles: true }));
             }
             input.dispatchEvent(new Event('change', { bubbles: true }));
-        } else if (input instanceof HTMLTextAreaElement) {
-            const setter = Object.getOwnPropertyDescriptor(
-                HTMLTextAreaElement.prototype, 'value'
-            )?.set;
-            if (!setter) return 'NO_INPUT';
-            setter.call(input, value);
-        } else {
-            const setter = Object.getOwnPropertyDescriptor(
-                HTMLInputElement.prototype, 'value'
-            )?.set;
+        } else if (input instanceof HTMLTextAreaElement || isTextInput) {
+            try { input.dataset.sbsllmValue = value; } catch (_) {}
+            const proto = input instanceof HTMLTextAreaElement
+                ? HTMLTextAreaElement.prototype
+                : HTMLInputElement.prototype;
+            const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
             if (!setter) return 'NO_INPUT';
             setter.call(input, value);
         }
@@ -85,8 +81,19 @@ _INJECT_TEMPLATE = """
 
 _SUBMIT_TEMPLATE = """
     (() => {
-        const input = document.querySelector('[data-sbsllm-input="true"]')
+        // Try light-DOM first; fall back to scanning shadow roots for the
+        // marked input (Google AI Studio ms-* web components use Shadow DOM).
+        let input = document.querySelector('[data-sbsllm-input="true"]')
             || (__INPUT_SELECTOR__);
+        if (!input) {
+            for (const host of document.querySelectorAll('*')) {
+                try {
+                    if (!host.shadowRoot) continue;
+                    input = host.shadowRoot.querySelector('[data-sbsllm-input="true"]');
+                    if (input) break;
+                } catch (_) {}
+            }
+        }
         if (input?.dataset?.sbsllmInput === 'true') {
             delete input.dataset.sbsllmInput;
         }
@@ -199,23 +206,56 @@ def _submit_js(button_selectors: str, input_selector: str | None = None) -> str:
 # fire beforeinput/input events so the editor's listeners catch up.
 _POST_INJECT_CONTENTEDITABLE = """
     (() => {
-        const el = document.querySelector('[data-sbsllm-input="true"]');
+        let el = document.querySelector('[data-sbsllm-input="true"]');
+        if (!el) {
+            // The inject step may have found the editor inside a Shadow DOM
+            // (web component host). Search all shadow roots for the marker.
+            for (const host of document.querySelectorAll('*')) {
+                try {
+                    if (!host.shadowRoot) continue;
+                    el = host.shadowRoot.querySelector('[data-sbsllm-input="true"]');
+                    if (el) break;
+                } catch (_) {}
+            }
+        }
         if (!el) return 'NO_MARKED_INPUT';
+        const value = el.dataset.sbsllmValue || '';
         try {
-            el.focus();
-            el.innerText = '';
-            document.execCommand('insertText', false, el.dataset.sbsllmValue || '');
-            el.dispatchEvent(new InputEvent('beforeinput', {
-                bubbles: true, cancelable: true,
-                inputType: 'insertText', data: el.dataset.sbsllmValue || ''
-            }));
-            el.dispatchEvent(new InputEvent('input', {
-                bubbles: true, inputType: 'insertText'
-            }));
+            if (el.isContentEditable) {
+                // contenteditable/TipTap/ProseMirror path: clear via innerText,
+                // re-insert via execCommand, fire beforeinput/input events.
+                el.focus();
+                el.innerText = '';
+                document.execCommand('insertText', false, value);
+                el.dispatchEvent(new InputEvent('beforeinput', {
+                    bubbles: true, cancelable: true,
+                    inputType: 'insertText', data: value
+                }));
+                el.dispatchEvent(new InputEvent('input', {
+                    bubbles: true, inputType: 'insertText'
+                }));
+            } else {
+                // Plain textarea/input path: set value via the property
+                // descriptor so React/lexical/etc. listeners fire, then
+                // dispatch a native input event.
+                const setter = Object.getOwnPropertyDescriptor(
+                    el instanceof HTMLTextAreaElement
+                        ? HTMLTextAreaElement.prototype
+                        : HTMLInputElement.prototype,
+                    'value'
+                )?.set;
+                if (setter) {
+                    setter.call(el, value);
+                } else {
+                    el.value = value;
+                }
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+            }
         } catch (_) {}
         return 'OK';
     })()
-"""
+    """
 
 # Selectors that positively indicate the site is still generating a reply.
 # Bare `[class*="loading"]` is deliberately excluded: sites keep decorative
@@ -404,14 +444,11 @@ _RESPONSE_TEMPLATE = """
         }
         // Site-specific login-wall selectors (e.g., a "Sign in" button that
         // only appears on auth-gated pages). These are positive signals only.
+        // Use matches()+isVisible() instead of bare querySelector so that
+        // hidden login links in nav menus or collapsed dialogs do not
+        // trigger a false positive.
         if (!loginWall && loginWallSelectors.length) {
-            loginWall = loginWallSelectors.some((sel) => {
-                try {
-                    return document.querySelector(sel) !== null;
-                } catch (_) {
-                    return false;
-                }
-            });
+            loginWall = matches(loginWallSelectors).some(isVisible);
         }
         return {
             found: response !== null,
@@ -506,29 +543,7 @@ SITES: dict[str, dict] = {
             ".assistant-message",
             '[class*="assistant"] .message',
         ],
-        "post_inject_js": """
-            (() => {
-                // Claude uses ProseMirror/contenteditable. The main inject sets
-                // textContent, but that does NOT update the editor's internal
-                // document model. We must use innerText + execCommand +
-                // beforeinput to make the editor register the new value.
-                const el = document.querySelector('[data-sbsllm-input="true"]');
-                if (!el) return 'NO_MARKED_INPUT';
-                try {
-                    el.focus();
-                    el.innerText = '';
-                    document.execCommand('insertText', false, el.dataset.sbsllmValue || '');
-                    el.dispatchEvent(new InputEvent('beforeinput', {
-                        bubbles: true, cancelable: true,
-                        inputType: 'insertText', data: el.dataset.sbsllmValue || ''
-                    }));
-                    el.dispatchEvent(new InputEvent('input', {
-                        bubbles: true, inputType: 'insertText'
-                    }));
-                } catch (_) {}
-                return 'OK';
-            })()
-        """,
+        "post_inject_js": _POST_INJECT_CONTENTEDITABLE,
         "thinking_selectors": [
             '[class*="thinking"]',
             '[class*="reasoning"]',
@@ -567,29 +582,7 @@ SITES: dict[str, dict] = {
             """,
             "document.querySelector('textarea, #chat-input, [contenteditable], input[type=\"text\"]')",
         ),
-        "post_inject_js": """
-            (() => {
-                // DeepSeek uses contenteditable. The main inject sets textContent,
-                // but that does NOT update the editor's internal document model.
-                // We must use innerText + execCommand + beforeinput to make the
-                // editor register the new value.
-                const el = document.querySelector('[data-sbsllm-input="true"]');
-                if (!el) return 'NO_MARKED_INPUT';
-                try {
-                    el.focus();
-                    el.innerText = '';
-                    document.execCommand('insertText', false, el.dataset.sbsllmValue || '');
-                    el.dispatchEvent(new InputEvent('beforeinput', {
-                        bubbles: true, cancelable: true,
-                        inputType: 'insertText', data: el.dataset.sbsllmValue || ''
-                    }));
-                    el.dispatchEvent(new InputEvent('input', {
-                        bubbles: true, inputType: 'insertText'
-                    }));
-                } catch (_) {}
-                return 'OK';
-            })()
-        """,
+        "post_inject_js": _POST_INJECT_CONTENTEDITABLE,
         "response_selectors": [
             '[data-message-author-role="assistant"]',
             ".assistant-message",
@@ -652,35 +645,26 @@ SITES: dict[str, dict] = {
                 || document.querySelector('textarea[class*="prose"]')
                 || document.querySelector('textarea[placeholder*="Ask" i]')
                 || document.querySelector('textarea')
+                || (function() {
+                    // Shadow DOM fallback: Grok may render its composer inside a
+                    // web-component shadow tree that document.querySelector
+                    // cannot reach. Scan all shadow roots for an editable element.
+                    for (const host of document.querySelectorAll('*')) {
+                        try {
+                            if (!host.shadowRoot) continue;
+                            const el = host.shadowRoot.querySelector('.tiptap.ProseMirror[contenteditable="true"]')
+                                || host.shadowRoot.querySelector('div[contenteditable="true"][data-lexical-editor="true"]')
+                                || host.shadowRoot.querySelector('div[role="textbox"][contenteditable="true"]')
+                                || host.shadowRoot.querySelector('div[contenteditable="true"]')
+                                || host.shadowRoot.querySelector('textarea')
+                                || host.shadowRoot.querySelector('[contenteditable="true"]');
+                            if (el) return el;
+                        } catch (_) {}
+                    }
+                    return null;
+                })()
         """),
-        "post_inject_js": """
-            (() => {
-                // Grok uses TipTap/ProseMirror. The main inject above sets
-                // textContent, but that does NOT update the editor's internal
-                // document model. We must use innerText + execCommand +
-                // beforeinput to make the editor register the new value.
-                // This matches the pattern used by working grok automation scripts.
-                const el = document.querySelector('[data-sbsllm-input="true"]');
-                if (!el) return 'NO_MARKED_INPUT';
-                try {
-                    // Clear existing content
-                    el.focus();
-                    el.innerText = '';
-                    // Use execCommand to insert text (works with ProseMirror)
-                    document.execCommand('insertText', false, el.dataset.sbsllmValue || '');
-                    // Dispatch beforeinput for TipTap listeners
-                    el.dispatchEvent(new InputEvent('beforeinput', {
-                        bubbles: true, cancelable: true,
-                        inputType: 'insertText', data: el.dataset.sbsllmValue || ''
-                    }));
-                    // Dispatch input event
-                    el.dispatchEvent(new InputEvent('input', {
-                        bubbles: true, inputType: 'insertText'
-                    }));
-                } catch (_) {}
-                return 'OK';
-            })()
-        """,
+        "post_inject_js": _POST_INJECT_CONTENTEDITABLE,
         "submit_js": _submit_js(
             """
             document.querySelector('button[data-testid="chat-submit"]:not([disabled])')
@@ -690,6 +674,20 @@ SITES: dict[str, dict] = {
                 || document.querySelector('button[aria-label*="Send" i]:not([disabled])')
                 || document.querySelector('button[type="submit"]:not([disabled])')
                 || document.querySelector('.tiptap, [contenteditable], textarea')?.closest('form')?.querySelector('button:not([disabled])')
+                || (function() {
+                    // Shadow DOM fallback: scan all shadow roots for a send button.
+                    for (const host of document.querySelectorAll('*')) {
+                        try {
+                            if (!host.shadowRoot) continue;
+                            const btn = host.shadowRoot.querySelector('button[data-testid*="send" i]:not([disabled])')
+                                || host.shadowRoot.querySelector('button[data-testid*="submit" i]:not([disabled])')
+                                || host.shadowRoot.querySelector('button[type="submit"]:not([disabled])')
+                                || host.shadowRoot.querySelector('button:not([disabled])');
+                            if (btn) return btn;
+                        } catch (_) {}
+                    }
+                    return null;
+                })()
         """,
             "document.querySelector('.tiptap, [contenteditable], textarea')",
         ),
@@ -717,13 +715,41 @@ SITES: dict[str, dict] = {
     "google": {
         "url": "https://aistudio.google.com/",
         "inject": _inject_js("""
-            document.querySelector('ms-prompt-box ms-autosize-textarea textarea')
-                || document.querySelector('ms-prompt-box textarea[aria-label="Enter a prompt"]')
-                || document.querySelector('ms-prompt-box textarea[aria-label="Type something"]')
-                || document.querySelector('ms-prompt-box textarea')
-                || document.querySelector('textarea[aria-label="Enter a prompt"]')
-                || document.querySelector('textarea[aria-label="Type something"]')
-                || document.querySelector('textarea')
+            (function() {
+                // Try standard light-DOM selectors first.
+                var result =
+                    document.querySelector('ms-prompt-box ms-autosize-textarea textarea')
+                    || document.querySelector('ms-prompt-box textarea[aria-label="Enter a prompt"]')
+                    || document.querySelector('ms-prompt-box textarea[aria-label="Type something"]')
+                    || document.querySelector('ms-prompt-box textarea')
+                    || document.querySelector('textarea[aria-label="Enter a prompt"]')
+                    || document.querySelector('textarea[aria-label="Type something"]')
+                    || document.querySelector('textarea');
+                if (result) return result;
+                // Google AI Studio renders ms-* web components with Shadow DOM,
+                // so standard querySelector cannot reach the textarea. Walk known
+                // shadow hosts and search their shadow roots.
+                var hosts = document.querySelectorAll('ms-prompt-box, ms-autosize-textarea');
+                for (var host of hosts) {
+                    try {
+                        var root = host.shadowRoot;
+                        if (!root) continue;
+                        result = root.querySelector('textarea[aria-label="Enter a prompt"]')
+                            || root.querySelector('textarea[aria-label="Type something"]')
+                            || root.querySelector('textarea');
+                        if (result) return result;
+                        // Descend one more level (ms-autosize-textarea inside ms-prompt-box)
+                        var innerHost = root.querySelector('ms-autosize-textarea');
+                        if (innerHost && innerHost.shadowRoot) {
+                            result = innerHost.shadowRoot.querySelector('textarea[aria-label="Enter a prompt"]')
+                                || innerHost.shadowRoot.querySelector('textarea[aria-label="Type something"]')
+                                || innerHost.shadowRoot.querySelector('textarea');
+                            if (result) return result;
+                        }
+                    } catch (_) {}
+                }
+                return null;
+            })()
         """),
         "post_inject_js": """
             (() => {
@@ -731,7 +757,18 @@ SITES: dict[str, dict] = {
                 // internal state (data-value attribute, disabled flag on the
                 // Run button) that does not sync when .value is set via the
                 // property setter. Sync the wrapper so the Run button enables.
-                const el = document.querySelector('[data-sbsllm-input="true"]');
+                // The marked input may live inside a shadow root, so scan
+                // both light DOM and shadow roots.
+                let el = document.querySelector('[data-sbsllm-input="true"]');
+                if (!el) {
+                    for (const host of document.querySelectorAll('*')) {
+                        try {
+                            if (!host.shadowRoot) continue;
+                            el = host.shadowRoot.querySelector('[data-sbsllm-input="true"]');
+                            if (el) break;
+                        } catch (_) {}
+                    }
+                }
                 if (!el) return 'NO_MARKED_INPUT';
                 const autosize = el.closest('ms-autosize-textarea');
                 if (autosize) {
@@ -749,14 +786,16 @@ SITES: dict[str, dict] = {
                     el.dispatchEvent(new Event('input', { bubbles: true }));
                     el.dispatchEvent(new Event('change', { bubbles: true }));
                 }
-                // The Run button lives inside ms-run-button; enable it directly
-                // so the submit step can click it. The component may keep its
-                // own disabled flag, but removing ours helps.
-                const runButton = document.querySelector('ms-run-button');
-                if (runButton) {
+                // The Run button lives inside ms-run-button's shadow DOM;
+                // standard querySelector cannot reach into shadow roots, so
+                // traverse shadowRoot explicitly. Fall back to light-DOM
+                // querySelector for components that don't use shadow DOM.
+                const runButtonHost = document.querySelector('ms-run-button');
+                if (runButtonHost) {
                     try {
-                        runButton.removeAttribute('disabled');
-                        const inner = runButton.querySelector('button');
+                        runButtonHost.removeAttribute('disabled');
+                        const root = (runButtonHost.shadowRoot || runButtonHost);
+                        const inner = root.querySelector('button');
                         if (inner) {
                             inner.removeAttribute('disabled');
                             inner.setAttribute('aria-disabled', 'false');
@@ -768,10 +807,14 @@ SITES: dict[str, dict] = {
         """,
         "submit_js": _submit_js(
             """
-            // Google AI Studio: click the Run button inside ms-run-button or the
-            // ms-prompt-box. If no button is found, dispatch Enter on the
-            // textarea — AI Studio submits on Enter.
-            document.querySelector('ms-run-button button[aria-label="Run"]')
+            // Google AI Studio uses ms-* web components that may use Shadow DOM.
+            // Standard querySelector cannot reach into shadow roots, so we
+            // traverse shadowRoot first, then fall back to light-DOM selectors.
+            (document.querySelector('ms-run-button')?.shadowRoot?.querySelector('button[aria-label="Run"]'))
+                || (document.querySelector('ms-run-button')?.shadowRoot?.querySelector('button[type="submit"]'))
+                || (document.querySelector('ms-run-button')?.shadowRoot?.querySelector('button:not([disabled])'))
+                || (document.querySelector('ms-prompt-box')?.shadowRoot?.querySelector('ms-run-button')?.shadowRoot?.querySelector('button[aria-label="Run"]'))
+                || document.querySelector('ms-run-button button[aria-label="Run"]')
                 || document.querySelector('ms-prompt-box ms-run-button button[aria-label="Run"]')
                 || document.querySelector('ms-prompt-box ms-run-button button[type="submit"]')
                 || document.querySelector('ms-run-button button[type="submit"].run-button')
@@ -822,29 +865,7 @@ SITES: dict[str, dict] = {
                 || document.querySelector('textarea')?.closest('form')?.querySelector('button')
                 || document.querySelector('.ProseMirror')?.closest('form')?.querySelector('button')
         """),
-        "post_inject_js": """
-            (() => {
-                // Mistral uses ProseMirror/contenteditable. The main inject sets
-                // textContent, but that does NOT update the editor's internal
-                // document model. We must use innerText + execCommand +
-                // beforeinput to make the editor register the new value.
-                const el = document.querySelector('[data-sbsllm-input="true"]');
-                if (!el) return 'NO_MARKED_INPUT';
-                try {
-                    el.focus();
-                    el.innerText = '';
-                    document.execCommand('insertText', false, el.dataset.sbsllmValue || '');
-                    el.dispatchEvent(new InputEvent('beforeinput', {
-                        bubbles: true, cancelable: true,
-                        inputType: 'insertText', data: el.dataset.sbsllmValue || ''
-                    }));
-                    el.dispatchEvent(new InputEvent('input', {
-                        bubbles: true, inputType: 'insertText'
-                    }));
-                } catch (_) {}
-                return 'OK';
-            })()
-        """,
+        "post_inject_js": _POST_INJECT_CONTENTEDITABLE,
         "response_selectors": [
             '[data-message-author-role="assistant"]',
             ".assistant-message",
@@ -865,7 +886,7 @@ SITES: dict[str, dict] = {
         ],
     },
     "kimi": {
-        "url": "https://kimi.ai/",
+        "url": "https://www.kimi.ai/",
         "inject": _inject_js("""
             document.querySelector('textarea.ph')
                 || document.querySelector('textarea[name="message"]')
@@ -885,30 +906,7 @@ SITES: dict[str, dict] = {
         """,
             "document.querySelector('textarea.ph, textarea[name=\"message\"], textarea, div.chat-input-editor')",
         ),
-        "post_inject_js": """
-            (() => {
-                // Kimi uses a contenteditable div (chat-input-editor) as a
-                // fallback. The main inject sets textContent, but that does
-                // NOT update the editor's internal document model. We must
-                // use innerText + execCommand + beforeinput to make the
-                // editor register the new value.
-                const el = document.querySelector('[data-sbsllm-input="true"]');
-                if (!el) return 'NO_MARKED_INPUT';
-                try {
-                    el.focus();
-                    el.innerText = '';
-                    document.execCommand('insertText', false, el.dataset.sbsllmValue || '');
-                    el.dispatchEvent(new InputEvent('beforeinput', {
-                        bubbles: true, cancelable: true,
-                        inputType: 'insertText', data: el.dataset.sbsllmValue || ''
-                    }));
-                    el.dispatchEvent(new InputEvent('input', {
-                        bubbles: true, inputType: 'insertText'
-                    }));
-                } catch (_) {}
-                return 'OK';
-            })()
-        """,
+        "post_inject_js": _POST_INJECT_CONTENTEDITABLE,
         "response_selectors": [
             '[data-role="assistant"]',
             '[data-message-author-role="assistant"]',
@@ -1030,7 +1028,7 @@ SITES: dict[str, dict] = {
         ],
     },
     "zai": {
-        "url": "https://chat.z.ai/auth",
+        "url": "https://chat.z.ai/",
         "inject": _inject_js("""
             document.querySelector('textarea#chat-input')
                 || document.querySelector('textarea[placeholder*="Ask"]')
@@ -1119,7 +1117,6 @@ SITES: dict[str, dict] = {
         ],
         "login_wall_selectors": [
             'a[href*="login" i]',
-            'button[aria-label*="Sign in" i]',
             'button[aria-label*="Log in" i]',
         ],
         "loading_selectors": [
