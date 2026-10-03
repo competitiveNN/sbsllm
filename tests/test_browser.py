@@ -1,5 +1,6 @@
 """Tests for browser.py."""
 
+import logging
 import os
 import threading
 import time
@@ -9,8 +10,12 @@ import pytest
 
 import sbsllm.browser as browser_module
 from sbsllm.browser import (
+    DEFAULT_BUSY_PATIENCE,
+    DEFAULT_FIRST_TOKEN_TIMEOUT,
+    DEFAULT_THINKING_PATIENCE,
     USER_DATA_DIR,
     BrowserError,
+    ResponsePoller,
     check_page_health,
     close_browser,
     ensure_browser,
@@ -20,6 +25,7 @@ from sbsllm.browser import (
     run_in_browser_thread,
     run_js,
     setup_logging,
+    wait_for_response,
 )
 
 
@@ -1016,6 +1022,52 @@ class TestCaptureResponseRetry:
                 fake_page, extraction, retries=2, base_delay=0.01
             )
 
+    def test_browser_worker_stopped_retried(self):
+        """A dead worker mid-dispatch must be retried (idempotent read)."""
+        fake_page = MagicMock()
+        extraction = "return {found:true};"
+        call_counts = {"n": 0}
+
+        def flaky_worker_stop(page, js):
+            call_counts["n"] += 1
+            if call_counts["n"] == 1:
+                raise browser_module.BrowserWorkerStopped(
+                    "Browser worker stopped before completing the operation"
+                )
+            return {
+                "found": True,
+                "content": "recovered",
+                "thinking": None,
+                "busy": False,
+                "done": True,
+                "count": 1,
+            }
+
+        with patch(
+            "sbsllm.browser.run_js_value", side_effect=flaky_worker_stop
+        ):
+            result = browser_module.capture_response(
+                fake_page, extraction, retries=2, base_delay=0.01
+            )
+            assert result["content"] == "recovered"
+            assert call_counts["n"] == 2
+
+    def test_browser_worker_stopped_exhausts_retries(self):
+        """After exhausting retries, BrowserWorkerStopped is re-raised."""
+        fake_page = MagicMock()
+        extraction = "return {found:true};"
+
+        with (
+            patch(
+                "sbsllm.browser.run_js_value",
+                side_effect=browser_module.BrowserWorkerStopped("dead worker"),
+            ),
+            pytest.raises(browser_module.BrowserWorkerStopped),
+        ):
+            browser_module.capture_response(
+                fake_page, extraction, retries=2, base_delay=0.01
+            )
+
     def test_normalize_non_dict_result(self):
         """_normalize_response must handle non-dict return values."""
         result = browser_module._normalize_response(None)
@@ -1235,33 +1287,292 @@ class TestWorkerLifecycle:
             browser_module._stop_browser_worker(timeout=0.01)
         mock_logger.warning.assert_called_once()
 
-    def test_run_in_browser_thread_worker_stopped(self):
-        """run_in_browser_thread raises if worker dies before completing."""
-        # Simulate worker dying by replacing the thread reference
+    def test_run_in_browser_thread_restarts_dead_worker(self):
+        """A worker that is already dead when an operation is queued is
+        restarted transparently rather than failing the call.
+
+        Previously this surfaced as "Browser worker stopped before completing
+        the operation" because a stale queue (left behind by a prior worker)
+        made the new worker exit before seeing the real work item. The queue
+        is now drained on restart, so the operation runs to completion.
+        """
         browser_module._browser_thread = MagicMock(spec=threading.Thread)
         browser_module._browser_thread.is_alive.return_value = False
 
-        with pytest.raises(RuntimeError, match="Browser worker stopped"):
-            browser_module.run_in_browser_thread(_identity, timeout=2)
+        result = browser_module.run_in_browser_thread(_identity, timeout=5)
+        assert result == "ok"
+        assert browser_module._browser_thread is not None
+        assert browser_module._browser_thread.is_alive()
+
+    def test_stale_sentinel_in_queue_does_not_kill_worker(self):
+        """A stale ``None`` sentinel left in the queue by a dead worker must not
+        make the next worker exit before doing real work.
+
+        Reproduces the original order-dependent failure: when a predecessor
+        faked a dead worker, ``_stop_browser_worker`` left a ``None`` in the
+        shared queue; the next ``run_in_browser_thread`` spawned a worker that
+        dequeued the stale ``None`` first and exited, raising "Browser worker
+        stopped" instead of returning the result.
+        """
+        # Poison the queue with a stale shutdown sentinel, as if a previous
+        # dead worker's stop call had enqueued it.
+        browser_module._browser_queue.put(None)
+        # Also drop a stale "no result" item (orphaned request with an unset
+        # event) -- _drain_browser_queue must clear both.
+        orphan_event = threading.Event()
+        browser_module._browser_queue.put((_identity, (), {}, orphan_event, []))
+
+        result = browser_module.run_in_browser_thread(_identity, timeout=5)
+        assert result == "ok"
+        assert browser_module._browser_thread is not None
+        assert browser_module._browser_thread.is_alive()
+
+    def test_stop_on_dead_worker_does_not_poison_queue(self):
+        """Stopping an already-dead worker must not enqueue a sentinel that
+        lingers in the queue and kills the next worker."""
+        # Pre-existing stale sentinel from the bug scenario.
+        browser_module._browser_queue.put(None)
+        before = list(browser_module._browser_queue.queue)
+        # A dead worker reference (the worker has already exited on its own).
+        dead = MagicMock(spec=threading.Thread)
+        dead.is_alive.return_value = False
+        browser_module._browser_thread = dead
+        browser_module._playwright_thread_id = 123
+
+        browser_module._stop_browser_worker(timeout=1.0)
+
+        assert browser_module._browser_thread is None
+        # The queue must not have grown and no *new* sentinel must have been
+        # added -- only the pre-existing stale None we put above may remain.
+        # (Stale items are drained by _start_browser_worker on next restart.)
+        after = list(browser_module._browser_queue.queue)
+        assert len(after) == len(before), (
+            f"stop added {len(after) - len(before)} item(s): {before} -> {after}"
+        )
+        assert after.count(None) <= before.count(None), (
+            f"new sentinel leaked: {before} -> {after}"
+        )
+
+    def test_concurrent_starts_share_one_worker(self):
+        """Concurrent run_in_browser_thread calls with a poisoned queue all
+        complete; the drain on (re)start must not lose real work items.
+
+        This exercises the realistic contention path: many callers racing
+        through _start_browser_worker while stale sentinels linger from a
+        dead predecessor. No concurrent stopper is used -- a stopper that
+        wedges a worker before it receives its work item is a separate design
+        concern outside this fix's scope -- so the test stays deterministic.
+        """
+        import threading as _t
+
+        # Poison the queue with stale sentinels and orphaned items, exactly as
+        # the original bug left it.
+        browser_module._browser_queue.put(None)
+        orphan_event = _t.Event()
+        browser_module._browser_queue.put((_identity, (), {}, orphan_event, []))
+
+        results = []
+        errors = []
+        barrier = _t.Barrier(8)
+        counter = {"i": 0}
+
+        def op():
+            counter["i"] += 1
+            tag = counter["i"]
+
+            def tagged():
+                return tag
+
+            try:
+                barrier.wait(timeout=5)
+                results.append(
+                    browser_module.run_in_browser_thread(tagged, operation_timeout=10)
+                )
+            except Exception as e:  # noqa: BLE001
+                errors.append(e)
+
+        threads = [_t.Thread(target=op) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=20)
+
+        assert not errors, f"concurrent ops raised: {errors}"
+        assert sorted(results) == list(range(1, 9)), (
+            f"expected results 1..8, got {sorted(results)}"
+        )
+        # Everything, including the stale sentinel/orphan, must have been
+        # drained or processed -- the queue must be empty.
+        assert browser_module._browser_queue.empty(), (
+            f"queue not empty: {list(browser_module._browser_queue.queue)}"
+        )
+        worker = browser_module._browser_thread
+        assert worker is not None and worker.is_alive(), (
+            f"expected a live worker, got {worker!r}"
+        )
+
+    def test_drain_refuses_to_drain_live_worker(self, caplog):
+        """_drain_browser_queue must never steal items from a running worker.
+
+        A live worker may be blocked in get() on an item we would otherwise
+        discard; draining it would silently drop an in-flight operation.
+        """
+        worker = browser_module._start_browser_worker()
+        try:
+            assert worker.is_alive()
+            with caplog.at_level(
+                logging.INFO,
+                logger="sbsllm.browser.worker_lifecycle",
+            ):
+                drained = browser_module._drain_browser_queue()
+            assert drained == 0
+            assert any(
+                r.getMessage() == "browser_queue_drain_refused"
+                and r.name.endswith("worker_lifecycle")
+                for r in caplog.records
+            ), [r.getMessage() for r in caplog.records]
+        finally:
+            browser_module._stop_browser_worker()
+
+    def test_drain_refuses_while_worker_is_processing(self, caplog):
+        """The live-worker guard must hold while a worker is busy running an item.
+
+        This is the realistic contention case: draining must not discard an
+        item the worker has already dequeued and is mid-execution on.
+        """
+        started = threading.Event()
+        release = threading.Event()
+        processed = []
+
+        def blocking():
+            started.set()
+            release.wait(2)
+            processed.append("done")
+            return "ok"
+
+        browser_module._start_browser_worker()
+        try:
+            holder = []
+            event = threading.Event()
+            browser_module._browser_queue.put((blocking, (), {}, event, holder))
+            assert started.wait(2), "worker did not pick up the blocking item"
+            # Worker is now blocked inside blocking(); draining must be refused.
+            with caplog.at_level(
+                logging.INFO,
+                logger="sbsllm.browser.worker_lifecycle",
+            ):
+                assert browser_module._drain_browser_queue() == 0
+                assert any(
+                    r.getMessage() == "browser_queue_drain_refused"
+                    and r.name.endswith("worker_lifecycle")
+                    for r in caplog.records
+                ), [r.getMessage() for r in caplog.records]
+            release.set()
+            assert event.wait(2), "operation never completed"
+            assert processed == ["done"]
+            assert holder and holder[0][0] == "ok"
+        finally:
+            browser_module._stop_browser_worker()
+
+    def test_worker_lifecycle_logs_drain_and_start(self, caplog):
+        """A stale queue item must produce drain + start lifecycle logs."""
+        # Stale sentinel left behind by a dead predecessor; must be drained on
+        # the next worker start rather than killing the new worker.
+        browser_module._browser_queue.put(None)
+        with caplog.at_level(
+            logging.INFO,
+            logger="sbsllm.browser.worker_lifecycle",
+        ):
+            result = browser_module.run_in_browser_thread(_identity)
+        assert result == "ok"
+        messages = [r.getMessage() for r in caplog.records]
+        assert "browser_queue_drained" in messages
+        assert "browser_worker_started" in messages
+
+    def test_stop_dead_worker_logs_already_dead(self, caplog):
+        """Stopping an already-dead worker logs the dead path and skips sentinel."""
+        browser_module._browser_queue.put(None)
+        before = list(browser_module._browser_queue.queue)
+        dead = MagicMock(spec=threading.Thread)
+        dead.is_alive.return_value = False
+        browser_module._browser_thread = dead
+        browser_module._playwright_thread_id = 999
+        with caplog.at_level(
+            logging.INFO,
+            logger="sbsllm.browser.worker_lifecycle",
+        ):
+            browser_module._stop_browser_worker(timeout=1.0)
+        assert browser_module._browser_thread is None
+        # Should log the already-dead info path, never the join/stop path.
+        messages = [r.getMessage() for r in caplog.records]
+        assert "browser_worker_already_dead" in messages
+        assert "browser_worker_stopped" not in messages
+        after = list(browser_module._browser_queue.queue)
+        assert len(after) == len(before), (before, after)
+        assert after.count(None) <= before.count(None)
+
+    def test_replay_poison_restart_succeeds(self):
+        """Repeated poison -> dead-worker-restart -> drain -> run must never break.
+
+        Deterministic replay of the original order-dependent failure: each
+        iteration leaves the queue in the poisoned state a dead worker would,
+        then a fresh start must drain it and run to completion. Cycled many
+        times to flush out intermittent drain/dispatch races.
+        """
+        for _ in range(10):
+            # Clean up any real worker from the previous iteration first so we
+            # don't accumulate orphaned threads.
+            browser_module._stop_browser_worker(timeout=2.0)
+            assert browser_module._browser_thread is None
+            # Poison the queue as a dead worker would.
+            browser_module._browser_queue.put(None)
+            orphan_event = threading.Event()
+            browser_module._browser_queue.put(
+                (_identity, (), {}, orphan_event, [])
+            )
+            # Simulate a worker reference that died without draining (the
+            # original bug state), plus a stale thread id to clear.
+            dead = MagicMock(spec=threading.Thread)
+            dead.is_alive.return_value = False
+            browser_module._browser_thread = dead
+            browser_module._playwright_thread_id = 123
+            assert (
+                browser_module.run_in_browser_thread(_identity, operation_timeout=5)
+                == "ok"
+            )
+            assert browser_module._browser_queue.empty(), (
+                "queue not empty after restart: "
+                f"{list(browser_module._browser_queue.queue)}"
+            )
+
+    def test_browser_worker_stopped_is_browser_error(self):
+        """BrowserWorkerStopped must be catchable as BrowserError so the server
+        surfaces it as a 502, not a generic 500 internal error."""
+        assert issubclass(browser_module.BrowserWorkerStopped, BrowserError)
+        assert issubclass(browser_module.BrowserWorkerStopped, RuntimeError)
 
     def test_run_in_browser_thread_no_result(self):
-        """run_in_browser_thread raises if the worker produces no result."""
-        # Patch the worker loop to set the event but not populate the result holder
-        with patch.object(browser_module, "_browser_worker_loop") as mock_loop:
+        """run_in_browser_thread raises if the worker produces no result.
 
+        The worker loop always populates the result holder before setting the
+        event, so a worker that exits without doing so is a worker death, not
+        an empty result -- it surfaces as a typed BrowserWorkerStopped.
+        """
+        # Patch the worker loop to a no-op so the worker thread exits before
+        # processing its queued item -- simulating a crash/stop.
+        with patch.object(browser_module, "_browser_worker_loop") as mock_loop:
             def fake_worker():
-                # Simulate the worker setting the event but not populating holder
                 pass
 
             mock_loop.side_effect = fake_worker
             browser_module._browser_thread = None
             browser_module._playwright_thread_id = None
 
-            def func_returning_none():
-                return None
-
-            with pytest.raises(RuntimeError, match="Browser worker stopped"):
-                browser_module.run_in_browser_thread(func_returning_none, timeout=2)
+            with pytest.raises(
+                browser_module.BrowserWorkerStopped,
+                match="Browser worker stopped",
+            ):
+                browser_module.run_in_browser_thread(_identity, operation_timeout=2)
 
     def test_run_in_browser_thread_propagates_error(self):
         """run_in_browser_thread re-raises errors returned with status 'error'."""
@@ -2007,3 +2318,294 @@ class TestCloseBrowserSafety:
             browser_module.close_browser()
         browser_module._context = None
         browser_module._playwright_instance = None
+
+
+class TestResponsePoller:
+    """Direct unit tests for the shared completion state machine.
+
+    ResponsePoller is the single source of truth for when polling
+    stops. These tests pin each termination rule in isolation so the
+    streaming and non-streaming paths -- which both delegate here --
+    can never drift.
+    """
+
+    def _poll(
+        self,
+        *,
+        content="",
+        thinking=None,
+        busy=False,
+        done=False,
+        found=True,
+        count=1,
+    ) -> dict:
+        return {
+            "found": found,
+            "content": content,
+            "thinking": thinking,
+            "busy": busy,
+            "done": done,
+            "count": count,
+        }
+
+    def _poller(self, **kw):
+        defaults = {
+            "baseline": None,
+            "idle_timeout": 3.0,
+            "done_confirm": 0.75,
+            "busy_patience": DEFAULT_BUSY_PATIENCE,
+            "thinking_patience": DEFAULT_THINKING_PATIENCE,
+            "first_token_timeout": DEFAULT_FIRST_TOKEN_TIMEOUT,
+        }
+        defaults.update(kw)
+        return ResponsePoller(started_at=0.0, **defaults)
+
+    def test_site_done_requires_seen_busy_then_not_busy(self):
+        """A site must be observed generating before its `done` flag is
+        trusted once it stops reporting busy."""
+        poller = self._poller(done_confirm=0.0)
+        stop = poller.observe(self._poll(content="hi", busy=True, done=True), 0.0)
+        assert stop is None
+        stop = poller.observe(self._poll(content="hi", busy=False, done=True), 1.0)
+        assert stop == "site_done"
+
+    def test_idle_completes_when_site_never_signals(self):
+        """No `done` flag, but a stable payload must still close the turn."""
+        poller = self._poller(idle_timeout=0.1, done_confirm=99.0, busy_patience=99)
+        stop = poller.observe(self._poll(content="ans"), 1.0)
+        assert stop is None
+        stop = poller.observe(self._poll(content="ans"), 1.0 + 0.1)
+        assert stop == "idle"
+
+    def test_idle_timeout_zero_does_not_finish_immediately(self):
+        """Idle_timeout of 0 disables the idle rule instead of cutting on the
+        first poll (a regression the streaming loop had)."""
+        poller = self._poller(idle_timeout=0.0, done_confirm=99.0, busy_patience=99)
+        stop = poller.observe(self._poll(content="ans", done=True), 0.0)
+        assert stop is None
+
+    def test_busy_timeout_ends_an_answer_stall(self):
+        """busy + content that stops moving must end after busy_patience,
+        not the overall budget."""
+        poller = self._poller(busy_patience=1.0, thinking_patience=99, idle_timeout=99)
+        poller.observe(self._poll(content="partial", busy=True), 0.0)
+        stop = poller.observe(self._poll(content="partial", busy=True), 5.0)
+        assert stop == "busy_timeout"
+
+    def test_thinking_timeout_endures_longer_than_busy(self):
+        """A thinking-only stall uses the larger thinking_patience, not the
+        busier answer patience."""
+        poller = self._poller(busy_patience=1.0, thinking_patience=99.0, idle_timeout=99)
+        poller.observe(self._poll(thinking="still...", busy=True), 0.0)
+        stop = poller.observe(self._poll(thinking="still...", busy=True), 2.0)
+        assert stop is None
+        stop = poller.observe(self._poll(thinking="still...", busy=True), 100.0)
+        assert stop == "thinking_timeout"
+
+    def test_no_output_after_first_token_timeout(self):
+        """Nothing ever appears -> no_output, even for a brand-new page."""
+        poller = self._poller(first_token_timeout=1.0, idle_timeout=99)
+        stop = poller.observe(self._poll(found=False, count=0), 0.0)
+        assert stop is None
+        stop = poller.observe(self._poll(found=False, count=0), 2.0)
+        assert stop == "no_output"
+
+    def test_count_tick_does_not_reset_stability(self):
+        """A ticking `count` (busy flip / spinner) must not restart the
+        patience clock -- only real text movement may."""
+        poller = self._poller(busy_patience=1.0, thinking_patience=99, idle_timeout=99)
+        poller.observe(self._poll(content="partial", busy=True, count=1), 0.0)
+        stop = poller.observe(self._poll(content="partial", busy=True, count=4), 5.0)
+        assert stop == "busy_timeout"
+
+    def test_growing_text_never_hits_busy_timeout(self):
+        """Continuously arriving content keeps resetting the clock."""
+        poller = self._poller(busy_patience=1.0, thinking_patience=99, idle_timeout=99)
+        stop = poller.observe(self._poll(content="a", busy=True), 0.0)
+        assert stop is None
+        stop = poller.observe(self._poll(content="ab", busy=True), 0.5)
+        assert stop is None
+        stop = poller.observe(self._poll(content="abc", busy=True), 1.5)
+        assert stop is None
+
+
+class TestWaitForResponseSharedRules:
+    """wait_for_response must surface the same stop reasons the poller
+    produces, including the ones the old non-streaming copy lacked."""
+
+    def _run(self, polls, *, busy_patience=1.0, thinking_patience=99.0,
+             idle_timeout=0.05, first_token_timeout=DEFAULT_FIRST_TOKEN_TIMEOUT,
+             done_confirm=0.75, timeout=10.0, poll_interval=0.01, baseline=None):
+        clock = type("C", (), {"t": 0.0, "monotonic": lambda self: self.t,
+                                "sleep": lambda self, s: setattr(self, "t", self.t + max(s, 0.01))})()
+        it = iter(polls)
+
+        def capture(page, js):
+            try:
+                return dict(next(it))
+            except StopIteration:
+                return dict(polls[-1])
+
+        with (
+            patch.object(browser_module, "capture_response", side_effect=capture),
+            patch.object(browser_module.time, "sleep", side_effect=clock.sleep),
+            patch.object(browser_module.time, "monotonic", side_effect=clock.monotonic),
+        ):
+            result = browser_module.wait_for_response(
+                MagicMock(), "JS", timeout, poll_interval=poll_interval,
+                idle_timeout=idle_timeout, baseline=baseline,
+                done_confirm=done_confirm, thinking_patience=thinking_patience,
+                busy_patience=busy_patience, first_token_timeout=first_token_timeout,
+            )
+        return result
+
+    def test_no_output_flag_when_nothing_appears(self):
+        polls = [{"found": False, "content": "", "thinking": None,
+                  "busy": False, "done": False, "count": 0}]
+        result = self._run(polls, first_token_timeout=0.5, idle_timeout=0.0)
+        assert result.get("no_output") is True
+        assert result["done"] is False
+        assert result["content"] == ""
+
+    def test_busy_timeout_flag_for_answer_stall(self):
+        polls = [
+            {"found": False, "content": "", "thinking": None,
+             "busy": False, "done": False, "count": 0},
+            {"found": True, "content": "partial", "thinking": None,
+             "busy": True, "done": False, "count": 1},
+        ]
+        result = self._run(polls, busy_patience=0.5, thinking_patience=99,
+                           idle_timeout=0.0, first_token_timeout=99)
+        assert result.get("busy_timeout") is True
+        assert result["content"] == "partial"
+
+
+class TestWaitForResponseDoneConfirm:
+    """The non-streaming caller must honor the server's configured
+    ``response_done_confirm`` setting instead of hardcoding 0.75.
+
+    The streaming path reads it off the server config; the non-streaming
+    path used to ignore it, so a short ``done_confirm`` (or a long one)
+    changed behaviour only in one direction.
+    """
+
+    def _run(self, polls, *, done_confirm=0.75, poll_interval=0.01,
+             timeout=30.0, **kwargs):
+        clock = type(
+            "C",
+            (),
+            {
+                "t": 0.0,
+                "monotonic": lambda self: self.t,
+                "sleep": lambda self, s: setattr(self, "t", self.t + max(s, 0.01)),
+            },
+        )()
+        it = iter(polls)
+
+        def capture(page, js):
+            try:
+                return dict(next(it))
+            except StopIteration:
+                return dict(polls[-1])
+
+        with (
+            patch.object(browser_module, "capture_response", side_effect=capture),
+            patch.object(browser_module.time, "sleep", side_effect=clock.sleep),
+            patch.object(browser_module.time, "monotonic", side_effect=clock.monotonic),
+        ):
+            return wait_for_response(
+                MagicMock(),
+                "JS",
+                timeout,
+                poll_interval=poll_interval,
+                done_confirm=done_confirm,
+                **kwargs,
+            )
+
+    def test_short_done_confirm_finishes_faster(self):
+        """With a 0.05s done_confirm a site that stops generating is trusted
+        almost immediately, whereas the 0.75s default would wait longer."""
+        # Site was seen generating, then stops. Text is stable across polls.
+        polls = [
+            {"found": True, "content": "answer", "thinking": None,
+             "busy": True, "done": False, "count": 1},
+            {"found": True, "content": "answer", "thinking": None,
+             "busy": False, "done": True, "count": 1},
+            {"found": True, "content": "answer", "thinking": None,
+             "busy": False, "done": True, "count": 1},
+        ]
+        # Poll 0 records the change at t=0; poll 1 lands at t=0.01, poll 2 at
+        # t=0.02 -- both past the 0.05s window? No: 0.01 < 0.05. So poll 3
+        # (t=0.03) still under. We need enough polls to exceed 0.05s.
+        polls = polls * 4
+        result = self._run(
+            polls, done_confirm=0.05, poll_interval=0.01,
+            idle_timeout=0.0, busy_patience=99,
+            thinking_patience=99, first_token_timeout=99,
+        )
+        assert result.get("done") is True, (
+            f"should finish, not time out: {result}"
+        )
+
+    def test_long_done_confirm_keeps_waiting(self):
+        """A 5s done_confirm must not return before the confirm window elapses.
+
+        With a 0.5s budget the loop times out well before the 5s stable
+        window, proving the long confirm is actually being honored.
+        """
+        polls = [
+            {"found": True, "content": "answer", "thinking": None,
+             "busy": True, "done": False, "count": 1},
+            {"found": True, "content": "answer", "thinking": None,
+             "busy": False, "done": True, "count": 1},
+        ]
+        result = self._run(
+            polls, done_confirm=5.0, poll_interval=0.01,
+            idle_timeout=0.0, busy_patience=99,
+            thinking_patience=99, first_token_timeout=99, timeout=0.5,
+        )
+        assert result.get("timed_out") is True, (
+            f"should time out, not finish early: {result}"
+        )
+
+
+class TestUserDataDirEnvOverride:
+    """SBSLLM_USER_DATA_DIR overrides the default persistent profile path.
+
+    Two Chromium instances locking the same profile is the classic
+    "could not connect to browser" hang, so tests (and CI) need a private
+    directory without changing the CLI's default behaviour. The override
+    is read at call time (via ``user_data_dir()``) rather than import time
+    so tests can switch profiles mid-process.
+    """
+
+    def test_default_path_is_well_known(self, monkeypatch):
+        monkeypatch.delenv("SBSLLM_USER_DATA_DIR", raising=False)
+        assert browser_module.user_data_dir() == "/tmp/sbsllm-chrome"
+
+    def test_env_override_changes_path(self, monkeypatch, tmp_path):
+        custom = str(tmp_path / "sbsllm-profile")
+        monkeypatch.setenv("SBSLLM_USER_DATA_DIR", custom)
+        assert browser_module.user_data_dir() == custom
+
+    def test_ensure_browser_uses_overridden_path(self, monkeypatch, tmp_path):
+        custom = str(tmp_path / "sbsllm-profile-2")
+        monkeypatch.setenv("SBSLLM_USER_DATA_DIR", custom)
+        mock_context, _ = self._mock_context()
+        with patch("sbsllm.browser.sync_playwright") as mock_pw:
+            mock_instance = MagicMock()
+            mock_pw.return_value.start.return_value = mock_instance
+            mock_instance.chromium.launch_persistent_context.return_value = mock_context
+            browser_module.ensure_browser()
+            assert (
+                mock_instance.chromium.launch_persistent_context.call_args[0][0]
+                == custom
+            )
+
+    @staticmethod
+    def _mock_context():
+        mock_browser = MagicMock()
+        mock_browser.is_connected.return_value = True
+        mock_context = MagicMock()
+        mock_context.browser = mock_browser
+        return mock_context, mock_browser

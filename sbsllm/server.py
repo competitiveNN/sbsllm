@@ -6,6 +6,7 @@ and routes them to the appropriate chat website via browser automation.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -19,8 +20,12 @@ from typing import Any, ClassVar
 from playwright.sync_api import Error as PlaywrightError
 
 from .browser import (
+    DEFAULT_BUSY_PATIENCE,
+    DEFAULT_FIRST_TOKEN_TIMEOUT,
+    DEFAULT_THINKING_PATIENCE,
     BrowserError,
     BrowserOperationTimeout,
+    ResponsePoller,
     capture_response,
     check_page_health,
     get_page_snapshot,
@@ -29,7 +34,7 @@ from .browser import (
     wait_for_response,
 )
 from .inject import extract_js, inject_prompt, submit_js
-from .sites import get_site
+from .sites import SITES, get_site
 
 # Logger for structured JSON state transition events in streaming.
 _stream_logger = logging.getLogger(__name__ + ".stream_state")
@@ -49,22 +54,6 @@ DEFAULT_RESPONSE_IDLE_TIMEOUT = 3.0
 # flag is trusted. Covers the brief window where a stop control flickers
 # out mid-render and would otherwise truncate the answer.
 DEFAULT_RESPONSE_DONE_CONFIRM = 0.75
-# How long an unchanged payload is tolerated while the site still claims to
-# be generating. Web chats pause mid-answer (thinking, re-render, rate limit)
-# and cutting there truncates the reply -- but a site whose spinner never
-# clears must not hold the tab until browser_timeout.
-DEFAULT_BUSY_PATIENCE = 20.0
-# Tolerance for a *thinking-only* stall: content is still empty, only the
-# reasoning trace is present, and the site keeps reporting "generating".
-# Thinking traces update in bursts with natural pauses between chunks, and
-# models like o1 / deepseek-reasoner / Claude-thinking can think for minutes,
-# so this must be far larger than DEFAULT_BUSY_PATIENCE. A site whose
-# thinking never moves again after this is genuinely stuck.
-DEFAULT_THINKING_PATIENCE = 120.0
-# After submitting, how long to wait for the web chat to produce any output at
-# all. Without this a selector mismatch meant silence until browser_timeout,
-# and the local chat simply spun forever.
-DEFAULT_FIRST_TOKEN_TIMEOUT = 60.0
 # SSE comment cadence while waiting, so the connection shows liveness.
 DEFAULT_KEEPALIVE_INTERVAL = 10.0
 # Poll interval between extraction passes (seconds)
@@ -75,10 +64,108 @@ DEFAULT_POLL_INTERVAL = 0.25
 # generation) while the main one is still streaming. 10s produced spurious
 # 503s on a tab that was merely busy answering.
 DEFAULT_BROWSER_LOCK_TIMEOUT = 180
+# Duplicate-submit guard (seconds). Clients that retry silently -- an SSE
+# reconnect behind a proxy, a fetch retry, a frontend retry policy -- POST the
+# identical request again after a failure, and every POST re-injects and
+# re-submits, so the same prompt was posted to the web chat in a loop. An
+# identical prompt on the same tab within this window attaches to the turn
+# already on screen instead of being sent again. 0 disables the guard.
+DEFAULT_DUPLICATE_PROMPT_COOLDOWN = 60.0
 # Default interval for periodic health checks (seconds)
 DEFAULT_HEALTH_INTERVAL = 30
 # Request ID header name
 REQUEST_ID_HEADER = "X-Request-ID"
+
+
+def _estimate_tokens(text: str) -> int:
+    """Rough token-count estimate: CJK-aware characters heuristic.
+
+    Web chats are black boxes: there is no tokenizer API to call, so we
+    approximate token usage for the ``usage`` field that OpenAI-compatible
+    clients expect. Non-CJK text averages ~4 characters per token; CJK
+    characters (Han, Hiragana, Katakana, Hangul) map to roughly one token
+    each, so they are counted separately. A flat chars/4 split badly
+    under-counts the CJK prompts this tool is used to test against
+    DeepSeek, Qwen, Kimi, Zai and friends. Only a heuristic -- good enough
+    for cost ballpark and progress display, not for billing.
+    """
+    if not text:
+        return 0
+    cjk = sum(1 for ch in text if _is_cjk(ch))
+    return max(1, cjk + (len(text) - cjk) // 4)
+
+
+def _is_cjk(ch: str) -> bool:
+    """Return True if ``ch`` is a CJK / CJK-adjacent syllable or ideograph.
+
+    Covers Han ideographs, Hiragana, Katakana and Hangul syllables -- the
+    script blocks most likely to appear in prompts sent to the supported
+    chat sites. Fullwidth punctuation is intentionally excluded.
+    """
+    cp = ord(ch)
+    return (
+        0x4E00 <= cp <= 0x9FFF  # CJK Unified Ideographs
+        or 0x3040 <= cp <= 0x30FF  # Hiragana + Katakana
+        or 0xAC00 <= cp <= 0xD7AF  # Hangul syllables
+    )
+
+
+def _usage_fields(prompt: str, content: str, thinking: str | None) -> dict:
+    """Estimated OpenAI ``usage`` counts for a completion.
+
+    Shared by the streaming final chunk and the non-streaming
+    completion object so both report identical token estimates.
+    ``thinking`` may be ``None`` (streaming path) or an empty string.
+    """
+    prompt_tokens = _estimate_tokens(prompt)
+    completion_tokens = _estimate_tokens(content) + (
+        _estimate_tokens(thinking) if thinking else 0
+    )
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+    }
+
+
+def _stream_delta(new: str, old: str) -> str:
+    """Return only the part of ``new`` the client has not received yet.
+
+    Normally ``new`` extends ``old`` and the suffix is emitted. But sites
+    re-render already-streamed text while a reply is still generating --
+    z.ai drops or adds markdown emphasis mid-stream (``I'm **GLM`` became
+    ``I'm GLM``), so the new content diverges from what was already sent.
+    ``str.removeprefix`` does not match then and returned the *whole*
+    content, which the client appended after what it already had: every
+    earlier character appeared twice.
+
+    On divergence, skip the shared prefix plus the longest run of ``new``
+    that already occurs in ``old`` (the re-rendered fragment), so the
+    client only ever receives text it has not seen. Anything skipped is
+    guaranteed present in ``old`` by construction, so no content is lost;
+    only the pre-divergence fragment, which cannot be retracted, differs.
+    """
+    if not old:
+        return new
+    if new.startswith(old):
+        return new[len(old) :]
+    split = 0
+    limit = min(len(old), len(new))
+    while split < limit and old[split] == new[split]:
+        split += 1
+    rest = new[split:]
+    tail = old[split:]
+    # If rest[:k] occurs in tail, so does rest[:k-1] (same position), so the
+    # predicate is monotonic and the largest already-sent run binary-searches.
+    lo, hi = 0, min(len(rest), len(tail))
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if rest[:mid] in tail:
+            lo = mid
+        else:
+            hi = mid - 1
+    return rest[lo:]
+
 
 # Metrics storage
 _request_count = 0
@@ -120,7 +207,9 @@ class _SBSHTTPServer(ThreadingHTTPServer):
         # every handler fall back to the defaults, so the configured
         # browser_timeout was ignored and no tab lock was ever taken.
         self.model_locks: _ModelLockRegistry = _ModelLockRegistry()
+        self.turn_registry: _TurnRegistry = _TurnRegistry()
         self.browser_lock_timeout: float = DEFAULT_BROWSER_LOCK_TIMEOUT
+        self.duplicate_prompt_cooldown: float = DEFAULT_DUPLICATE_PROMPT_COOLDOWN
         self.browser_timeout: float = DEFAULT_BROWSER_TIMEOUT
         self.response_idle_timeout: float = DEFAULT_RESPONSE_IDLE_TIMEOUT
         self.response_done_confirm: float = DEFAULT_RESPONSE_DONE_CONFIRM
@@ -188,6 +277,51 @@ class _ModelLockRegistry:
             return [m for m, lock in self._locks.items() if lock.locked()]
 
 
+class _TurnRegistry:
+    """Duplicate-submit guard: the last successful submission per tab.
+
+    One POST to /v1/chat/completions injects and submits exactly once, but a
+    client that retries (SSE reconnect, fetch/proxy retry, frontend retry
+    policy) produces a *train* of identical POSTs -- each one re-sending the
+    same prompt to the same tab, which is the reported repeating-loop bug.
+    This registry suppresses that: an identical prompt within the cooldown
+    window attaches to the turn already on screen (the duplicate still gets a
+    valid response, so a retry chain ends after one suppressed request) instead
+    of being injected and submitted again.
+    """
+
+    def __init__(self) -> None:
+        self._guard = threading.Lock()
+        self._last: dict[str, tuple[str, float]] = {}
+
+    def record(self, model: str, prompt: str) -> None:
+        """Record a successful submission of `prompt` on `model`'s tab."""
+        digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        with self._guard:
+            self._last[model] = (digest, time.monotonic())
+
+    def is_duplicate(self, model: str, prompt: str, cooldown: float) -> bool:
+        """True when `prompt` was just submitted on this tab.
+
+        A duplicate slides the cooldown window forward, so a retry train
+        cannot re-send the prompt no matter how long it runs; once the retries
+        stop, the entry ages out after `cooldown` and a deliberate re-send of
+        the same prompt works again.
+        """
+        if cooldown <= 0:
+            return False
+        digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        with self._guard:
+            entry = self._last.get(model)
+            if entry is None:
+                return False
+            last_digest, submitted_at = entry
+            if last_digest != digest or (time.monotonic() - submitted_at) >= cooldown:
+                return False
+            self._last[model] = (digest, time.monotonic())
+            return True
+
+
 class OpenAIHandler(BaseHTTPRequestHandler):
     """Handler for OpenAI-compatible chat completion requests."""
 
@@ -218,8 +352,15 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         model: str | None = None,
         site_id: str | None = None,
         tab_index: int | None = None,
+        code: str | None = None,
     ) -> None:
-        """Send an error response in OpenAI format."""
+        """Send an error response in OpenAI format.
+
+        ``code`` carries a stable, machine-readable error code (e.g.
+        ``model_not_found``, ``inject_submit_failed``) so programmatic
+        clients can branch on it; it stays ``None`` when unset, matching
+        the OpenAI convention of an optional error code.
+        """
         logger = logging.getLogger(__name__)
         logger.info(
             "chat_completion request_end",
@@ -239,7 +380,7 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                     "message": message,
                     "type": error_type,
                     "param": None,
-                    "code": None,
+                    "code": code,
                 }
             },
             request_id,
@@ -586,6 +727,29 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         if browser_lock is not None:
             browser_lock.release()
 
+    def _duplicate_turn(self, model: str, prompt: str) -> bool:
+        """True when this exact prompt was just submitted on this tab.
+
+        The registry only suppresses when a real ``_TurnRegistry`` is
+        published by the Server; handler instances faked up in tests (a
+        ``MagicMock`` server) deliberately fall through to the normal path.
+        """
+        registry = getattr(getattr(self, "server", None), "turn_registry", None)
+        if not isinstance(registry, _TurnRegistry):
+            return False
+        cooldown = float(
+            self._server_setting(
+                "duplicate_prompt_cooldown", DEFAULT_DUPLICATE_PROMPT_COOLDOWN
+            )
+        )
+        return registry.is_duplicate(model, prompt, cooldown)
+
+    def _record_turn(self, model: str, prompt: str) -> None:
+        """Record a successful submission for the duplicate-submit guard."""
+        registry = getattr(getattr(self, "server", None), "turn_registry", None)
+        if isinstance(registry, _TurnRegistry):
+            registry.record(model, prompt)
+
     def _busy_models(self) -> list[str]:
         """Models whose tab is currently serving another request."""
         registry = getattr(getattr(self, "server", None), "model_locks", None)
@@ -618,21 +782,19 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         model: str,
         delta: dict,
         finish_reason: str | None = None,
+        usage: dict | None = None,
     ) -> None:
         """Write one OpenAI-compatible `chat.completion.chunk` SSE event."""
-        self._send_sse(
-            json.dumps(
-                {
-                    "id": completion_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model,
-                    "choices": [
-                        {"index": 0, "delta": delta, "finish_reason": finish_reason}
-                    ],
-                }
-            )
-        )
+        chunk: dict = {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+        }
+        if usage is not None:
+            chunk["usage"] = usage
+        self._send_sse(json.dumps(chunk))
 
     def _stream_web_chat(
         self,
@@ -654,13 +816,20 @@ class OpenAIHandler(BaseHTTPRequestHandler):
           * the site finishing after having been seen generating (`site_done`),
           * the payload going idle while the site is not generating (`idle`),
           * an unchanged payload outlasting the busy patience (`busy_timeout`),
+          * a reasoning-only stall outlasting the thinking patience
+            (`thinking_timeout`),
           * no output at all after the prompt (`no_output`),
           * the overall budget elapsing (`budget_exhausted`).
 
-        Truncation guard: web chats pause routinely mid-answer, so an unchanged
-        payload is not treated as finished while the site still claims to be
-        generating. The busy patience is what stops that tolerance from turning
-        into an indefinite hang.
+        The termination rules themselves live in ResponsePoller, shared with
+        the non-streaming `wait_for_response` loop so both paths agree by
+        construction. This loop adds the streaming specifics: SSE deltas,
+        the role announcement, and keepalive comments during silence.
+
+        Truncation guard: web chats pause routinely mid-answer, so an
+        unchanged payload is not treated as finished while the site still
+        claims to be generating. The busy patience is what stops that
+        tolerance from turning into an indefinite hang.
         """
         setting = self._server_setting
         idle_timeout = float(
@@ -682,13 +851,21 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         )
         started_at = time.monotonic()
         deadline = started_at + max(float(browser_timeout), 1.0)
+        poller = ResponsePoller(
+            baseline=baseline,
+            idle_timeout=idle_timeout,
+            done_confirm=done_confirm,
+            busy_patience=busy_patience,
+            thinking_patience=thinking_patience,
+            first_token_timeout=first_token_timeout,
+            started_at=started_at,
+            logger=_stream_logger,
+            context={"model": model},
+        )
         last_content = ""
         last_thinking = ""
         role_sent = False
-        saw_busy = False
-        got_output = False
-        last_change_at: float | None = None
-        last_keepalive_at: float = started_at
+        last_keepalive_at = started_at
         response = {
             "found": False,
             "content": "",
@@ -714,129 +891,38 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                 # instead of holding the browser lock until the deadline.
                 raise BrowserError(f"Response capture failed: {e}") from e
 
+            stop = poller.observe(response, time.monotonic())
             content = response.get("content") or ""
             thinking = response.get("thinking") or ""
-            busy = bool(response.get("busy"))
-            if busy:
-                saw_busy = True
 
-            is_new = self._is_new_response(response, baseline)
-            if is_new and (content or thinking):
-                got_output = True
+            if poller.is_new:
+                delta: dict[str, Any] = {}
+                if not role_sent:
+                    # Announce the role on the first chunk even when it only
+                    # carries reasoning, so thinking-only turns stay valid.
+                    delta["role"] = "assistant"
+                    role_sent = True
+                if content != last_content:
+                    delta["content"] = _stream_delta(content, last_content)
+                    last_content = content
+                if thinking and thinking != last_thinking:
+                    delta["thinking"] = _stream_delta(thinking, last_thinking)
+                    # OpenAI-compatible clients look for `reasoning_content` in the
+                    # delta; surface the same growing trace there too.
+                    delta["reasoning_content"] = delta["thinking"]
+                    last_thinking = thinking
 
-            if not is_new:
-                # Nothing new on screen yet. Never spin silently: if the web
-                # chat has produced nothing at all, say so and stop, instead
-                # of holding the tab until the budget runs out.
-                if not got_output and now - started_at >= first_token_timeout:
-                    return finish("no_output", done=False)
-                if now - last_keepalive_at >= keepalive_interval:
-                    # A long silence reads as a dead connection; an SSE
-                    # comment keeps the client (and any proxy) satisfied.
-                    self._send_sse_comment()
-                    last_keepalive_at = now
-                time.sleep(poll_interval)
-                continue
+                if delta:
+                    self._sse_chunk(completion_id, created, model, delta)
 
-            delta: dict[str, Any] = {}
-            if not role_sent:
-                # Announce the role on the first chunk even when it only
-                # carries reasoning, so thinking-only turns stay valid.
-                delta["role"] = "assistant"
-                role_sent = True
-            changed = False
-            if content != last_content:
-                changed = True
-                delta["content"] = content.removeprefix(last_content)
-                last_content = content
-            if thinking and thinking != last_thinking:
-                changed = True
-                delta["thinking"] = thinking.removeprefix(last_thinking)
-                # OpenAI-compatible clients look for `reasoning_content` in the
-                # delta; surface the same growing trace there too.
-                delta["reasoning_content"] = delta["thinking"]
-                last_thinking = thinking
+            if stop is not None:
+                return finish(stop, done=stop in ("site_done", "idle"))
 
-            if delta:
-                self._sse_chunk(completion_id, created, model, delta)
-
-            now = time.monotonic()
-            if changed:
-                # Track only real payload movement. Resetting on `busy` as
-                # well made the elapsed time always ~0, so the busy-patience
-                # guard could never fire and a site with a stuck spinner held
-                # the tab until the budget ran out.
-                last_change_at = now
-                _stream_logger.debug(
-                    "stream_state: payload_changed",
-                    extra={
-                        "model": model,
-                        "content_len": len(content),
-                        "thinking_len": len(thinking),
-                        "busy": busy,
-                        "done": response.get("done"),
-                        "count": response.get("count"),
-                    },
-                )
-            stable_for = now - last_change_at if last_change_at is not None else 0.0
-
-            if (
-                saw_busy
-                and not busy
-                and response.get("done")
-                and stable_for >= done_confirm
-            ):
-                _stream_logger.debug(
-                    "stream_state: done_after_stable",
-                    extra={"model": model, "stable_for": stable_for},
-                )
-                return finish("site_done")
-            if not busy and (content or thinking) and stable_for >= idle_timeout:
-                _stream_logger.debug(
-                    "stream_state: idle_complete",
-                    extra={"model": model, "stable_for": stable_for},
-                )
-                return finish("idle")
-            # A stall while the site still reports generating. A thinking-only
-            # stall (content empty, reasoning present) gets far more patience
-            # than an answer stall: reasoning traces pause naturally between
-            # chunks and thinking models think for minutes, so use
-            # thinking_patience instead of busy_patience for that case.
-            if busy and (content or thinking):
-                thinking_only = not content and bool(thinking)
-                patience = thinking_patience if thinking_only else busy_patience
-                if stable_for >= patience:
-                    _stream_logger.debug(
-                        "stream_state: "
-                        + ("thinking_timeout" if thinking_only else "busy_timeout"),
-                        extra={
-                            "model": model,
-                            "stable_for": stable_for,
-                            "patience": patience,
-                            "thinking_only": thinking_only,
-                        },
-                    )
-                    return finish(
-                        "thinking_timeout" if thinking_only else "busy_timeout",
-                        done=False,
-                    )
-            if not got_output and now - started_at >= first_token_timeout:
-                _stream_logger.debug(
-                    "stream_state: no_output",
-                    extra={"model": model, "elapsed": now - started_at},
-                )
-                return finish("no_output", done=False)
-            _stream_logger.debug(
-                "stream_state: polling",
-                extra={
-                    "model": model,
-                    "busy": busy,
-                    "done": response.get("done"),
-                    "content_len": len(content),
-                    "thinking_len": len(thinking),
-                    "stable_for": stable_for,
-                },
-            )
+            if not poller.is_new and now - last_keepalive_at >= keepalive_interval:
+                # A long silence reads as a dead connection; an SSE
+                # comment keeps the client (and any proxy) satisfied.
+                self._send_sse_comment()
+                last_keepalive_at = now
             time.sleep(poll_interval)
 
     def _handle_streaming_chat_completions(
@@ -901,10 +987,76 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                     error_type="extraction_unsupported",
                 )
                 return
-            baseline = capture_response(page, extraction)
-            status, page = self._inject_and_submit_with_recovery(
-                page, model, site_id, prompt, tab_index
-            )
+            duplicate = self._duplicate_turn(model, prompt)
+            if duplicate:
+                # An identical prompt was just submitted on this tab (a client
+                # retry train: SSE reconnect, fetch/proxy retry). Re-sending it
+                # would post the prompt in a loop. Attach to the turn already
+                # on screen: if its answer is up, hand it straight back; if it
+                # is still generating (or nothing has appeared yet), follow it
+                # from this capture onward without re-injecting.
+                logger.warning(
+                    "chat_completion duplicate_prompt_suppressed",
+                    extra={
+                        "model": model,
+                        "tab_index": tab_index,
+                        "request_id": request_id,
+                        "stream": True,
+                    },
+                )
+                attach = capture_response(page, extraction)
+                status = {
+                    "tab": tab_index,
+                    "inject": "OK (duplicate suppressed)",
+                    "submit": "OK (duplicate suppressed)",
+                }
+                if not attach.get("busy") and (attach.get("content") or "").strip():
+                    self._send_sse_headers(request_id)
+                    headers_sent = True
+                    delta: dict[str, Any] = {"role": "assistant"}
+                    attached_thinking = (attach.get("thinking") or "").strip()
+                    if attached_thinking:
+                        delta["thinking"] = attached_thinking
+                        # OpenAI-compatible clients look for
+                        # `reasoning_content` in the delta.
+                        delta["reasoning_content"] = attached_thinking
+                    delta["content"] = attach["content"]
+                    self._sse_chunk(completion_id, created, model, delta)
+                    final_usage = _usage_fields(
+                        prompt, attach["content"], attached_thinking or None
+                    )
+                    self._sse_chunk(
+                        completion_id,
+                        created,
+                        model,
+                        {},
+                        finish_reason="stop",
+                        usage=final_usage,
+                    )
+                    self._send_sse("[DONE]")
+                    elapsed = time.monotonic() - request_start
+                    logger.info(
+                        "chat_completion stream_end",
+                        extra={
+                            "model": model,
+                            "site_id": site_id,
+                            "tab_index": tab_index,
+                            "request_id": request_id,
+                            "stream": True,
+                            "stop_reason": "duplicate_attached",
+                            "duration_ms": int(elapsed * 1000),
+                            "chars": len(attach["content"]),
+                            "has_thinking": bool(attached_thinking),
+                        },
+                    )
+                    _update_metrics(elapsed, error=False)
+                    return
+                baseline = attach
+            else:
+                baseline = capture_response(page, extraction)
+                status, page = self._inject_and_submit_with_recovery(
+                    page, model, site_id, prompt, tab_index
+                )
             if not isinstance(status, dict):
                 logger.error(
                     "chat_completion invalid_status",
@@ -964,11 +1116,15 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                     error_type="browser_error",
                 )
                 return
-            if status.get("inject") != "OK" or status.get("submit") not in {
-                "OK",
-                "ENTER_SENT",
-                "ENTER_SENT_UNVERIFIED",
-            }:
+            if not duplicate and (
+                status.get("inject") != "OK"
+                or status.get("submit")
+                not in {
+                    "OK",
+                    "ENTER_SENT",
+                    "ENTER_SENT_UNVERIFIED",
+                }
+            ):
                 logger.warning(
                     "chat_completion inject_submit_failed",
                     extra={
@@ -988,6 +1144,7 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                     f"Try refreshing the browser tab or restarting sbsllm.",
                     "server_error",
                     request_id,
+                    code="inject_submit_failed",
                 )
                 _update_metrics(
                     time.monotonic() - request_start,
@@ -995,6 +1152,10 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                     error_type="inject_submit_failed",
                 )
                 return
+            if not duplicate:
+                # Only a real submission arms the duplicate-submit guard; a
+                # suppressed duplicate already slid the window forward.
+                self._record_turn(model, prompt)
             if not extraction:
                 self._send_error(
                     502,
@@ -1022,6 +1183,8 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                 model,
                 browser_timeout,
             )
+            content = response.get("content") or ""
+            thinking = response.get("thinking")
             stop_reason = response.get("stop_reason", "unknown")
             stopped_cleanly = bool(response.get("done"))
             elapsed = time.monotonic() - request_start
@@ -1080,12 +1243,16 @@ class OpenAIHandler(BaseHTTPRequestHandler):
 
             # Always finish the stream: a terminal chunk followed by the
             # [DONE] sentinel. Without this the local chat kept waiting.
+            # Include usage on the final chunk so OpenAI-compatible clients
+            # that parse streaming responses receive token estimates.
+            final_usage = _usage_fields(prompt, content, thinking)
             self._sse_chunk(
                 completion_id,
                 created,
                 model,
                 {},
                 finish_reason="stop" if stopped_cleanly else "length",
+                usage=final_usage,
             )
             self._send_sse("[DONE]")
             headers_sent = True
@@ -1320,6 +1487,7 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                 f"Use GET /v1/models to list available models.",
                 "invalid_request_error",
                 request_id=request_id,
+                code="model_not_found",
             )
             return
 
@@ -1418,34 +1586,97 @@ class OpenAIHandler(BaseHTTPRequestHandler):
 
         status = None
         response_result = None
+        duplicate = self._duplicate_turn(model, prompt)
+        if duplicate:
+            # An identical prompt was just submitted on this tab (a client
+            # retry train). Re-sending it would post the prompt in a loop:
+            # attach to the turn already on screen instead -- its finished
+            # answer is returned directly, an in-flight one is followed
+            # without re-injecting.
+            logger.warning(
+                "chat_completion duplicate_prompt_suppressed",
+                extra={
+                    "model": model,
+                    "tab_index": tab_index,
+                    "request_id": request_id,
+                    "stream": False,
+                },
+            )
         try:
             extraction = extract_js(site_id)
-            baseline = capture_response(page, extraction) if extraction else None
-            status, page = self._inject_and_submit_with_recovery(
-                page, model, site_id, prompt, tab_index
-            )
-            if (
-                isinstance(status, dict)
-                and status.get("inject") == "OK"
-                and status.get("submit")
-                in {"OK", "ENTER_SENT", "ENTER_SENT_UNVERIFIED"}
-                and extraction
-            ):
-                response_result = wait_for_response(
-                    page,
-                    extraction,
-                    browser_timeout,
-                    idle_timeout=self._server_setting(
-                        "response_idle_timeout", DEFAULT_RESPONSE_IDLE_TIMEOUT
-                    ),
-                    poll_interval=self._server_setting(
-                        "poll_interval", DEFAULT_POLL_INTERVAL
-                    ),
-                    thinking_patience=self._server_setting(
-                        "thinking_patience", DEFAULT_THINKING_PATIENCE
-                    ),
-                    baseline=baseline,
+            if duplicate:
+                status = {
+                    "tab": tab_index,
+                    "inject": "OK (duplicate suppressed)",
+                    "submit": "OK (duplicate suppressed)",
+                }
+                if extraction:
+                    attach = capture_response(page, extraction)
+                    if not attach.get("busy") and (attach.get("content") or "").strip():
+                        response_result = attach
+                    else:
+                        response_result = wait_for_response(
+                            page,
+                            extraction,
+                            browser_timeout,
+                            idle_timeout=self._server_setting(
+                                "response_idle_timeout", DEFAULT_RESPONSE_IDLE_TIMEOUT
+                            ),
+                            poll_interval=self._server_setting(
+                                "poll_interval", DEFAULT_POLL_INTERVAL
+                            ),
+                            done_confirm=self._server_setting(
+                                "response_done_confirm", DEFAULT_RESPONSE_DONE_CONFIRM
+                            ),
+                            thinking_patience=self._server_setting(
+                                "thinking_patience", DEFAULT_THINKING_PATIENCE
+                            ),
+                            busy_patience=self._server_setting(
+                                "busy_patience", DEFAULT_BUSY_PATIENCE
+                            ),
+                            first_token_timeout=self._server_setting(
+                                "first_token_timeout", DEFAULT_FIRST_TOKEN_TIMEOUT
+                            ),
+                            baseline=attach,
+                        )
+            else:
+                baseline = capture_response(page, extraction) if extraction else None
+                status, page = self._inject_and_submit_with_recovery(
+                    page, model, site_id, prompt, tab_index
                 )
+                if (
+                    isinstance(status, dict)
+                    and status.get("inject") == "OK"
+                    and status.get("submit")
+                    in {"OK", "ENTER_SENT", "ENTER_SENT_UNVERIFIED"}
+                    and extraction
+                ):
+                    # Only a real submission arms the duplicate-submit guard.
+                    self._record_turn(model, prompt)
+                    response_result = wait_for_response(
+                        page,
+                        extraction,
+                        browser_timeout,
+                        idle_timeout=self._server_setting(
+                            "response_idle_timeout", DEFAULT_RESPONSE_IDLE_TIMEOUT
+                        ),
+                        poll_interval=self._server_setting(
+                            "poll_interval", DEFAULT_POLL_INTERVAL
+                        ),
+                        done_confirm=self._server_setting(
+                            "response_done_confirm", DEFAULT_RESPONSE_DONE_CONFIRM
+                        ),
+                        thinking_patience=self._server_setting(
+                            "thinking_patience", DEFAULT_THINKING_PATIENCE
+                        ),
+                        busy_patience=self._server_setting(
+                            "busy_patience", DEFAULT_BUSY_PATIENCE
+                        ),
+                        first_token_timeout=self._server_setting(
+                            "first_token_timeout", DEFAULT_FIRST_TOKEN_TIMEOUT
+                        ),
+                        baseline=baseline,
+                    )
         except BrowserError as e:
             elapsed = time.monotonic() - request_start
             snapshot = get_page_snapshot(page)
@@ -1600,11 +1831,15 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                 time.monotonic() - request_start, error=True, error_type="browser_error"
             )
             return
-        if status.get("inject") != "OK" or status.get("submit") not in {
-            "OK",
-            "ENTER_SENT",
-            "ENTER_SENT_UNVERIFIED",
-        }:
+        if not duplicate and (
+            status.get("inject") != "OK"
+            or status.get("submit")
+            not in {
+                "OK",
+                "ENTER_SENT",
+                "ENTER_SENT_UNVERIFIED",
+            }
+        ):
             logger.warning(
                 "chat_completion inject_submit_failed",
                 extra={
@@ -1633,6 +1868,7 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                 model=model,
                 site_id=site_id,
                 tab_index=tab_index,
+                code="inject_submit_failed",
             )
             _update_metrics(
                 time.monotonic() - request_start,
@@ -1660,7 +1896,43 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                     error_type="extraction_unsupported",
                 )
                 return
-            if response_result.get("timed_out"):
+            if response_result.get("timed_out") or response_result.get("busy_timeout"):
+                partial = response_result.get("content") or ""
+                partial_thinking = response_result.get("thinking") or ""
+                if partial.strip() or partial_thinking.strip():
+                    # Budget ran out (or the site kept claiming to
+                    # generate without changing its text) but a
+                    # non-blank answer is on screen: hand it back as
+                    # a truncated answer (finish_reason="length")
+                    # instead of a bare 504 that loses it. Mirrors
+                    # the streaming path and OpenAI's own max_tokens
+                    # truncation behavior. A whitespace-only capture
+                    # is "nothing captured" and still falls through
+                    # to the 504 below.
+                    response = self._build_completion_response(
+                        model,
+                        prompt,
+                        partial,
+                        partial_thinking,
+                        "length",
+                        request_id,
+                    )
+                    elapsed = time.monotonic() - request_start
+                    logger.warning(
+                        "chat_completion timeout_partial_returned",
+                        extra={
+                            "model": model,
+                            "site_id": site_id,
+                            "tab_index": tab_index,
+                            "request_id": request_id,
+                            "content_len": len(partial),
+                            "thinking_len": len(partial_thinking),
+                            "has_thinking": bool(partial_thinking),
+                        },
+                    )
+                    _update_metrics(elapsed, error=False)
+                    self._send_json(200, response, request_id)
+                    return
                 self._send_error(
                     504,
                     f"Request timeout: the {site_id} assistant response was not "
@@ -1671,9 +1943,49 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                     model=model,
                     site_id=site_id,
                     tab_index=tab_index,
+                    code="response_timeout",
                 )
                 _update_metrics(
                     time.monotonic() - request_start, error=True, error_type="timeout"
+                )
+                return
+            if response_result.get("no_output"):
+                # The page stayed alive but never produced any
+                # answer or reasoning trace within the first-token
+                # window. Say so plainly instead of spinning until
+                # the whole budget (and instead of a 200 with
+                # empty content).
+                first_token_timeout = self._server_setting(
+                    "first_token_timeout", DEFAULT_FIRST_TOKEN_TIMEOUT
+                )
+                logger.warning(
+                    "chat_completion no_output",
+                    extra={
+                        "model": model,
+                        "site_id": site_id,
+                        "tab_index": tab_index,
+                        "request_id": request_id,
+                        "first_token_timeout": first_token_timeout,
+                    },
+                )
+                self._send_error(
+                    504,
+                    f"The {site_id} page produced no answer within "
+                    f"{first_token_timeout:g}s of submitting the prompt. "
+                    f"Check the browser tab is logged in, that the message "
+                    f"was actually sent, and that the response selectors "
+                    f"in sites.py still match the page.",
+                    "server_error",
+                    request_id,
+                    model=model,
+                    site_id=site_id,
+                    tab_index=tab_index,
+                    code="response_timeout",
+                )
+                _update_metrics(
+                    time.monotonic() - request_start,
+                    error=True,
+                    error_type="no_output",
                 )
                 return
             if not response_result.get("found"):
@@ -1719,6 +2031,7 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                     model=model,
                     site_id=site_id,
                     tab_index=tab_index,
+                    code="response_timeout",
                 )
                 _update_metrics(
                     time.monotonic() - request_start,
@@ -1750,35 +2063,9 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             )
             return
 
-        response = {
-            "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "model": model,
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": content,
-                        **({"reasoning_content": thinking} if thinking else {}),
-                    },
-                    "finish_reason": "stop",
-                }
-            ],
-            "usage": {
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "total_tokens": 0,
-            },
-            "request_id": request_id,
-        }
-        if thinking:
-            # Keep the custom top-level `thinking` field for existing sbsllm
-            # clients, but also expose the trace in the OpenAI-standard location
-            # (choices[0].message.reasoning_content) so OpenAI-compatible
-            # consumers that parse the message object see the reasoning trace.
-            response["thinking"] = thinking
+        response = self._build_completion_response(
+            model, prompt, content, thinking, "stop", request_id
+        )
 
         elapsed = time.monotonic() - request_start
         logger.info(
@@ -1794,6 +2081,50 @@ class OpenAIHandler(BaseHTTPRequestHandler):
 
         _update_metrics(elapsed, error=False)
         self._send_json(200, response, request_id)
+
+    def _build_completion_response(
+        self,
+        model: str,
+        prompt: str,
+        content: str,
+        thinking: str,
+        finish_reason: str,
+        request_id: str,
+    ) -> dict:
+        """Build an OpenAI chat.completion body with estimated token usage.
+
+        Used by the non-streaming path for both the normal response
+        (``finish_reason="stop"``) and the truncated-on-timeout fallback
+        (``finish_reason="length"``, mirroring how OpenAI signals a
+        ``max_tokens`` cutoff).
+        """
+        thinking = thinking or ""
+        response = {
+            "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": content,
+                        **({"reasoning_content": thinking} if thinking else {}),
+                    },
+                    "finish_reason": finish_reason,
+                }
+            ],
+            "usage": _usage_fields(prompt, content, thinking),
+            "request_id": request_id,
+        }
+        if thinking:
+            # Keep the custom top-level `thinking` field for existing sbsllm
+            # clients, but also expose the trace in the OpenAI-standard location
+            # (choices[0].message.reasoning_content) so OpenAI-compatible
+            # consumers that parse the message object see the reasoning trace.
+            response["thinking"] = thinking
+        return response
 
     def _build_prompt(self, messages: list[dict]) -> str:
         """Build a prompt string from OpenAI messages format."""
@@ -1860,9 +2191,26 @@ class Server:
         first_token_timeout: float = DEFAULT_FIRST_TOKEN_TIMEOUT,
         keepalive_interval: float = DEFAULT_KEEPALIVE_INTERVAL,
         poll_interval: float = DEFAULT_POLL_INTERVAL,
+        duplicate_prompt_cooldown: float = DEFAULT_DUPLICATE_PROMPT_COOLDOWN,
     ):
         self.model_map = model_map or {}
         self.tab_map = tab_map or {}
+        # Fail fast on mappings that can never work: an unknown
+        # site id only surfaces per-request as a 500, long after
+        # the operator has walked away. The config layer already
+        # validates `chats`; this guards programmatic callers.
+        unknown_sites = sorted(
+            {site_id for site_id in self.model_map.values() if site_id not in SITES}
+        )
+        if unknown_sites:
+            logger = logging.getLogger(__name__)
+            logger.warning(
+                "server unknown_site_in_model_map",
+                extra={
+                    "unknown_sites": unknown_sites,
+                    "available": sorted(SITES),
+                },
+            )
         self.host = host
         self.port = port
         self.browser_timeout = browser_timeout
@@ -1875,6 +2223,7 @@ class Server:
         self.first_token_timeout = max(float(first_token_timeout), 0.1)
         self.keepalive_interval = max(float(keepalive_interval), 0.1)
         self.poll_interval = max(float(poll_interval), 0.01)
+        self.duplicate_prompt_cooldown = max(float(duplicate_prompt_cooldown), 0.0)
         self._server: _SBSHTTPServer | None = None
         self._ready = threading.Event()
         self._startup_error: BaseException | None = None
@@ -1882,6 +2231,7 @@ class Server:
         self._stop_requested = threading.Event()
         self._state_lock = threading.Lock()
         self.model_locks = _ModelLockRegistry()
+        self.turn_registry = _TurnRegistry()
         self._health_thread: threading.Thread | None = None
         self._shutdown_initiated = False
         self._signal_handler_installed = False
@@ -1960,7 +2310,9 @@ class Server:
             # Handlers resolve these via `self.server`; without them they
             # silently fell back to defaults.
             server.model_locks = self.model_locks
+            server.turn_registry = self.turn_registry
             server.browser_lock_timeout = self.browser_lock_timeout
+            server.duplicate_prompt_cooldown = self.duplicate_prompt_cooldown
             server.browser_timeout = self.browser_timeout
             server.response_idle_timeout = self.response_idle_timeout
             server.response_done_confirm = self.response_done_confirm
@@ -2121,6 +2473,7 @@ def create_server(
     first_token_timeout: float = DEFAULT_FIRST_TOKEN_TIMEOUT,
     keepalive_interval: float = DEFAULT_KEEPALIVE_INTERVAL,
     poll_interval: float = DEFAULT_POLL_INTERVAL,
+    duplicate_prompt_cooldown: float = DEFAULT_DUPLICATE_PROMPT_COOLDOWN,
 ) -> Server:
     """Create a new server instance."""
     return Server(
@@ -2138,4 +2491,5 @@ def create_server(
         first_token_timeout=first_token_timeout,
         keepalive_interval=keepalive_interval,
         poll_interval=poll_interval,
+        duplicate_prompt_cooldown=duplicate_prompt_cooldown,
     )

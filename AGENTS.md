@@ -65,6 +65,18 @@ browser tab on a specific chat website (configured via `model_map`).
 
 ### Known fixes
 
+- **Extraction keeps paragraph breaks**: answers are normalised with
+  `normalize()` (per-line squash, blank runs collapsed) instead of a
+  whole-text `squash()`, and detached clones are read with `blockTextOf()`
+  (block-boundary newlines, whitespace collapsed inside text nodes) because
+  `textContent` carries no layout-derived newlines. Multi-paragraph replies
+  no longer arrive as one run-on line.
+- **Streaming deltas survive site re-renders**: `_stream_delta` in
+  `server.py` replaces `str.removeprefix`. When a site re-renders
+  already-streamed text (z.ai dropped `**` mid-stream: `I'm **GLM` became
+  `I'm GLM`), the diff skips the shared prefix plus the longest run of new
+  text already present in the old content instead of re-sending the whole
+  message.
 - **Google AI Studio**: `inject` and `submit_js` now traverse Shadow DOM roots
   of `ms-prompt-box` / `ms-autosize-textarea` / `ms-run-button` web components.
 - **Zai chat**: URL changed to `https://chat.z.ai/` to avoid auth wall;
@@ -73,9 +85,49 @@ browser tab on a specific chat website (configured via `model_map`).
 - **Grok chat**: `inject` and `submit_js` now fall back to scanning shadow roots
   for the TipTap/ProseMirror editor and send button.
 - **Kimi URL**: Corrected to `https://www.kimi.ai/`.
+- **Browser worker lifecycle**: `_stop_browser_worker` no longer enqueues a
+  `None` shutdown sentinel when the worker is already dead (it left the
+  sentinel in the shared `_browser_queue`, so the next worker dequeued it and
+  exited immediately, surfacing as `RuntimeError("Browser worker stopped
+  before completing the operation")`). `_start_browser_worker` now drains stale
+  queue items before spawning a fresh worker, so a dead worker is restarted
+  transparently instead of failing the caller.
+- **Duplicate prompt loop**: one HTTP request injects and submits exactly
+  once, but clients that retry silently (SSE reconnect, fetch/proxy retry)
+  re-POST the identical request, and each POST re-sent the prompt — visible
+  as the same prompt repeating forever in the tab. A per-tab duplicate-submit
+  guard (`_TurnRegistry`, `duplicate_prompt_cooldown`, default 60s, `0`
+  disables) now attaches an identical prompt within the cooldown window to
+  the turn already on screen (returning its finished answer directly, or
+  following an in-flight one) instead of re-injecting. Suppressed duplicates
+  slide the window forward, so a retry train cannot re-send the prompt; a
+  deliberate re-send works again once the retries stop.
 
-### Design TODO
+### Duplicate prompt guard
 
-- Token usage counts (`prompt_tokens`, `completion_tokens`) are always 0.
-  A simple word-count heuristic could provide rough estimates.
-- The non-streaming path returns the full response at once; no chunked fallback.
+`duplicate_prompt_cooldown` (config, default 60s, `0` disables) arms the
+guard only on a *successful* submit. An identical prompt on the same tab
+within the window skips inject+submit entirely: if the answer is already on
+screen it is handed straight back; if the turn is still generating (or
+nothing has appeared yet) the request polls from the current capture onward.
+Each suppressed duplicate slides the window forward, so a retry train
+cannot out-wait the guard; once retries stop the entry ages out after one
+cooldown and re-sending the same prompt works again.
+
+### Non-streaming timeout fallback
+
+The non-streaming path returns the full response at once. If the browser
+budget runs out but a non-blank answer (or reasoning trace) is already on
+screen, it now returns the truncated answer with `finish_reason="length"` (a
+200, not an error) rather than a bare 504 — mirroring the streaming path and
+how OpenAI signals a `max_tokens` cutoff. A timeout that captured nothing (or
+only whitespace) still returns 504.
+
+### Token usage
+
+`prompt_tokens` / `completion_tokens` / `total_tokens` are estimated by
+`_estimate_tokens` in `server.py`: CJK characters (Han / Hiragana / Katakana /
+Hangul) count ~1 token each, everything else ~4 characters per token. Web chats
+expose no tokenizer, so these are ballpark figures for cost/progress display,
+not billing. Included on the final SSE chunk (streaming) and on the completion
+object (non-streaming).

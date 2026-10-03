@@ -18,33 +18,55 @@ import threading
 
 import pytest
 
-from sbsllm.inject import inject_prompt, submit_js
+from sbsllm.inject import extract_js, inject_prompt, submit_js
 from sbsllm.sites import SITES, _response_js
 
 pw = pytest.importorskip("playwright.sync_api")
 
 _ZAI = SITES["zai"]
 
+_GROK = SITES["grok"]
+
+
+@pytest.fixture(autouse=True)
+def _isolated_chrome_profile(monkeypatch, tmp_path_factory):
+    """Give every test in this module its own Chromium user-data directory.
+
+    The integration tests launch real headless Chromium. Two instances
+    locking the same profile is the classic "could not connect to browser"
+    hang, so without isolation the suite flakes whenever a previous test's
+    browser did not shut down cleanly. The default path is untouched for
+    the CLI; only tests see a private directory.
+    """
+    profile = tmp_path_factory.mktemp("sbsllm-profile-")
+    monkeypatch.setenv("SBSLLM_USER_DATA_DIR", str(profile))
+    yield
+
 _MOCK_PAGE_HTML = """<!doctype html>
 <html><head><meta charset="utf-8"><title>mock zai</title></head>
 <body>
   <form id="chat-form">
     <textarea id="chat-input" placeholder="Ask anything"></textarea>
-    <button type="submit" id="send-btn">Send</button>
+    <button type="submit" id="send-message-button">Send</button>
   </form>
   <div id="response-content-container">
     <div class="markdown-prose"></div>
   </div>
   <script>
-    var sendBtn = document.getElementById('send-btn');
+    var sendBtn = document.getElementById('send-message-button');
     var form = document.getElementById('chat-form');
     var input = document.getElementById('chat-input');
     var container = document.querySelector('#response-content-container .markdown-prose');
+    // Track submit count so tests can assert exactly-once delivery.
+    window.__submitCount = 0;
+    window.__submitPrompts = [];
     input.addEventListener('input', function() {
       sendBtn.disabled = !this.value.trim();
     });
     form.addEventListener('submit', function(e) {
       e.preventDefault();
+      window.__submitCount++;
+      window.__submitPrompts.push(input.value);
       var prompt = input.value;
       container.innerHTML = '<div class="thinking-chain-container"><div class="thinking-body"><p>Thinking: ' + prompt + '</p></div></div>';
       var stop = document.createElement('button');
@@ -1093,5 +1115,298 @@ class TestZaiPostInject:
                 assert "thinking" not in final["content"].lower(), (
                     f"thinking leaked into answer: {final['content']!r}"
                 )
+
+                # 7. The form must have been submitted exactly once.
+                submit_count = page.evaluate("window.__submitCount")
+                assert submit_count == 1, (
+                    f"form submitted {submit_count} times; expected exactly 1 "
+                    "(double-send bug)"
+                )
+            finally:
+                browser.close()
+
+    def test_zai_submit_sends_exactly_once(self, mock_server):
+        """The full inject + post_inject + submit flow must submit the form
+        exactly once.
+
+        This is the regression test for the z.ai double-send bug: previously
+        post_inject_js dispatched Enter key events, which triggered the form's
+        native submit handler BEFORE submit_js clicked the send button,
+        resulting in two submissions. The fix removed Enter dispatch from
+        post_inject_js; this test asserts the form is submitted exactly once.
+        """
+        with pw.sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+            page = browser.new_page()
+            page.goto(mock_server, wait_until="networkidle")
+            try:
+                prompt = "double-send regression test"
+
+                # Run the full inject (which includes post_inject_js).
+                inject_status = page.evaluate(inject_prompt("zai", prompt))
+                assert inject_status == "OK", f"inject failed: {inject_status}"
+
+                # Verify the prompt was set.
+                val = page.evaluate(
+                    "document.getElementById('chat-input').value"
+                )
+                assert prompt in val, f"prompt not in input: {val!r}"
+
+                # Submit via the real z.ai submit template.
+                submit_status = page.evaluate(_ZAI["submit_js"])
+                assert submit_status == "OK", f"submit failed: {submit_status}"
+
+                # The form must have been submitted exactly once.
+                submit_count = page.evaluate("window.__submitCount")
+                assert submit_count == 1, (
+                    f"form submitted {submit_count} times; expected exactly 1 "
+                    "(double-send bug)"
+                )
+                # And the submitted prompt must match.
+                submitted_prompts = page.evaluate("window.__submitPrompts")
+                assert submitted_prompts == [prompt], (
+                    f"unexpected submitted prompts: {submitted_prompts!r}"
+                )
+            finally:
+                browser.close()
+
+
+_KIMI = SITES["kimi"]
+_KIMI_MOCK_PAGE_HTML = """<!doctype html>
+<html><head><meta charset="utf-8"><title>mock kimi</title></head>
+<body>
+  <form id="kimi-form">
+    <div id="input-root">
+      <div class="chat-input-editor" data-sbsllm-input="true"
+           data-sbsllm-value=""
+           contenteditable="true"
+           placeholder="What would you like to know">
+      </div>
+    </div>
+    <button type="submit" id="kimi-send">Send</button>
+  </form>
+  <div id="kimi-conversation"></div>
+  <script>
+    var form = document.getElementById('kimi-form');
+    var input = document.querySelector('div.chat-input-editor[contenteditable="true"]');
+    var convo = document.getElementById('kimi-conversation');
+    var sendBtn = document.getElementById('kimi-send');
+    function syncValue() {
+      input.dataset.sbsllmValue = input.innerText || '';
+      var marked = document.querySelector('[data-sbsllm-input="true"]');
+      if (marked) marked.dataset.sbsllmValue = input.innerText || '';
+    }
+    input.addEventListener('input', syncValue);
+    form.addEventListener('submit', function(e) {
+      e.preventDefault();
+      var prompt = input.innerText || '';
+      var stop = document.createElement('button');
+      stop.setAttribute('aria-label', 'Stop generating');
+      stop.textContent = 'Stop';
+      document.body.appendChild(stop);
+      setTimeout(function() {
+        var msg = document.createElement('div');
+        msg.setAttribute('data-role', 'assistant');
+        var markdown = document.createElement('div');
+        markdown.className = 'markdown';
+        markdown.textContent = 'Kimi received: ' + prompt;
+        msg.appendChild(markdown);
+        convo.appendChild(msg);
+        stop.remove();
+      }, 400);
+    });
+  </script>
+</body></html>
+"""
+
+
+class _KimiHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(_KIMI_MOCK_PAGE_HTML.encode())
+
+    def log_message(self, *args):
+        pass
+
+
+@pytest.fixture(scope="module")
+def mock_kimi_server():
+    with socketserver.TCPServer(("127.0.0.1", 0), _KimiHandler) as httpd:
+        port = httpd.server_address[1]
+        url = f"http://127.0.0.1:{port}"
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        yield url
+    thread.join(timeout=5)
+
+
+# --- Shadow-DOM extraction tests ---
+
+# Several supported sites (Google AI Studio's ms-* web components, custom
+# elements on z.ai / grok) render the assistant answer inside a web
+# component's Shadow DOM. document.querySelector cannot reach into shadow
+# roots, so a light-DOM-only scan returned nothing and the server reported
+# "no output" on a perfectly healthy reply. This mock mirrors that structure.
+_SHADOW_MOCK_PAGE_HTML = """<!doctype html>
+<html><head><meta charset="utf-8"><title>mock shadow</title></head>
+<body>
+  <h1>Shadow host page</h1>
+  <my-chat-turn data-turn-role="model">
+    <!-- The real content lives in the component's shadow root. -->
+  </my-chat-turn>
+  <my-chat-turn data-turn-role="user">
+  </my-chat-turn>
+  <script>
+    class MyChatTurn extends HTMLElement {
+      connectedCallback() {
+        const root = this.attachShadow({ mode: 'open' });
+        const role = this.getAttribute('data-turn-role');
+        if (role === 'model') {
+          const prose = document.createElement('div');
+          prose.className = 'prose-chat';
+          prose.textContent = 'Answer from inside the shadow DOM';
+          const stop = document.createElement('button');
+          stop.setAttribute('aria-label', 'Stop generating');
+          root.appendChild(prose);
+          root.appendChild(stop);
+        } else {
+          const prose = document.createElement('div');
+          prose.className = 'prose-chat';
+          prose.textContent = 'User turn';
+          root.appendChild(prose);
+        }
+      }
+    }
+    customElements.define('my-chat-turn', MyChatTurn);
+  </script>
+</body></html>
+"""
+
+
+class _ShadowHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(_SHADOW_MOCK_PAGE_HTML.encode())
+
+    def log_message(self, *args):
+        pass
+
+
+@pytest.fixture(scope="module")
+def mock_shadow_server():
+    with socketserver.TCPServer(("127.0.0.1", 0), _ShadowHandler) as httpd:
+        port = httpd.server_address[1]
+        url = f"http://127.0.0.1:{port}"
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        yield url
+    thread.join(timeout=5)
+
+
+class TestShadowDomExtraction:
+    """The response extraction JS must reach into web-component shadow roots.
+
+    Regression guard: a light-DOM-only scan returned ``found: false`` for
+    every site whose assistant turn renders inside a shadow tree, which made
+    the server report "no output" on replies that were fully on screen.
+    """
+
+    def test_extraction_finds_answer_inside_shadow_root(self, mock_shadow_server):
+        with pw.sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+            page = browser.new_page()
+            page.goto(mock_shadow_server, wait_until="networkidle")
+            try:
+                extraction = _response_js(
+                    ["[data-turn-role='model'] .prose-chat"],
+                    ["[class*='thinking']"],
+                    [],
+                    [],
+                )
+                result = page.evaluate(extraction)
+                assert result["found"] is True, (
+                    f"extraction missed shadow-DOM answer: {result}"
+                )
+                assert "shadow DOM" in result["content"], (
+                    f"wrong content: {result['content']!r}"
+                )
+                assert result["busy"] is False
+            finally:
+                browser.close()
+
+    def test_extraction_falls_back_to_shadow_when_light_dom_empty(
+        self, mock_shadow_server
+    ):
+        """A selector that matches nothing in the light DOM must still find
+        the answer by walking shadow roots."""
+        with pw.sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+            page = browser.new_page()
+            page.goto(mock_shadow_server, wait_until="networkidle")
+            try:
+                # `.chat-turn-container .prose-chat` matches nothing in the
+                # light DOM (the host element has no children) but does match
+                # inside the component's shadow root.
+                extraction = _response_js(
+                    [".chat-turn-container .prose-chat"],
+                    [],
+                    [],
+                    [],
+                )
+                result = page.evaluate(extraction)
+                assert result["found"] is True, (
+                    f"shadow fallback failed: {result}"
+                )
+                assert "shadow DOM" in result["content"]
+            finally:
+                browser.close()
+
+
+class TestKimiIntegration:
+    """kimi.ai uses a `div.chat-input-editor[contenteditable="true"]`
+    composite editor. The inject + post_inject (contenteditable sync) +
+    submit JS must cooperate to set the prompt and click send, and the
+    response selectors must read the answer back (without leaking any
+    thinking-chain element)."""
+
+    def test_kimi_inject_targets_contenteditable_editor(self, mock_kimi_server):
+        """inject_prompt must find the contenteditable editor and mark it."""
+        with pw.sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+            page = browser.new_page()
+            page.goto(mock_kimi_server, wait_until="networkidle")
+            try:
+                status = page.evaluate(inject_prompt("kimi", "kimi test prompt"))
+                assert status == "OK", f"inject should find editor, got {status}"
+                has_marker = page.evaluate(
+                    "!!document.querySelector('[data-sbsllm-input=\"true\"]')"
+                )
+                assert has_marker, "editor should be marked after inject"
+            finally:
+                browser.close()
+
+    def test_kimi_full_cycle(self, mock_kimi_server):
+        """inject -> submit -> extract must round-trip on contenteditable
+        kimi like it does for the textarea-driven sites."""
+        with pw.sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+            page = browser.new_page()
+            page.goto(mock_kimi_server, wait_until="networkidle")
+            try:
+                assert page.evaluate(inject_prompt("kimi", "kimi full cycle")) == "OK"
+                assert page.evaluate(submit_js("kimi")) == "OK"
+                # Wait for the async 400ms response to land.
+                page.wait_for_function(
+                    "!!document.querySelector('[data-role=\"assistant\"]')",
+                    timeout=2000,
+                )
+                extracted = page.evaluate(extract_js("kimi"))
+                assert extracted["found"] is True, f"expected answer: {extracted}"
+                assert "kimi full cycle" in extracted["content"]
+                assert extracted["busy"] is False, "still busy after response"
             finally:
                 browser.close()

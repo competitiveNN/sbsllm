@@ -548,6 +548,7 @@ class TestRunServer:
                 browser_lock_timeout=300,
                 response_idle_timeout=3.0,
                 thinking_patience=120.0,
+                duplicate_prompt_cooldown=60.0,
             )
             mock_server.start.assert_called_once()
 
@@ -574,6 +575,7 @@ class TestRunServer:
                 browser_lock_timeout=300,
                 response_idle_timeout=3.0,
                 thinking_patience=120.0,
+                duplicate_prompt_cooldown=60.0,
             )
             mock_server.start.assert_called_once()
             url_calls = [

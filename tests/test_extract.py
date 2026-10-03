@@ -240,6 +240,68 @@ class TestZaiExtraction:
         assert result["thinking"] == "Reasoning here"
 
 
+class TestParagraphStructure:
+    """Answers must keep their paragraph breaks.
+
+    The extraction used to squash every whitespace run into one space, so
+    a multi-paragraph reply reached the local chat as a single run-on line.
+    """
+
+    def test_unpruned_answer_keeps_paragraph_breaks(self, extract_page):
+        html = """
+        <div id="response-content-container"><div class="markdown-prose">
+          <p>First paragraph.</p>
+          <p>Second paragraph.</p>
+        </div></div>
+        """
+        result = _extract(extract_page, html)
+        assert result["content"] == "First paragraph.\n\nSecond paragraph."
+
+    def test_pruned_answer_keeps_paragraph_breaks(self, extract_page):
+        """The prune path reads a detached clone, which has no layout and
+        therefore no block-boundary newlines; the walker must re-introduce
+        them from the DOM structure."""
+        html = """
+        <div id="response-content-container"><div class="markdown-prose">
+          <div class="thinking-chain-container">
+            <div><button>Thought Process</button></div>
+            <div class="thinking-body"><p>secret reasoning</p></div>
+          </div>
+          <p>First paragraph.</p>
+          <p>Second paragraph.</p>
+        </div></div>
+        """
+        result = _extract(extract_page, html)
+        assert result["content"] == "First paragraph.\n\nSecond paragraph."
+        assert "secret reasoning" not in result["content"]
+
+    def test_source_line_break_inside_paragraph_is_not_a_newline(self, extract_page):
+        """HTML source wrapping inside one <p> is not a paragraph break."""
+        html = """
+        <div id="response-content-container"><div class="markdown-prose">
+          <div class="thinking-chain-container">
+            <div><button>Thought Process</button></div>
+          </div>
+          <p>Wrapped source text
+          stays one line.</p>
+        </div></div>
+        """
+        result = _extract(extract_page, html)
+        assert result["content"] == "Wrapped source text stays one line."
+
+    def test_br_tag_breaks_the_line(self, extract_page):
+        html = """
+        <div id="response-content-container"><div class="markdown-prose">
+          <div class="thinking-chain-container">
+            <div><button>Thought Process</button></div>
+          </div>
+          <p>line one<br>line two</p>
+        </div></div>
+        """
+        result = _extract(extract_page, html)
+        assert result["content"] == "line one\nline two"
+
+
 class TestWorkingPrefixStripped:
     def test_working_prefix_is_removed_and_marks_streaming(self, extract_page):
         html = """

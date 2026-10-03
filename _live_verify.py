@@ -4,14 +4,17 @@ Inject only FILLS the input field (it does not click send), so it is safe to
 run against live sites. Reports the inject status and, on failure, what
 selectors/structures the page currently exposes.
 """
+
 from __future__ import annotations
 
 import sys
+import time
 import traceback
 
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import sync_playwright
 
-from sbsllm.inject import inject_prompt, extract_js
+from sbsllm.inject import extract_js, inject_prompt
 from sbsllm.sites import SITES
 
 TARGETS = ["grok", "zai", "google", "chatgpt", "claude", "deepseek", "qwen", "kimi"]
@@ -28,7 +31,8 @@ def safe_eval(page, expr):
 def main():
     with sync_playwright() as p:
         browser = p.chromium.launch(
-            headless=True, args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"]
+            headless=True,
+            args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"],
         )
         ctx = browser.new_context(
             user_agent=(
@@ -45,7 +49,10 @@ def main():
             try:
                 try:
                     resp = page.goto(url, wait_until="domcontentloaded", timeout=25000)
-                    print(f"  http_status={resp.status if resp else 'no-resp'}", flush=True)
+                    print(
+                        f"  http_status={resp.status if resp else 'no-resp'}",
+                        flush=True,
+                    )
                 except PlaywrightTimeoutError as e:
                     print(f"  NAV_TIMEOUT: {e!r}", flush=True)
                     results_summary(site_id, {"error": "nav_timeout"})
@@ -56,11 +63,8 @@ def main():
                     page.close()
                     continue
 
-                # Set a viewport title for diagnostics.
-                try:
-                    page.wait_for_timeout(1500)
-                except Exception:
-                    pass
+                # Let the page settle before running the inject probe.
+                time.sleep(1.5)
 
                 # Run the real inject JS (fills input only — no submit).
                 inject_js = inject_prompt(site_id, VERIFY_PROMPT)
@@ -106,7 +110,10 @@ def main():
                         "input_text": "document.querySelector('input[type=\"text\"]')",
                     }
                     for label, expr in probes.items():
-                        print(f"  probe[{label}]={safe_eval(page, f'!!{expr}')}", flush=True)
+                        print(
+                            f"  probe[{label}]={safe_eval(page, f'!!{expr}')}",
+                            flush=True,
+                        )
                     # Run login-wall detection if extraction JS available.
                     ej = extract_js(site_id)
                     if ej:
@@ -116,7 +123,9 @@ def main():
                             f"found={ex.get('found') if isinstance(ex, dict) else None}",
                             flush=True,
                         )
-                    body = safe_eval(page, "(document.body && document.body.innerText) || ''")
+                    body = safe_eval(
+                        page, "(document.body && document.body.innerText) || ''"
+                    )
                     if isinstance(body, str):
                         print(f"  body_preview={body[:160]!r}", flush=True)
                 results_summary(site_id, {"inject": status})
@@ -133,6 +142,10 @@ def results_summary(site_id, info):
 if __name__ == "__main__":
     try:
         main()
-    except Exception:
+    # Top-level guard: surface any failure with a traceback and exit non-zero.
+    # Catching Exception (not BaseException) deliberately lets KeyboardInterrupt
+    # and SystemExit propagate. noqa: BLE001 -- a broad catch is intentional
+    # here as the script's single entry-point error boundary.
+    except Exception:  # noqa: BLE001
         traceback.print_exc()
         sys.exit(1)

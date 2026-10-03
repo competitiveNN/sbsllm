@@ -2,7 +2,14 @@
 
 import pytest
 
-from sbsllm.sites import SITES, _response_js, get_site, list_sites
+from sbsllm.sites import (
+    SITES,
+    _response_js,
+    get_site,
+    list_sites,
+    validate_site_config,
+    validate_sites,
+)
 
 
 class TestListSites:
@@ -175,3 +182,68 @@ class TestResponseJs:
         assert "__RESPONSE_SELECTORS__" not in js
         assert "__THINKING_SELECTORS__" not in js
         assert "__LOADING_SELECTORS__" not in js
+
+
+class TestValidateSiteConfig:
+    """Import-time validation catches misconfigured site entries."""
+
+    def test_builtin_registry_is_valid(self):
+        problems = validate_sites()
+        assert problems == [], f"builtin sites have config problems: {problems}"
+
+    def test_missing_url_is_reported(self):
+        problems = validate_site_config("demo", {"inject": "x", "submit_js": "y"})
+        assert any("url" in p for p in problems)
+
+    def test_missing_inject_is_reported(self):
+        problems = validate_site_config(
+            "demo", {"url": "https://x", "submit_js": "y", "response_selectors": ["a"]}
+        )
+        assert any("inject" in p for p in problems)
+
+    def test_empty_response_selectors_is_reported(self):
+        problems = validate_site_config(
+            "demo",
+            {
+                "url": "https://x",
+                "inject": "PROMPT_PLACEHOLDER",
+                "submit_js": "y",
+                "response_selectors": [],
+            },
+        )
+        assert any("response_selectors" in p for p in problems)
+
+    def test_inject_without_placeholder_is_reported(self):
+        problems = validate_site_config(
+            "demo",
+            {
+                "url": "https://x",
+                "inject": "return 'NO_INPUT';",
+                "submit_js": "y",
+                "response_selectors": ["a"],
+            },
+        )
+        assert any("PROMPT_PLACEHOLDER" in p for p in problems)
+
+    def test_valid_site_has_no_problems(self):
+        problems = validate_site_config(
+            "demo",
+            {
+                "url": "https://x.example/",
+                "inject": "PROMPT_PLACEHOLDER",
+                "submit_js": "y",
+                "response_selectors": ["a"],
+            },
+        )
+        assert problems == []
+
+    def test_non_dict_site_is_reported(self):
+        problems = validate_site_config("demo", "not a dict")
+        assert problems == ["demo: not a dict"]
+
+    def test_validate_sites_uses_explicit_dict(self):
+        problems = validate_sites(
+            {"bad": {"url": "https://x", "inject": "no placeholder", "submit_js": "y"}}
+        )
+        assert problems  # at least one problem reported
+        assert any("bad" in p for p in problems)

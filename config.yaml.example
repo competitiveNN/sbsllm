@@ -47,3 +47,9 @@ login_wait: 30
 # On expiry the stream ends with a visible message instead of hanging
 # silently. Raise it for very slow models.
 # first_token_timeout: 60.0
+
+# Seconds an identical prompt on the same chat tab attaches to the answer
+# already on screen instead of being sent again. Guards against silent client
+# retries (SSE reconnects, fetch/proxy retry) that would otherwise re-post the
+# prompt to the web chat in a loop. Set 0 to disable and always re-send.
+# duplicate_prompt_cooldown: 60.0

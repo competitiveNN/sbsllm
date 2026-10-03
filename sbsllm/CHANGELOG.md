@@ -4,6 +4,43 @@
 
 ### Fixed
 
+- **Extracted answers lost their paragraph breaks.** The extraction pipeline
+  squashed every whitespace run into a single space, and the pruning path
+  read a detached clone with `textContent`, which carries no layout-derived
+  newlines — so a multi-paragraph reply reached the local chat as one run-on
+  line (`...meet you!Is there...`). Extraction now normalises whitespace per
+  line (`normalize`), collapsing blank-line runs instead of destroying them,
+  and reads detached clones with a block-boundary walker (`blockTextOf`) that
+  emits real newlines for block elements while collapsing source line breaks
+  inside a text node. Verified with Chromium-backed extraction tests covering
+  the pruned and unpruned paths, `<br>` handling, and source-wrapped
+  paragraphs.
+- **Site re-renders duplicated everything already streamed.** Content deltas
+  used `str.removeprefix`, which does not match when a site re-renders
+  already-sent text mid-stream (z.ai dropped markdown emphasis: `I'm **GLM`
+  became `I'm GLM`); the whole new content was then appended after what the
+  client already had, doubling the reply. `_stream_delta` now skips the
+  shared prefix plus the longest run of new content that already occurs in
+  the old content (binary-searched; the predicate is monotonic), so only
+  unseen text is emitted and nothing is lost. Verified with unit tests for
+  the diff and streaming tests replaying a re-render sequence.
+- **Duplicate prompts were re-posted to the same tab in a loop.** One
+  `POST /v1/chat/completions` injects and submits exactly once, but clients
+  that retry silently (an SSE reconnect behind a proxy, a fetch/proxy retry,
+  a frontend retry policy) produce a train of identical POSTs — each one
+  re-injecting and re-submitting the same prompt, which surfaced as the
+  prompt repeating forever in the browser tab. A per-tab duplicate-submit
+  guard (`_TurnRegistry`) now records the last successful submission per
+  model; an identical prompt within `duplicate_prompt_cooldown` (default
+  60s, `0` disables) attaches to the turn already on screen instead of
+  being sent again: its finished answer is returned directly (streaming and
+  non-streaming), and an in-flight one is followed without re-injecting.
+  Each suppressed duplicate slides the cooldown window forward, so a retry
+  train cannot out-wait the guard, while a deliberate re-send of the same
+  prompt works again once the retries stop. Verified with unit tests for
+  the registry (per-model scope, cooldown expiry, window sliding) and
+  handler tests asserting one submission total across a retry train in
+  both the streaming and non-streaming paths.
 - **Non-streaming path had no test coverage for success or error branches.**
   The `wait_for_response` → `_handle_chat_completions` path (non-`stream`
   requests) was only covered for inject/submit failures. Five new tests now
@@ -97,6 +134,15 @@
   transient-error retry, connection-error retry, no-retry on
   `BrowserOperationTimeout`, no-retry on non-transient errors, and
   exhaustion-then-raise.
+- **`capture_response` retries `BrowserWorkerStopped`.** A dead worker
+  mid-dispatch used to abort the whole request with a 502, even though the
+  operation is read-only (no prompt submission) and safe to re-run: the old
+  queue item was drained on restart and a fresh worker is started
+  transparently. The retry loop now also catches `BrowserWorkerStopped` and
+  retries with backoff, turning a transient worker death into a recoverable
+  blip. `BrowserOperationTimeout` (wedged, still-alive worker) is still never
+  retried. New tests: `test_browser_worker_stopped_retried`,
+  `test_browser_worker_stopped_exhausts_retries`.
 - **`SBSLLM_HEADLESS` env var** (`sbsllm/browser.py`): defaults to a visible
   browser so users can log in interactively, but CI / container environments
   can set `SBSLLM_HEADLESS=true` to run headless. Verified with unit tests.

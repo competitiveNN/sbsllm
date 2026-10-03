@@ -17,10 +17,13 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from sbsllm.browser import wait_for_response
 from sbsllm.server import (
+    DEFAULT_BUSY_PATIENCE,
     DEFAULT_RESPONSE_IDLE_TIMEOUT,
     OpenAIHandler,
     _ModelLockRegistry,
+    _stream_delta,
     create_server,
 )
 
@@ -372,6 +375,78 @@ class TestIsNewResponse:
         assert handler._is_new_response(_result("", found=False), None) is False
 
 
+class TestStreamDelta:
+    """Unit tests for the SSE content/thinking delta diff."""
+
+    def test_empty_previous_emits_everything(self):
+        assert _stream_delta("Hello", "") == "Hello"
+
+    def test_plain_growth_emits_only_the_suffix(self):
+        assert _stream_delta("Hello!", "Hello") == "!"
+
+    def test_identical_emits_nothing(self):
+        assert _stream_delta("Hello", "Hello") == ""
+
+    def test_rerendered_prefix_emits_only_unseen_tail(self):
+        """z.ai dropped the `**` from text that was already streamed; the
+        rest of the new content must be emitted, the overlap must not."""
+        old = "Hello! I'm **GLM"
+        new = "Hello! I'm GLM-5.2 trained by Z.ai."
+        assert _stream_delta(new, old) == "-5.2 trained by Z.ai."
+
+    def test_divergence_without_overlap_emits_the_rest(self):
+        """Nothing after the divergence is on screen: emit everything new
+        rather than lose content."""
+        assert _stream_delta("abcXYZ", "abc123") == "XYZ"
+
+    def test_no_shared_prefix_emits_everything(self):
+        assert _stream_delta("something else", "Hello") == "something else"
+
+    def test_withheld_text_is_already_present_in_the_old_text(self):
+        """The no-loss invariant: everything the diff does not emit is
+        either part of the shared prefix (identical in both) or occurs
+        verbatim inside what the client already received."""
+        old = "The answer is **42."
+        new = "The answer is 42.\n\nExplanation: life, the universe."
+        delta = _stream_delta(new, old)
+        withheld = new[: len(new) - len(delta)]
+        split = 0
+        while split < min(len(old), len(new)) and old[split] == new[split]:
+            split += 1
+        assert withheld.startswith(new[:split])
+        assert withheld[split:] in old
+
+
+class TestRerenderedContent:
+    """Sites re-render already-streamed text while a reply is generating,
+    so the extracted content stops being a strict extension of what was
+    already sent. The delta must skip the overlap instead of appending the
+    whole message a second time."""
+
+    def test_dropped_emphasis_does_not_duplicate(self):
+        polls = [
+            _result("", found=False, count=0),
+            _generating("Hello! I'm **GLM"),
+            _generating("Hello! I'm GLM-5.2 trained by Z.ai."),
+            _finished("Hello! I'm GLM-5.2 trained by Z.ai."),
+        ]
+        _t, events = _stream(_handler(idle_timeout=1.0), polls)
+        text = "".join(d.get("content", "") for d, _ in events if isinstance(d, dict))
+        assert text == "Hello! I'm **GLM-5.2 trained by Z.ai."
+
+    def test_rerender_still_streams_the_new_tail(self):
+        polls = [
+            _result("", found=False, count=0),
+            _generating("The answer is **42."),
+            _generating("The answer is 42.\n\nExplanation: life, the universe."),
+            _finished("The answer is 42.\n\nExplanation: life, the universe."),
+        ]
+        _t, events = _stream(_handler(idle_timeout=1.0), polls)
+        text = "".join(d.get("content", "") for d, _ in events if isinstance(d, dict))
+        assert text == "The answer is **42.\n\nExplanation: life, the universe."
+        assert text.count("42.") == 1, "re-rendered fragment was sent twice"
+
+
 class TestSSEHeaders:
     def test_streaming_response_closes_the_connection(self):
         """`Connection: keep-alive` on HTTP/1.0 left clients waiting forever."""
@@ -721,3 +796,149 @@ class TestNoSilentHang:
         text = "".join(d.get("content", "") for d, _ in events if isinstance(d, dict))
         assert text == "t" * 39, "busy patience truncated a live answer"
         assert elapsed < 30.0
+
+
+class TestBothPollingPathsAgree:
+    """The streaming and non-streaming loops used to keep private copies
+    of the termination rules, and they drifted (no busy-patience guard on
+    the non-streaming side, no thinking check on `is_new_response`,
+    an idle_timeout of 0 finishing immediately). ResponsePoller is the
+    single source of truth now; these tests drive the same scripted poll
+    sequence through both paths and assert they terminate identically.
+
+    The shared state machine is ResponsePoller, so the streaming loop's
+    stop reasons are derived from the same object the non-streaming
+    wait_for_response uses. Here we exercise the *loop* wrappers end to
+    end: _stream_web_chat (streaming) and wait_for_response
+    (non-streaming) over identical capture sequences.
+    """
+
+    def _poll(self, content="", *, thinking=None, busy=False, done=False,
+              found=True, count=1):
+        return {
+            "found": found,
+            "content": content,
+            "thinking": thinking,
+            "busy": busy,
+            "done": done,
+            "count": count,
+        }
+
+    def _stream_stop_reason(self, polls, **kw):
+        """Drive _stream_web_chat; return its stop_reason."""
+        settings = {
+            "idle_timeout": kw.pop("idle_timeout", 3.0),
+            "done_confirm": kw.pop("done_confirm", 0.75),
+            "thinking_patience": kw.pop("thinking_patience", 120.0),
+            "busy_patience": kw.pop("busy_patience", DEFAULT_BUSY_PATIENCE),
+            "first_token_timeout": kw.pop("first_token_timeout", 60.0),
+            "poll_interval": kw.pop("poll_interval", 0.25),
+            "keepalive_interval": kw.pop("keepalive_interval", 10.0),
+        }
+        handler = _handler(
+            idle_timeout=settings["idle_timeout"],
+            done_confirm=settings["done_confirm"],
+            thinking_patience=settings["thinking_patience"],
+            poll_interval=settings["poll_interval"],
+        )
+        for name, value in settings.items():
+            setattr(handler.server, name, value)
+        captured = []
+
+        def capture(page, js):
+            captured.append(1)
+            return dict(polls[min(len(captured) - 1, len(polls) - 1)])
+
+        clock = FakeClock()
+        with (
+            patch("sbsllm.server.capture_response", side_effect=capture),
+            patch("sbsllm.server.extract_js", return_value="EXTRACT"),
+            patch("sbsllm.server.time") as fake_time,
+        ):
+            fake_time.monotonic.side_effect = clock.monotonic
+            fake_time.sleep.side_effect = clock.sleep
+            fake_time.time.return_value = 1_700_000_000
+            handler._send_sse = lambda data: None
+            result = handler._stream_web_chat(
+                MagicMock(), "EXTRACT", None, "cid", 123, "gpt-4", 60.0
+            )
+        return result.get("stop_reason")
+
+    def _non_streaming_stop_reason(self, polls, **kw):
+        """Drive wait_for_response; return its terminal flag."""
+        clock = FakeClock()
+        it = iter(polls)
+
+        def capture(page, js):
+            try:
+                return dict(next(it))
+            except StopIteration:
+                return dict(polls[-1])
+
+        with (
+            patch("sbsllm.browser.capture_response", side_effect=capture),
+            patch("sbsllm.browser.time.sleep", side_effect=clock.sleep),
+            patch("sbsllm.browser.time.monotonic", side_effect=clock.monotonic),
+        ):
+            result = wait_for_response(
+                MagicMock(), "JS", 60.0, poll_interval=0.01,
+                idle_timeout=kw.pop("idle_timeout", 3.0),
+                done_confirm=kw.pop("done_confirm", 0.75),
+                thinking_patience=kw.pop("thinking_patience", 120.0),
+                busy_patience=kw.pop("busy_patience", DEFAULT_BUSY_PATIENCE),
+                first_token_timeout=kw.pop("first_token_timeout", 60.0),
+                baseline=None,
+            )
+        return result
+
+    def _agree(self, polls, **kw):
+        streaming = self._stream_stop_reason(polls, **kw)
+        non_streaming = self._non_streaming_stop_reason(polls, **kw)
+        # The streaming loop names site_done/idle as done and the
+        # patience/timeout reasons as not-done; the non-streaming path
+        # returns the same reasons as flags. Compare the *reason*.
+        streaming_reason = streaming
+        if streaming_reason in ("site_done", "idle"):
+            assert non_streaming.get("done") is True, non_streaming
+        elif streaming_reason in ("busy_timeout", "thinking_timeout", "no_output"):
+            assert non_streaming.get("done") is False, non_streaming
+            assert non_streaming.get(streaming_reason) is True, non_streaming
+        else:
+            # budget_exhausted: nothing else fired first.
+            assert non_streaming.get("timed_out") is True, non_streaming
+        return streaming_reason
+
+    def test_site_done_agrees(self):
+        polls = [
+            self._poll(found=False, count=0),
+            self._poll("hi", busy=True, done=False, count=1),
+            self._poll("hi", busy=False, done=True, count=2),
+        ]
+        assert self._agree(polls, done_confirm=0.0) == "site_done"
+
+    def test_idle_agrees(self):
+        polls = [self._poll("ans")] * 3
+        assert self._agree(polls, idle_timeout=0.1, done_confirm=99.0) == "idle"
+
+    def test_busy_timeout_agrees(self):
+        polls = [
+            self._poll(found=False, count=0),
+            self._poll("partial", busy=True, count=1),
+            self._poll("partial", busy=True, count=2),
+        ]
+        assert self._agree(polls, busy_patience=0.5, idle_timeout=99.0,
+                           thinking_patience=99.0, done_confirm=99.0) == "busy_timeout"
+
+    def test_thinking_timeout_agrees(self):
+        polls = [
+            self._poll(thinking="still...", busy=True, count=1),
+            self._poll(thinking="still...", busy=True, count=2),
+        ]
+        assert self._agree(polls, busy_patience=1.0, thinking_patience=0.5,
+                           idle_timeout=99.0, done_confirm=99.0,
+                           first_token_timeout=99.0) == "thinking_timeout"
+
+    def test_no_output_agrees(self):
+        polls = [self._poll(found=False, count=0)] * 3
+        assert self._agree(polls, first_token_timeout=0.5, idle_timeout=0.0,
+                           busy_patience=99.0, thinking_patience=99.0) == "no_output"

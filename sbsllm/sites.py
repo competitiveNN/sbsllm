@@ -291,26 +291,113 @@ _RESPONSE_TEMPLATE = """
             const text = element.innerText || element.textContent || '';
             return text.replace(/\\u00a0/g, ' ');
         };
-        // Detached nodes have no layout, so innerText is empty for clones.
-        const rawTextOf = (element) => {
-            if (!element) return '';
-            return (element.textContent || '').replace(/\\u00a0/g, ' ');
-        };
         const squash = (text) => (text || '').replace(/\\s+/g, ' ').trim();
-        const matches = (selectors) => {
+        // Whitespace cleanup that KEEPS paragraph breaks: every line is
+        // squashed individually, runs of blank lines collapse to one, and the
+        // whole text is trimmed. Squashing the entire answer (the old
+        // behaviour) flattened every paragraph into one run-on line.
+        const normalize = (text) => (text || '')
+            .split('\\n')
+            .map((line) => line.replace(/[ \\t\\r]+/g, ' ').trim())
+            .join('\\n')
+            .replace(/\\n{3,}/g, '\\n\\n')
+            .trim();
+        // Detached clones have no layout, so innerText/textContent carries no
+        // block-boundary newlines. Walk the subtree instead: whitespace inside
+        // a text node collapses (a source line break inside a <p> is not a
+        // paragraph break) while block-level elements contribute real ones.
+        const BLOCK_TAGS = new Set([
+            'ADDRESS', 'ARTICLE', 'ASIDE', 'BLOCKQUOTE', 'BR', 'DD', 'DETAILS',
+            'DIALOG', 'DIV', 'DL', 'DT', 'FIELDSET', 'FIGCAPTION', 'FIGURE',
+            'FOOTER', 'FORM', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'HEADER',
+            'HGROUP', 'HR', 'LI', 'MAIN', 'NAV', 'OL', 'P', 'PRE', 'SECTION',
+            'TABLE', 'TD', 'TH', 'TR', 'UL',
+        ]);
+        const blockTextOf = (element) => {
+            if (!element) return '';
+            const parts = [];
+            const walk = (node) => {
+                if (node.nodeType === 3) {
+                    parts.push(node.nodeValue.replace(/\\s+/g, ' '));
+                    return;
+                }
+                if (node.nodeType !== 1) return;
+                const tag = (node.tagName || '').toUpperCase();
+                if (tag === 'BR') {
+                    parts.push('\\n');
+                    return;
+                }
+                const block = BLOCK_TAGS.has(tag);
+                if (block) parts.push('\\n');
+                for (const child of node.childNodes) walk(child);
+                if (block) parts.push('\\n');
+            };
+            walk(element);
+            return parts.join('');
+        };
+        // document.querySelectorAll cannot reach into a web component's
+        // Shadow DOM. Several supported sites (Google AI Studio's ms-* tree,
+        // custom elements on z.ai / grok) render the assistant answer inside a
+        // shadow root, so a light-DOM-only scan returns nothing and the
+        // server reports "no output" on a perfectly healthy reply.
+        //
+        // Walk every element in the document; for each one that exposes a
+        // shadowRoot, query within it too. Depth-first so nested shadow trees
+        // (ms-prompt-box > ms-autosize-textarea > textarea) are reached.
+        const _shadowQuery = (root, selector) => {
+            let out = [];
+            try {
+                out = Array.from(root.querySelectorAll(selector));
+            } catch (_) {}
+            return out;
+        };
+        const matchesInShadow = (selectors) => {
             const elements = [];
+            const seen = new Set();
+            const stack = [document];
+            while (stack.length) {
+                const root = stack.pop();
+                for (const selector of selectors) {
+                    try {
+                        for (const element of _shadowQuery(root, selector)) {
+                            if (!seen.has(element)) {
+                                seen.add(element);
+                                elements.push(element);
+                            }
+                        }
+                    } catch (_) {}
+                }
+                // Enqueue shadow hosts found in this root for deeper scanning.
+                try {
+                    for (const host of root.querySelectorAll('*')) {
+                        if (host.shadowRoot) stack.push(host.shadowRoot);
+                    }
+                } catch (_) {}
+            }
+            return elements;
+        };
+        const matches = (selectors) => {
+            // Light-DOM first (cheap, and the common case), then shadow roots.
+            const light = [];
             const seen = new Set();
             for (const selector of selectors) {
                 try {
                     for (const element of document.querySelectorAll(selector)) {
                         if (!seen.has(element)) {
                             seen.add(element);
-                            elements.push(element);
+                            light.push(element);
                         }
                     }
                 } catch (_) {}
             }
-            return elements;
+            const shadow = matchesInShadow(selectors);
+            for (const element of shadow) {
+                if (!seen.has(element)) {
+                    seen.add(element);
+                    light.push(element);
+                }
+            }
+            return light;
         };
         // A collapsed disclosure only renders its label ("Thought Process").
         // That is UI chrome, not a reasoning trace, so it must not be
@@ -325,15 +412,74 @@ _RESPONSE_TEMPLATE = """
         // Merging every selector and taking the last match let a catch-all
         // further down the list (div[id*=message] and friends) override the
         // precise selector and win for the wrong element entirely.
+        // Response selection also needs shadow-DOM reach: sites that render the
+        // assistant turn inside a web component (Google AI Studio's
+        // ms-chat-turn, custom elements elsewhere) would otherwise report
+        // "found: false" on a reply that is fully on screen.
+        //
+        // A selector like "my-chat-turn [data-turn-role='model'] .prose-chat"
+        // references the shadow host itself ("my-chat-turn"), which lives in
+        // the light DOM. querySelectorAll on the shadow root can never match
+        // it, so we also try the selector's last compound sub-selector (".prose-chat")
+        // inside each shadow root as a fallback. This is only used for response
+        // containers -- thinking/loading/login selectors go through the
+        // separate matches()/matchesInShadow() path which is more generic.
+        const _shadowAll = (selector) => {
+            const out = [];
+            const seen = new Set();
+            const stack = [document];
+            while (stack.length) {
+                const root = stack.pop();
+                try {
+                    for (const el of root.querySelectorAll(selector)) {
+                        if (!seen.has(el)) {
+                            seen.add(el);
+                            out.push(el);
+                        }
+                    }
+                } catch (_) {}
+                // When scanning inside a shadow root, the full selector may
+                // reference the host element (in light DOM) and thus can't
+                // match. Fall back to the selector's trailing compound part
+                // so we still reach answer elements that live in the shadow tree.
+                if (root !== document && selector.indexOf(' ') !== -1) {
+                    const lastPart = selector.split(/\\s+/).pop();
+                    if (lastPart && lastPart !== selector) {
+                        try {
+                            for (const el of root.querySelectorAll(lastPart)) {
+                                if (!seen.has(el)) {
+                                    seen.add(el);
+                                    out.push(el);
+                                }
+                            }
+                        } catch (_) {}
+                    }
+                }
+                try {
+                    for (const host of root.querySelectorAll('*')) {
+                        if (host.shadowRoot) stack.push(host.shadowRoot);
+                    }
+                } catch (_) {}
+            }
+            return out;
+        };
         let response = null;
         let responseCount = 0;
         for (const selector of responseSelectors) {
-            let nodes;
+            let nodes = [];
             try {
-                nodes = Array.from(document.querySelectorAll(selector)).filter(isVisible);
+                nodes = Array.from(document.querySelectorAll(selector));
             } catch (_) {
-                continue;
+                nodes = [];
             }
+            if (!nodes.length) {
+                try {
+                    nodes = _shadowAll(selector);
+                } catch (_) {
+                    nodes = [];
+                }
+            }
+            nodes = nodes.filter(isVisible);
             if (nodes.length) {
                 response = nodes[nodes.length - 1];
                 responseCount = nodes.length;
@@ -353,7 +499,7 @@ _RESPONSE_TEMPLATE = """
             ))) {
                 if (header.parentNode) header.parentNode.removeChild(header);
             }
-            const text = squash(textOf(clone) || rawTextOf(clone));
+            const text = normalize(blockTextOf(clone));
             if (isLabelOnly(text) || thinkingParts.indexOf(text) !== -1) continue;
             thinkingParts.push(text);
         }
@@ -397,13 +543,13 @@ _RESPONSE_TEMPLATE = """
                 // phase the answer is legitimately empty, and falling back to
                 // the unpruned text there re-injected the reasoning into the
                 // answer, so the local chat rendered the thinking twice.
-                content = squash(rawTextOf(clone));
+                content = blockTextOf(clone);
             }
         }
         // Safety net for sites that render the disclosure label outside any
         // element matched by thinking_selectors.
         content = content.replace(/Thought Process\\s*/gi, '');
-        content = squash(content);
+        content = normalize(content);
         // "Working for 12s" / "Worked for 12s" appear while a reply streams.
         const isWorking = /^Work(?:ing|ed) for \\d+s/.test(content);
         content = content.replace(/^Work(?:ing|ed) for \\d+s\\s*/, '');
@@ -1260,6 +1406,82 @@ SITES: dict[str, dict] = {
         ],
     },
 }
+
+
+_REQUIRED_KEYS = ("url", "inject", "submit_js", "response_selectors")
+# Keys whose value is a list of CSS selectors rather than a JS string.
+_SELECTOR_KEYS = frozenset(
+    {"response_selectors", "thinking_selectors", "loading_selectors", "login_wall_selectors"}
+)
+# Optional JS blocks that must be non-empty strings when present.
+_OPTIONAL_JS_KEYS = ("post_inject_js", "setup_js")
+
+
+def validate_site_config(site_id: str, site: dict) -> list[str]:
+    """Validate one site entry; return a list of problems (empty = valid).
+
+    A misconfigured site (missing URL, empty response selectors, inject JS
+    without the placeholder) used to surface only at request time as a 500
+    or a silently empty answer. Running this at import time means the whole
+    process refuses to start with a broken config instead of failing the
+    first request.
+    """
+    problems: list[str] = []
+    if not isinstance(site, dict):
+        return [f"{site_id}: not a dict"]
+    for key in _REQUIRED_KEYS:
+        if key not in site:
+            problems.append(f"{site_id}: missing required key {key!r}")
+            continue
+        value = site[key]
+        if key in _SELECTOR_KEYS:
+            if not isinstance(value, (list, tuple)) or not value:
+                problems.append(
+                    f"{site_id}: key {key!r} must be a non-empty list of selectors"
+                )
+            elif not all(isinstance(s, str) and s.strip() for s in value):
+                problems.append(
+                    f"{site_id}: key {key!r} must contain only non-empty strings"
+                )
+        elif not isinstance(value, str) or not value.strip():
+            problems.append(f"{site_id}: key {key!r} must be a non-empty string")
+    for key in _OPTIONAL_JS_KEYS:
+        if key in site:
+            value = site[key]
+            if not isinstance(value, str) or not value.strip():
+                problems.append(f"{site_id}: key {key!r} must be a non-empty string")
+    inject = site.get("inject")
+    if isinstance(inject, str) and "PROMPT_PLACEHOLDER" not in inject:
+        problems.append(f"{site_id}: inject JS must contain PROMPT_PLACEHOLDER")
+    url = site.get("url")
+    if isinstance(url, str) and url and not url.startswith("https://"):
+        problems.append(f"{site_id}: url must be https://")
+    return problems
+
+
+def validate_sites(sites: dict[str, dict] | None = None) -> list[str]:
+    """Validate every site in the registry (or the given dict).
+
+    Returns a flat list of problem strings. Empty means all sites are
+    well-formed. Does not raise: the caller decides whether a warning or
+    a hard failure is appropriate.
+    """
+    problems: list[str] = []
+    for site_id, site in (sites or SITES).items():
+        problems.extend(validate_site_config(site_id, site))
+    return problems
+
+
+# Validate the built-in registry at import time so a broken site entry
+# fails fast rather than on the first request.
+_site_config_problems = validate_sites()
+if _site_config_problems:
+    import logging as _logging
+
+    _logging.getLogger(__name__).warning(
+        "site_config_invalid",
+        extra={"problems": _site_config_problems},
+    )
 
 
 def get_site(site_id: str) -> dict:

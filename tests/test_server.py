@@ -1,10 +1,12 @@
 """Tests for server.py."""
 
+import inspect
 import json
 import socket
 import threading
 import time
 import types
+from typing import ClassVar
 from unittest.mock import MagicMock, patch
 
 from sbsllm.server import (
@@ -13,6 +15,7 @@ from sbsllm.server import (
     OpenAIHandler,
     Server,
     _ModelLockRegistry,
+    _TurnRegistry,
     create_server,
 )
 
@@ -41,6 +44,25 @@ class TestCreateServer:
         assert server.tab_map == {"gpt-4": tab}
         assert server.host == "0.0.0.0"
         assert server.port == 9000
+
+    def test_unknown_site_in_model_map_warns(self):
+        """A model_map whose site id is not a real SITES entry must log a
+        warning at construction time, instead of surfacing only per-request
+        as a 500 long after the operator has walked away."""
+        with patch("sbsllm.server.logging") as mock_logging:
+            create_server(model_map={"gpt-4": "not-a-real-site"})
+        mock_logger = mock_logging.getLogger.return_value
+        mock_logger.warning.assert_called_once()
+        call = mock_logger.warning.call_args
+        assert call.args[0] == "server unknown_site_in_model_map"
+        assert "not-a-real-site" in call.kwargs["extra"]["unknown_sites"]
+
+    def test_known_site_in_model_map_is_silent(self):
+        """A fully valid model_map must not log anything."""
+        with patch("sbsllm.server.logging") as mock_logging:
+            create_server(model_map={"gpt-4": "chatgpt", "claude-3": "claude"})
+        mock_logger = mock_logging.getLogger.return_value
+        mock_logger.warning.assert_not_called()
 
 
 class TestServerStartStop:
@@ -234,6 +256,73 @@ class TestOpenAIHandlerChatCompletions:
         handler._send_error.assert_called_once()
         call_kwargs = handler._send_error.call_args.kwargs
         assert call_kwargs.get("request_id") == "test-request-id"
+        assert call_kwargs.get("code") == "model_not_found"
+
+    def test_inject_failure_sets_error_code(self):
+        """The non-streaming inject/submit failure carries a stable code."""
+        body = json.dumps(
+            {"model": "gpt-4", "messages": [{"role": "user", "content": "Hello!"}]}
+        ).encode()
+        handler = self._make_handler(body)
+        with patch("sbsllm.server.inject_and_submit") as mock_submit:
+            mock_submit.return_value = {
+                "tab": 1,
+                "inject": "NO_INPUT",
+                "submit": None,
+            }
+            with (
+                patch("sbsllm.server.inject_prompt"),
+                patch("sbsllm.server.submit_js"),
+                patch("sbsllm.server.extract_js", return_value="extract_js"),
+                patch("sbsllm.server.check_page_health", return_value=True),
+                patch(
+                    "sbsllm.server.capture_response",
+                    return_value={
+                        "content": "",
+                        "thinking": None,
+                        "busy": False,
+                        "done": False,
+                        "count": 0,
+                        "found": False,
+                    },
+                ),
+            ):
+                OpenAIHandler._handle_chat_completions(handler)
+        handler._send_error.assert_called_once()
+        assert handler._send_error.call_args[0][0] == 502
+        assert (
+            handler._send_error.call_args.kwargs.get("code") == "inject_submit_failed"
+        )
+
+    def test_timeout_sets_error_code(self):
+        """The 504 timeout error carries the response_timeout code."""
+        body = json.dumps(
+            {"model": "gpt-4", "messages": [{"role": "user", "content": "Hello!"}]}
+        ).encode()
+        handler = self._make_handler(body)
+        patches = self._patch_success(
+            {
+                "found": False,
+                "content": "",
+                "thinking": None,
+                "timed_out": True,
+                "done": False,
+            }
+        )
+        with (
+            patches[0],
+            patches[1],
+            patches[2],
+            patches[3],
+            patches[4],
+            patches[5],
+            patches[6],
+            patches[7],
+        ):
+            OpenAIHandler._handle_chat_completions(handler)
+        handler._send_error.assert_called_once()
+        assert handler._send_error.call_args[0][0] == 504
+        assert handler._send_error.call_args.kwargs.get("code") == "response_timeout"
 
     def test_missing_messages(self):
         body = json.dumps({"model": "gpt-4"}).encode()
@@ -609,6 +698,171 @@ class TestOpenAIHandlerChatCompletions:
         assert data["choices"][0]["message"]["content"] == real_answer
         assert "prompt sent" not in data["choices"][0]["message"]["content"].lower()
 
+    def test_non_streaming_usage_is_estimated_not_zero(self):
+        """Close the AGENTS.md Design TODO: token usage must be populated with
+        a non-zero heuristic estimate, not the previous stub of all zeros."""
+        body = json.dumps(
+            {"model": "gpt-4", "messages": [{"role": "user", "content": "Hello!"}]}
+        ).encode()
+        handler = self._make_handler(body)
+
+        real_answer = "The capital of France is Paris, and it is beautiful in spring."
+        patches = self._patch_success(
+            {"found": True, "content": real_answer, "thinking": None, "done": True}
+        )
+        with (
+            patches[0],
+            patches[1],
+            patches[2],
+            patches[3],
+            patches[4],
+            patches[5],
+            patches[6],
+            patches[7],
+        ):
+            OpenAIHandler._handle_chat_completions(handler)
+
+        handler._send_json.assert_called_once()
+        data = handler._send_json.call_args[0][1]
+        usage = data["usage"]
+        assert usage["prompt_tokens"] > 0
+        assert usage["completion_tokens"] > 0
+        assert (
+            usage["total_tokens"] == usage["prompt_tokens"] + usage["completion_tokens"]
+        )
+
+    def test_estimate_tokens_is_cjk_aware(self):
+        """CJK chars count ~1 token each; non-CJK ~4 chars/token. A flat
+        chars/4 split under-counts the CJK prompts this tool targets."""
+        from sbsllm.server import _estimate_tokens
+
+        # Pure Han: each character maps to ~1 token.
+        assert _estimate_tokens("你好世界") == 4
+        # Pure ASCII: 8 chars // 4 = 2 tokens.
+        assert _estimate_tokens("abcdefgh") == 2
+        # Mixed: 2 Han (2) + 4 ASCII (4 // 4 = 1) = 3.
+        assert _estimate_tokens("你好abcd") == 3
+        # CJK fullwidth punctuation (U+FF0C) is outside the CJK ranges, so it
+        # counts at the non-CJK rate: 4 Han (4) + 1 punctuation (1 // 4 = 0).
+        assert _estimate_tokens("你好，世界") == 4
+        # Emoji are a single code point each and non-CJK; 4 emoji -> 4 // 4 = 1.
+        assert _estimate_tokens("😀😀😀😀") == 1
+        # Empty and whitespace-only stay safe (0 / min 1 for non-empty).
+        assert _estimate_tokens("") == 0
+        assert _estimate_tokens(" ") == 1
+
+    def test_estimate_tokens_edge_cases(self):
+        """Pin the heuristic on long, mixed, and non-Han CJK inputs."""
+        from sbsllm.server import _estimate_tokens
+
+        # Long ASCII: 1000 chars // 4 = 250 tokens (floor division).
+        assert _estimate_tokens("a" * 1000) == 250
+        # Long Han: each character maps to ~1 token.
+        assert _estimate_tokens("你" * 1000) == 1000
+        # Katakana (U+30AB..) and Hangul (U+AC00..) count as CJK too.
+        assert _estimate_tokens("カタカナ") == 4
+        assert _estimate_tokens("한국어") == 3
+        # CJK-majority mix: 9 Han (9) + 4 ASCII (4 // 4 = 1) = 10.
+        assert _estimate_tokens("你" * 9 + "abcd") == 10
+        # Non-CJK remainder floors: 3 ASCII -> 3 // 4 = 0 -> min 1.
+        assert _estimate_tokens("abc") == 1
+        # Always a non-negative int for any mix.
+        assert isinstance(_estimate_tokens("Hello, 世界!"), int)
+
+    def test_estimate_tokens_cjk_extension_boundary(self):
+        """CJK Extension A (U+3400..4DBF) sits outside the covered
+        blocks and counts at the non-CJK rate -- pin the boundary so a
+        range widening is a deliberate, visible change."""
+        from sbsllm.server import _estimate_tokens
+
+        # 4 Ext-A chars, all non-CJK per the heuristic: 4 // 4 = 1.
+        assert _estimate_tokens("㐀㐁㐂㐃") == 1
+        # Mixed with basic Han: 2 Han (2) + 4 Ext-A (4 // 4 = 1) = 3.
+        assert _estimate_tokens("你好㐀㐁㐂㐃") == 3
+
+    def test_is_cjk_script_coverage(self):
+        """_is_cjk covers Han, Hiragana, Katakana and Hangul
+        syllables -- and deliberately nothing else (fullwidth
+        punctuation, Ext-A, emoji count at the non-CJK rate)."""
+        from sbsllm.server import _is_cjk
+
+        assert _is_cjk("中")  # Han (U+4E2D)
+        assert _is_cjk("あ")  # Hiragana (U+3042)
+        assert _is_cjk("ア")  # Katakana (U+30A2)
+        assert _is_cjk("한")  # Hangul (U+D55C)
+        assert not _is_cjk("a")
+        assert not _is_cjk("，")  # fullwidth comma (U+FF0C)
+        assert not _is_cjk("😀")  # emoji (U+1F600)
+        assert not _is_cjk("㐀")  # CJK Ext A (U+3400)
+
+    def test_usage_fields_computes_estimates(self):
+        """The shared usage helper estimates prompt/completion/total."""
+        from sbsllm.server import _usage_fields
+
+        # "Hello world" (11 ASCII) -> 11 // 4 = 2; "The answer" (10) -> 2.
+        usage = _usage_fields("Hello world", "The answer", None)
+        assert usage["prompt_tokens"] == 2
+        assert usage["completion_tokens"] == 2
+        assert usage["total_tokens"] == 4
+
+    def test_usage_fields_thinking_none_and_empty_match(self):
+        """thinking=None and thinking='' contribute the same (zero)."""
+        from sbsllm.server import _usage_fields
+
+        assert _usage_fields("p", "c", None) == _usage_fields("p", "c", "")
+        # Thinking folds into completion_tokens: prompt "你好" (2) +
+        # content "c" (min 1) + thinking "你好" (2) = 3 completion.
+        usage = _usage_fields("你好", "c", "你好")
+        assert usage["prompt_tokens"] == 2
+        assert usage["completion_tokens"] == 3
+        assert usage["total_tokens"] == 5
+
+    def test_usage_fields_all_empty_is_zero(self):
+        """No prompt, no content, no thinking -> all-zero usage.
+
+        Guards the non-negative clamping contract explicitly, since the
+        heuristic uses floor division which could otherwise drift on
+        tiny inputs.
+        """
+        from sbsllm.server import _usage_fields
+
+        usage = _usage_fields("", "", None)
+        assert usage == {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
+        # Whitespace-only is non-empty input and must still be >= 1 token.
+        assert _usage_fields(" ", "", None)["prompt_tokens"] == 1
+        assert _usage_fields("", " ", None)["completion_tokens"] == 1
+
+    def test_usage_fields_total_is_prompt_plus_completion(self):
+        """total_tokens must always equal prompt + completion."""
+        from sbsllm.server import _estimate_tokens, _usage_fields
+
+        for prompt, content, thinking in [
+            ("Hello world", "The answer", None),
+            ("你好世界", "カタカナと한국어", "deepseek-reasoner"),
+            ("a" * 50, "b" * 50, "c" * 50),
+        ]:
+            usage = _usage_fields(prompt, content, thinking)
+            assert (
+                usage["total_tokens"]
+                == usage["prompt_tokens"] + usage["completion_tokens"]
+            )
+            expected_completion = _estimate_tokens(content) + _estimate_tokens(thinking)
+            assert usage["completion_tokens"] == expected_completion
+
+    def test_estimate_tokens_handles_surrogate_and_combining(self):
+        """Combining marks and astral (emoji) code points are counted as
+        single characters each and the heuristic never raises on odd input."""
+        from sbsllm.server import _estimate_tokens
+
+        # 'e' + combining acute = 2 non-CJK chars -> 2 // 4 = 0 -> min 1.
+        assert _estimate_tokens("e\u0301") == 1
+        # Family-emoji sequence = 5 non-CJK code points -> 5 // 4 = 1.
+        assert _estimate_tokens("👨\u200d👩\u200d👧") == 1
+
     def test_non_streaming_timeout_returns_504(self):
         """A timed-out non-streaming request must surface as 504, not 200."""
         body = json.dumps(
@@ -642,6 +896,115 @@ class TestOpenAIHandlerChatCompletions:
         assert call_args[0] == 504
         assert "timeout" in call_args[1].lower()
         assert call_args[3] == "test-request-id"
+
+    def test_non_streaming_timeout_returns_partial_content(self):
+        """A timeout with partial content on screen returns the truncated
+        answer (200 + finish_reason="length"), not a bare 504 that
+        loses it — mirroring OpenAI's max_tokens truncation behavior."""
+        body = json.dumps(
+            {"model": "gpt-4", "messages": [{"role": "user", "content": "Hello!"}]}
+        ).encode()
+        handler = self._make_handler(body)
+
+        partial = "The capital of France is Pa"
+        patches = self._patch_success(
+            {
+                "found": True,
+                "content": partial,
+                "thinking": None,
+                "timed_out": True,
+                "done": False,
+            }
+        )
+        with (
+            patches[0],
+            patches[1],
+            patches[2],
+            patches[3],
+            patches[4],
+            patches[5],
+            patches[6],
+            patches[7],
+        ):
+            OpenAIHandler._handle_chat_completions(handler)
+
+        handler._send_error.assert_not_called()
+        handler._send_json.assert_called_once()
+        call_args = handler._send_json.call_args[0]
+        assert call_args[0] == 200
+        data = call_args[1]
+        assert data["choices"][0]["message"]["content"] == partial
+        assert data["choices"][0]["finish_reason"] == "length"
+        assert data["usage"]["completion_tokens"] > 0
+
+    def test_non_streaming_timeout_returns_partial_thinking(self):
+        """A thinking-only stall on timeout still returns the reasoning
+        trace rather than discarding it."""
+        body = json.dumps(
+            {"model": "gpt-4", "messages": [{"role": "user", "content": "Hello!"}]}
+        ).encode()
+        handler = self._make_handler(body)
+
+        thinking = "Let me reason about this step by step."
+        patches = self._patch_success(
+            {
+                "found": True,
+                "content": "",
+                "thinking": thinking,
+                "timed_out": True,
+                "done": False,
+            }
+        )
+        with (
+            patches[0],
+            patches[1],
+            patches[2],
+            patches[3],
+            patches[4],
+            patches[5],
+            patches[6],
+            patches[7],
+        ):
+            OpenAIHandler._handle_chat_completions(handler)
+
+        handler._send_json.assert_called_once()
+        data = handler._send_json.call_args[0][1]
+        message = data["choices"][0]["message"]
+        assert message["reasoning_content"] == thinking
+        assert data["choices"][0]["finish_reason"] == "length"
+
+    def test_non_streaming_timeout_whitespace_only_returns_504(self):
+        """A whitespace-only capture on timeout is 'nothing captured' and
+        must still surface as 504, not a 200 with a blank answer."""
+        body = json.dumps(
+            {"model": "gpt-4", "messages": [{"role": "user", "content": "Hello!"}]}
+        ).encode()
+        handler = self._make_handler(body)
+
+        patches = self._patch_success(
+            {
+                "found": True,
+                "content": "   \n\t  ",
+                "thinking": "   ",
+                "timed_out": True,
+                "done": False,
+            }
+        )
+        with (
+            patches[0],
+            patches[1],
+            patches[2],
+            patches[3],
+            patches[4],
+            patches[5],
+            patches[6],
+            patches[7],
+        ):
+            OpenAIHandler._handle_chat_completions(handler)
+
+        handler._send_json.assert_not_called()
+        handler._send_error.assert_called_once()
+        assert handler._send_error.call_args[0][0] == 504
 
     def test_non_streaming_no_response_returns_504(self):
         """No assistant response detected must surface as 504."""
@@ -901,6 +1264,57 @@ class TestBuildPrompt:
         assert result == ""
 
 
+class TestBuildCompletionResponse:
+    """_build_completion_response builds the OpenAI completion body."""
+
+    def _build(self, content, thinking, finish_reason="stop"):
+        return OpenAIHandler._build_completion_response(
+            MagicMock(spec=OpenAIHandler),
+            "gpt-4",
+            "Hello!",
+            content,
+            thinking,
+            finish_reason,
+            "test-request-id",
+        )
+
+    def test_no_thinking_omits_reasoning_fields(self):
+        """thinking=None/'' must not leak reasoning_content or `thinking`."""
+        for thinking in (None, ""):
+            resp = self._build("The answer", thinking)
+            message = resp["choices"][0]["message"]
+            assert message["content"] == "The answer"
+            assert "reasoning_content" not in message
+            assert "thinking" not in resp
+            assert resp["choices"][0]["finish_reason"] == "stop"
+            assert resp["usage"]["completion_tokens"] > 0
+
+    def test_with_thinking_exposes_reasoning_content(self):
+        """A thinking trace appears in both reasoning_content and `thinking`."""
+        from sbsllm.server import _estimate_tokens
+
+        resp = self._build("The answer", "Let me think.", "length")
+        message = resp["choices"][0]["message"]
+        assert message["reasoning_content"] == "Let me think."
+        assert resp["thinking"] == "Let me think."
+        assert resp["choices"][0]["finish_reason"] == "length"
+        # usage folds the thinking trace into completion_tokens.
+        assert resp["usage"]["completion_tokens"] == (
+            _estimate_tokens("The answer") + _estimate_tokens("Let me think.")
+        )
+
+    def test_usage_and_request_id_present(self):
+        """The completion body carries object/model/request_id and coherent usage."""
+        resp = self._build("ok", None)
+        assert resp["object"] == "chat.completion"
+        assert resp["model"] == "gpt-4"
+        assert resp["request_id"] == "test-request-id"
+        usage = resp["usage"]
+        assert usage["total_tokens"] == (
+            usage["prompt_tokens"] + usage["completion_tokens"]
+        )
+
+
 class TestHTTPMethods:
     """Test HTTP method routing."""
 
@@ -1006,6 +1420,21 @@ class TestHandlerHelpers:
         assert call_args[1]["error"]["type"] == "invalid_request_error"
         assert call_args[1]["error"]["param"] is None
         assert call_args[1]["error"]["code"] is None
+
+    def test_send_error_includes_code(self):
+        """A passed code is surfaced in the OpenAI error envelope."""
+        handler = MagicMock(spec=OpenAIHandler)
+        OpenAIHandler._send_error(
+            handler,
+            400,
+            "Bad request",
+            "invalid_request_error",
+            code="my_code",
+        )
+        handler._send_json.assert_called_once()
+        error = handler._send_json.call_args[0][1]["error"]
+        assert error["code"] == "my_code"
+        assert error["type"] == "invalid_request_error"
 
 
 class TestBuildPromptAssistant:
@@ -1728,6 +2157,43 @@ class TestHandlerSSEHelpers:
         assert "unresponsive" in call_args[1].lower()
         handler._send_sse_headers.assert_not_called()
 
+    def test_streaming_browser_worker_stopped_returns_502(self):
+        """A BrowserWorkerStopped (worker died mid-dispatch) must surface as a
+        browser-level 502, not a generic 500 internal error.
+
+        BrowserWorkerStopped subclasses BrowserError, so the existing
+        `except BrowserError` handler covers it -- this guards against future
+        refactors that weaken the inheritance or catch a bare RuntimeError
+        first.
+        """
+        from sbsllm.browser import BrowserWorkerStopped
+
+        handler = self._make_streaming_handler()
+        handler._inject_and_submit_with_recovery = MagicMock(
+            side_effect=BrowserWorkerStopped("worker stopped mid-dispatch")
+        )
+        with (
+            patch("sbsllm.server.extract_js", return_value="EXTRACT"),
+            patch(
+                "sbsllm.server.capture_response",
+                return_value={"found": False, "count": 0},
+            ),
+            patch("sbsllm.server.time") as fake_time,
+        ):
+            fake_time.monotonic.return_value = 0.0
+            fake_time.time.return_value = 1_700_000_000
+            handler._handle_streaming_chat_completions(
+                "req-1", "gpt-4", "chatgpt", MagicMock(), 1, "hi", 0.0, 60.0
+            )
+        handler._send_error.assert_called_once()
+        call_args = handler._send_error.call_args[0]
+        assert call_args[0] == 502
+        # The streaming BrowserError message references the failure itself
+        # (the non-streaming path is the one that includes the site name).
+        assert "worker stopped mid-dispatch" in call_args[1].lower()
+        assert "restart" in call_args[1].lower()
+        handler._send_sse_headers.assert_not_called()
+
     def test_stream_web_chat_thinking_then_content_deltas(self):
         """_stream_web_chat emits role, thinking, and content as ordered deltas."""
         handler = self._make_streaming_handler()
@@ -1948,6 +2414,535 @@ class TestHandlerSSEHelpers:
         assert terminal_call[1]["finish_reason"] == "stop"
         handler._send_sse.assert_any_call("[DONE]")
 
+    def test_streaming_final_chunk_carries_usage(self):
+        """Regression: the terminal SSE chunk must include non-zero token
+        usage. Before the content/thinking-extraction fix, the final-usage
+        block referenced unbound locals and raised NameError, so no terminal
+        chunk with usage (nor [DONE]) was ever emitted on a happy path."""
+        handler = self._make_streaming_handler()
+        handler._stream_web_chat = MagicMock(
+            return_value={
+                "content": "Here is a thoughtful answer about Paris.",
+                "thinking": "Let me reason about this carefully.",
+                "done": True,
+                "stop_reason": "site_done",
+            }
+        )
+        with (
+            patch("sbsllm.server.extract_js", return_value="EXTRACT"),
+            patch(
+                "sbsllm.server.capture_response",
+                return_value={"found": False, "count": 0},
+            ),
+        ):
+            handler._handle_streaming_chat_completions(
+                "req-1", "gpt-4", "chatgpt", MagicMock(), 1, "hi", 0.0, 60.0
+            )
+        terminal_call = None
+        for call in handler._sse_chunk.call_args_list:
+            if call[1].get("finish_reason"):
+                terminal_call = call
+                break
+        assert terminal_call is not None, "no terminal chunk was emitted"
+        usage = terminal_call[1].get("usage")
+        assert usage is not None, "terminal chunk missing usage block"
+        assert usage["prompt_tokens"] > 0
+        assert usage["completion_tokens"] > 0
+        assert (
+            usage["total_tokens"] == usage["prompt_tokens"] + usage["completion_tokens"]
+        )
+        handler._send_sse.assert_any_call("[DONE]")
+
+
+class TestSSEConformance:
+    """OpenAI SSE wire-format conformance for the streaming path."""
+
+    @staticmethod
+    def _make_handler():
+        handler = OpenAIHandler.__new__(OpenAIHandler)
+        handler.model_map = {"gpt-4": "chatgpt"}
+        handler.tab_map = {"gpt-4": MagicMock()}
+        handler._build_web_prompt = MagicMock(return_value="Hello!")
+        handler._inject_and_submit_with_recovery = MagicMock(
+            return_value=({"inject": "OK", "submit": "OK"}, MagicMock())
+        )
+        handler._server_setting = MagicMock(return_value=60)
+        handler._acquire_browser_lock = MagicMock(
+            return_value=(threading.Lock(), True, 30.0)
+        )
+        handler._release_browser_lock = MagicMock()
+        handler._send_error = MagicMock()
+        handler._send_sse = MagicMock(side_effect=lambda x: x)
+        handler._send_sse_headers = MagicMock()
+        handler._send_sse_comment = MagicMock()
+        handler._sse_chunk = MagicMock()
+        handler.wfile = MagicMock()
+        handler.server = types.SimpleNamespace(
+            model_locks=_ModelLockRegistry(),
+            browser_lock_timeout=30,
+            browser_timeout=60,
+        )
+        return handler
+
+    def _run_success(self, handler):
+        with (
+            patch("sbsllm.server.extract_js", return_value="EXTRACT"),
+            patch(
+                "sbsllm.server.capture_response",
+                return_value={"found": False, "count": 0},
+            ),
+        ):
+            handler._handle_streaming_chat_completions(
+                "req-1", "gpt-4", "chatgpt", MagicMock(), 1, "hi", 0.0, 60.0
+            )
+
+    def test_usage_only_on_terminal_chunk(self):
+        """`usage` must ride only on the final chunk; the delta
+        chunks emitted while polling carry no usage block."""
+        handler = self._make_handler()
+
+        def fake_stream(*_args, **_kwargs):
+            # The delta chunks _stream_web_chat emits while polling.
+            handler._sse_chunk("chatcmpl-1", 1, "gpt-4", {"content": "Hello"})
+            handler._sse_chunk("chatcmpl-1", 1, "gpt-4", {"content": " world"})
+            return {
+                "content": "Hello world",
+                "thinking": None,
+                "done": True,
+                "stop_reason": "site_done",
+            }
+
+        handler._stream_web_chat = MagicMock(side_effect=fake_stream)
+        self._run_success(handler)
+
+        chunk_calls = handler._sse_chunk.call_args_list
+        assert len(chunk_calls) == 3
+        with_usage = [c for c in chunk_calls if c[1].get("usage") is not None]
+        assert len(with_usage) == 1
+        terminal = with_usage[0]
+        assert terminal is chunk_calls[-1]
+        assert terminal[1]["finish_reason"] == "stop"
+        assert terminal[1]["usage"]["prompt_tokens"] > 0
+        assert terminal[1]["usage"]["completion_tokens"] > 0
+        # Intermediate delta chunks: no usage, no finish_reason.
+        for call in chunk_calls[:-1]:
+            assert "usage" not in call[1]
+            assert call[1].get("finish_reason") is None
+
+    def test_terminal_chunk_precedes_done_sentinel(self):
+        """Wire order: delta chunks, then the terminal chunk
+        (finish_reason set), then the [DONE] sentinel -- last."""
+        handler = self._make_handler()
+        events = []
+        handler._sse_chunk = MagicMock(
+            side_effect=lambda *a, **k: events.append(("chunk", k.get("finish_reason")))
+        )
+        handler._send_sse = MagicMock(
+            side_effect=lambda data: events.append(("sse", data))
+        )
+
+        def fake_stream(*_args, **_kwargs):
+            handler._sse_chunk("chatcmpl-1", 1, "gpt-4", {"content": "Hello"})
+            return {
+                "content": "Hello",
+                "thinking": None,
+                "done": True,
+                "stop_reason": "site_done",
+            }
+
+        handler._stream_web_chat = MagicMock(side_effect=fake_stream)
+        self._run_success(handler)
+
+        assert events, "no SSE events were emitted"
+        assert events[-1] == ("sse", "[DONE]")
+        terminal_idx = max(i for i, e in enumerate(events) if e[0] == "chunk" and e[1])
+        assert terminal_idx < len(events) - 1
+        # Every chunk before the terminal one is a plain delta.
+        for event in events[:terminal_idx]:
+            if event[0] == "chunk":
+                assert event[1] is None
+
+    def test_reasoning_content_mirrors_thinking_delta(self):
+        """thinking deltas are mirrored byte-for-byte as
+        reasoning_content, and concatenated deltas reconstruct each
+        stream without duplication."""
+        handler = self._make_handler()
+
+        def mock_setting(name, default):
+            values = {
+                "response_idle_timeout": 1.0,
+                "response_done_confirm": 0.01,
+                "busy_patience": 60.0,
+                "thinking_patience": 60.0,
+                "first_token_timeout": 5.0,
+                "poll_interval": 0.01,
+                "keepalive_interval": 60.0,
+            }
+            return values.get(name, default)
+
+        handler._server_setting = MagicMock(side_effect=mock_setting)
+        responses = [
+            {
+                "found": True,
+                "content": "",
+                "thinking": "Let me",
+                "busy": True,
+                "done": False,
+                "count": 1,
+            },
+            {
+                "found": True,
+                "content": "Answer",
+                "thinking": "Let me think",
+                "busy": True,
+                "done": False,
+                "count": 2,
+            },
+            {
+                "found": True,
+                "content": "Answer",
+                "thinking": "Let me think",
+                "busy": False,
+                "done": True,
+                "count": 3,
+            },
+            {
+                "found": True,
+                "content": "Answer",
+                "thinking": "Let me think",
+                "busy": False,
+                "done": True,
+                "count": 4,
+            },
+        ]
+        state = {"i": 0}
+
+        def mock_capture(*_args, **_kwargs):
+            idx = min(state["i"], len(responses) - 1)
+            state["i"] += 1
+            return responses[idx]
+
+        with (
+            patch("sbsllm.server.capture_response", side_effect=mock_capture),
+            patch("sbsllm.server.time") as fake_time,
+        ):
+            clock = FakeClock()
+            fake_time.monotonic.side_effect = clock.monotonic
+            fake_time.sleep.side_effect = clock.sleep
+            fake_time.time.return_value = 1_700_000_000
+            result = handler._stream_web_chat(
+                MagicMock(),
+                "EXTRACT",
+                None,
+                "chatcmpl-test",
+                1234567890,
+                "gpt-4",
+                60.0,
+            )
+
+        assert result["stop_reason"] == "site_done"
+        thinking_parts = []
+        content_parts = []
+        for call in handler._sse_chunk.call_args_list:
+            delta = call[0][3]
+            if "thinking" in delta:
+                assert delta["reasoning_content"] == delta["thinking"]
+                thinking_parts.append(delta["thinking"])
+            if "content" in delta:
+                content_parts.append(delta["content"])
+        assert "".join(thinking_parts) == "Let me think"
+        assert "".join(content_parts) == "Answer"
+
+
+class TestStreamNonStreamParity:
+    """Streaming and non-streaming paths must honor one contract."""
+
+    @staticmethod
+    def _make_non_streaming_handler():
+        handler = OpenAIHandler.__new__(OpenAIHandler)
+        body = json.dumps(
+            {"model": "gpt-4", "messages": [{"role": "user", "content": "Hello!"}]}
+        ).encode()
+        handler.headers = {
+            "Content-Length": str(len(body)),
+            "x-request-id": "test-request-id",
+        }
+        handler.rfile = MagicMock()
+        handler.rfile.read.return_value = body
+        handler.model_map = {"gpt-4": "chatgpt"}
+        page_mock = MagicMock()
+        page_mock.is_closed.return_value = False
+        page_mock.evaluate.return_value = 2
+        handler.tab_map = {"gpt-4": page_mock}
+        handler._build_prompt = MagicMock(return_value="Hello!")
+        handler.server = MagicMock(
+            browser_lock=threading.Lock(),
+            browser_timeout=60,
+            browser_lock_timeout=10,
+        )
+        handler._send_json = MagicMock()
+        handler._send_error = MagicMock()
+        handler.send_response = MagicMock()
+        handler.send_header = MagicMock()
+        handler.end_headers = MagicMock()
+        handler.wfile = MagicMock()
+        handler.wfile.write = MagicMock()
+        return handler
+
+    @staticmethod
+    def _make_streaming_handler():
+        handler = OpenAIHandler.__new__(OpenAIHandler)
+        handler.model_map = {"gpt-4": "chatgpt"}
+        handler.tab_map = {"gpt-4": MagicMock()}
+        handler._build_web_prompt = MagicMock(return_value="Hello!")
+        handler._inject_and_submit_with_recovery = MagicMock(
+            return_value=({"inject": "OK", "submit": "OK"}, MagicMock())
+        )
+        handler._server_setting = MagicMock(return_value=60)
+        handler._acquire_browser_lock = MagicMock(
+            return_value=(threading.Lock(), True, 30.0)
+        )
+        handler._release_browser_lock = MagicMock()
+        handler._send_error = MagicMock()
+        handler._send_sse = MagicMock(side_effect=lambda x: x)
+        handler._send_sse_headers = MagicMock()
+        handler._send_sse_comment = MagicMock()
+        handler._sse_chunk = MagicMock()
+        handler.wfile = MagicMock()
+        handler.server = types.SimpleNamespace(
+            model_locks=_ModelLockRegistry(),
+            browser_lock_timeout=30,
+            browser_timeout=60,
+        )
+        return handler
+
+    def test_inject_failure_same_error_contract(self):
+        """A failed inject/submit answers with 502, error type
+        server_error and code inject_submit_failed on both paths."""
+        # Non-streaming path.
+        ns_handler = self._make_non_streaming_handler()
+        with patch("sbsllm.server.inject_and_submit") as mock_submit:
+            mock_submit.return_value = {
+                "tab": 1,
+                "inject": "NO_INPUT",
+                "submit": None,
+            }
+            with (
+                patch("sbsllm.server.inject_prompt"),
+                patch("sbsllm.server.submit_js"),
+                patch("sbsllm.server.extract_js", return_value="extract_js"),
+                patch("sbsllm.server.check_page_health", return_value=True),
+                patch(
+                    "sbsllm.server.capture_response",
+                    return_value={
+                        "content": "",
+                        "thinking": None,
+                        "busy": False,
+                        "done": False,
+                        "count": 0,
+                        "found": False,
+                    },
+                ),
+            ):
+                OpenAIHandler._handle_chat_completions(ns_handler)
+        ns_handler._send_error.assert_called_once()
+        ns_args = ns_handler._send_error.call_args
+        assert ns_args[0][0] == 502
+        assert ns_args[0][2] == "server_error"
+        assert ns_args.kwargs.get("code") == "inject_submit_failed"
+
+        # Streaming path.
+        s_handler = self._make_streaming_handler()
+        s_handler._inject_and_submit_with_recovery = MagicMock(
+            return_value=(
+                {"inject": "NO_INPUT", "submit": "NO_BUTTON"},
+                MagicMock(),
+            )
+        )
+        with (
+            patch("sbsllm.server.extract_js", return_value="EXTRACT"),
+            patch(
+                "sbsllm.server.capture_response",
+                return_value={"found": False, "count": 0},
+            ),
+        ):
+            s_handler._handle_streaming_chat_completions(
+                "req-1", "gpt-4", "chatgpt", MagicMock(), 1, "hi", 0.0, 60.0
+            )
+        s_handler._send_error.assert_called_once()
+        s_args = s_handler._send_error.call_args
+        assert s_args[0][0] == 502
+        assert s_args[0][2] == "server_error"
+        assert s_args.kwargs.get("code") == "inject_submit_failed"
+
+    def test_timeout_with_content_same_finish_reason(self):
+        """A truncated answer reports finish_reason="length" on both
+        paths: streaming terminal chunk vs non-streaming 200 response."""
+        partial = "The capital of France is Pa"
+
+        # Streaming: terminal chunk carries finish_reason="length".
+        s_handler = self._make_streaming_handler()
+        s_handler._stream_web_chat = MagicMock(
+            return_value={
+                "content": partial,
+                "thinking": None,
+                "done": False,
+                "stop_reason": "budget_exhausted",
+            }
+        )
+        with (
+            patch("sbsllm.server.extract_js", return_value="EXTRACT"),
+            patch(
+                "sbsllm.server.capture_response",
+                return_value={"found": False, "count": 0},
+            ),
+        ):
+            s_handler._handle_streaming_chat_completions(
+                "req-1", "gpt-4", "chatgpt", MagicMock(), 1, "hi", 0.0, 60.0
+            )
+        terminal = None
+        for call in s_handler._sse_chunk.call_args_list:
+            if call[1].get("finish_reason"):
+                terminal = call
+                break
+        assert terminal is not None
+        assert terminal[1]["finish_reason"] == "length"
+
+        # Non-streaming: 200 with the same finish_reason.
+        ns_handler = self._make_non_streaming_handler()
+        patches = (
+            patch(
+                "sbsllm.server.inject_and_submit",
+                return_value={"tab": 1, "inject": "OK", "submit": "OK"},
+            ),
+            patch("sbsllm.server.inject_prompt", return_value="inject_js"),
+            patch("sbsllm.server.submit_js", return_value="submit_js"),
+            patch("sbsllm.server.extract_js", return_value="EXTRACT_JS"),
+            patch("sbsllm.server.check_page_health", return_value=True),
+            patch(
+                "sbsllm.server.capture_response",
+                return_value={
+                    "found": False,
+                    "content": "",
+                    "thinking": None,
+                    "busy": False,
+                    "done": False,
+                    "count": 0,
+                },
+            ),
+            patch(
+                "sbsllm.server.wait_for_response",
+                return_value={
+                    "found": True,
+                    "content": partial,
+                    "thinking": None,
+                    "timed_out": True,
+                    "done": False,
+                },
+            ),
+            patch(
+                "sbsllm.server.get_page_snapshot",
+                return_value={"url": "http://x", "title": "t", "text_preview": ""},
+            ),
+        )
+        with (
+            patches[0],
+            patches[1],
+            patches[2],
+            patches[3],
+            patches[4],
+            patches[5],
+            patches[6],
+            patches[7],
+        ):
+            OpenAIHandler._handle_chat_completions(ns_handler)
+
+        ns_handler._send_error.assert_not_called()
+        ns_handler._send_json.assert_called_once()
+        data = ns_handler._send_json.call_args[0][1]
+        assert data["choices"][0]["message"]["content"] == partial
+        assert data["choices"][0]["finish_reason"] == "length"
+
+
+class TestSettingsPlumbing:
+    """Runtime settings must survive the Server -> _SBSHTTPServer hop.
+
+    Handlers read settings off `self.server`, so a setting added to
+    Server.__init__ but not published in Server.start (or not defaulted
+    in _SBSHTTPServer.__init__) silently reverts to the module default.
+    """
+
+    RUNTIME_SETTINGS: ClassVar[dict[str, float]] = {
+        "browser_timeout": 123,
+        "browser_lock_timeout": 234,
+        "response_idle_timeout": 1.5,
+        "response_done_confirm": 0.25,
+        "busy_patience": 2.5,
+        "thinking_patience": 3.5,
+        "first_token_timeout": 4.5,
+        "keepalive_interval": 5.5,
+        "poll_interval": 0.05,
+        "duplicate_prompt_cooldown": 6.5,
+    }
+
+    def test_create_server_signature_matches_server_init(self):
+        """The factory exposes exactly Server.__init__'s parameters."""
+        server_params = set(inspect.signature(Server.__init__).parameters)
+        factory_params = set(inspect.signature(create_server).parameters)
+        assert server_params - {"self"} == factory_params
+
+    def test_start_publishes_settings_to_http_server(self):
+        """Every runtime setting is published onto the HTTP server the
+        handlers read from, with the configured value."""
+        server = create_server(port=0, **self.RUNTIME_SETTINGS)
+        mock_http_server = MagicMock()
+        mock_http_server.handle_request.side_effect = [
+            socket.timeout,
+            KeyboardInterrupt(),
+        ]
+        with patch("sbsllm.server._SBSHTTPServer", return_value=mock_http_server):
+            thread = threading.Thread(target=server.start, daemon=True)
+            thread.start()
+            server.wait_until_ready(5)
+            server.stop()
+            thread.join(timeout=2)
+        for name, value in self.RUNTIME_SETTINGS.items():
+            assert getattr(mock_http_server, name) == value, name
+
+    def test_http_server_defaults_match_module_constants(self):
+        """A fresh _SBSHTTPServer defaults every runtime setting to
+        its module-level DEFAULT_ constant."""
+        from sbsllm.server import (
+            DEFAULT_BROWSER_LOCK_TIMEOUT,
+            DEFAULT_BROWSER_TIMEOUT,
+            DEFAULT_BUSY_PATIENCE,
+            DEFAULT_DUPLICATE_PROMPT_COOLDOWN,
+            DEFAULT_FIRST_TOKEN_TIMEOUT,
+            DEFAULT_KEEPALIVE_INTERVAL,
+            DEFAULT_POLL_INTERVAL,
+            DEFAULT_RESPONSE_DONE_CONFIRM,
+            DEFAULT_RESPONSE_IDLE_TIMEOUT,
+            DEFAULT_THINKING_PATIENCE,
+            _SBSHTTPServer,
+        )
+
+        httpd = _SBSHTTPServer(("127.0.0.1", 0), OpenAIHandler)
+        try:
+            assert httpd.browser_timeout == DEFAULT_BROWSER_TIMEOUT
+            assert httpd.browser_lock_timeout == DEFAULT_BROWSER_LOCK_TIMEOUT
+            assert httpd.response_idle_timeout == DEFAULT_RESPONSE_IDLE_TIMEOUT
+            assert httpd.response_done_confirm == DEFAULT_RESPONSE_DONE_CONFIRM
+            assert httpd.busy_patience == DEFAULT_BUSY_PATIENCE
+            assert httpd.thinking_patience == DEFAULT_THINKING_PATIENCE
+            assert httpd.first_token_timeout == DEFAULT_FIRST_TOKEN_TIMEOUT
+            assert httpd.keepalive_interval == DEFAULT_KEEPALIVE_INTERVAL
+            assert httpd.poll_interval == DEFAULT_POLL_INTERVAL
+            assert httpd.duplicate_prompt_cooldown == DEFAULT_DUPLICATE_PROMPT_COOLDOWN
+            assert isinstance(httpd.turn_registry, _TurnRegistry)
+            assert isinstance(httpd.model_locks, _ModelLockRegistry)
+        finally:
+            httpd.server_close()
+
 
 class TestHandlerHealthMetrics:
     """Tests for health and metrics endpoints."""
@@ -2078,7 +3073,12 @@ class TestNonStreamingPaths:
             handler._handle_chat_completions()
         handler._send_error.assert_called_once()
         assert handler._send_error.call_args[0][0] == 502
-        assert "unresponsive" in handler._send_error.call_args[0][1].lower()
+        # BrowserOperationTimeout means the Playwright worker thread is
+        # wedged and every later browser call will fail too; the message
+        # names the site and warns of a stuck worker thread.
+        msg = handler._send_error.call_args[0][1].lower()
+        assert "chatgpt" in msg
+        assert "unresponsive" in msg
 
     def test_non_streaming_internal_error(self):
         """An unexpected exception must surface as a 500."""
@@ -2260,3 +3260,287 @@ class FakeClock:
 
     def sleep(self, seconds):
         self.t += max(seconds, 0.01)
+
+
+class TestTurnRegistry:
+    """Unit tests for the duplicate-submit guard's storage."""
+
+    def _record(self, registry, model="gpt-4", prompt="hello"):
+        registry.record(model, prompt)
+
+    def test_fresh_registry_never_duplicate(self):
+        registry = _TurnRegistry()
+        assert registry.is_duplicate("gpt-4", "hello", 60.0) is False
+
+    def test_same_prompt_is_duplicate(self):
+        registry = _TurnRegistry()
+        self._record(registry)
+        assert registry.is_duplicate("gpt-4", "hello", 60.0) is True
+
+    def test_different_prompt_is_not_duplicate(self):
+        registry = _TurnRegistry()
+        self._record(registry)
+        assert registry.is_duplicate("gpt-4", "goodbye", 60.0) is False
+
+    def test_scope_is_per_model(self):
+        registry = _TurnRegistry()
+        self._record(registry)
+        assert registry.is_duplicate("claude-3", "hello", 60.0) is False
+
+    def test_cooldown_zero_disables_guard(self):
+        registry = _TurnRegistry()
+        self._record(registry)
+        assert registry.is_duplicate("gpt-4", "hello", 0.0) is False
+
+    def test_entry_expires_after_cooldown(self):
+        registry = _TurnRegistry()
+        clock = FakeClock()
+        with patch("sbsllm.server.time") as fake_time:
+            fake_time.monotonic.side_effect = clock.monotonic
+            self._record(registry)  # recorded at t=1000
+            # No retry for 61s: the entry ages out.
+            clock.t = 1000.0 + 61.0
+            assert registry.is_duplicate("gpt-4", "hello", 60.0) is False
+
+    def test_duplicate_slides_cooldown_window(self):
+        """A retry train cannot out-wait a fixed window: each suppressed
+        duplicate slides the window forward, so the prompt is never
+        re-sent for as long as retries keep arriving."""
+        registry = _TurnRegistry()
+        clock = FakeClock()
+        with patch("sbsllm.server.time") as fake_time:
+            fake_time.monotonic.side_effect = clock.monotonic
+            self._record(registry)  # recorded at t=1000
+            clock.t = 1050.0
+            # Retries 50s apart forever: every one lands inside the window
+            # that the previous retry slid forward.
+            for _ in range(5):
+                assert registry.is_duplicate("gpt-4", "hello", 60.0) is True
+                clock.t += 50.0
+            # Once the train stops, the entry ages out after one cooldown.
+            clock.t += 61.0
+            assert registry.is_duplicate("gpt-4", "hello", 60.0) is False
+
+
+class TestDuplicatePromptSuppression:
+    """A client retry train must not re-post the same prompt to a tab.
+
+    One POST = one inject+submit, but retrying clients POST the identical
+    request again after a failure (SSE reconnect, fetch/proxy retry), which
+    re-sends the prompt -- the reported repeating-loop bug. A duplicate
+    within `duplicate_prompt_cooldown` attaches to the turn already on
+    screen instead: its finished answer is returned directly, and an
+    in-flight one is followed without re-injecting.
+    """
+
+    COOLDOWN: ClassVar[float] = 60.0
+    ATTACHED: ClassVar[dict] = {
+        "found": True,
+        "content": "the answer",
+        "thinking": None,
+        "busy": False,
+        "done": True,
+        "count": 1,
+    }
+    IN_FLIGHT: ClassVar[dict] = {
+        "found": False,
+        "content": "",
+        "thinking": None,
+        "busy": True,
+        "done": False,
+        "count": 1,
+    }
+
+    def _make_streaming_handler(self, registry, **server_attrs):
+        handler = OpenAIHandler.__new__(OpenAIHandler)
+        handler.model_map = {"gpt-4": "chatgpt"}
+        handler.tab_map = {"gpt-4": MagicMock()}
+        handler._inject_and_submit_with_recovery = MagicMock(
+            return_value=({"inject": "OK", "submit": "OK"}, MagicMock())
+        )
+        handler._server_setting = MagicMock(return_value=self.COOLDOWN)
+        handler._acquire_browser_lock = MagicMock(
+            return_value=(threading.Lock(), True, 30.0)
+        )
+        handler._release_browser_lock = MagicMock()
+        handler._send_error = MagicMock()
+        handler._send_sse = MagicMock(side_effect=lambda x: x)
+        handler._send_sse_headers = MagicMock()
+        handler._send_sse_comment = MagicMock()
+        handler._sse_chunk = MagicMock()
+        handler._stream_web_chat = MagicMock(
+            return_value={
+                "content": "the answer",
+                "thinking": None,
+                "done": True,
+                "stop_reason": "site_done",
+            }
+        )
+        handler.wfile = MagicMock()
+        handler.server = types.SimpleNamespace(
+            model_locks=_ModelLockRegistry(),
+            browser_lock_timeout=30,
+            browser_timeout=60,
+            turn_registry=registry,
+            duplicate_prompt_cooldown=self.COOLDOWN,
+            **server_attrs,
+        )
+        return handler
+
+    def _call_streaming(self, handler, prompt="hi"):
+        with (
+            patch("sbsllm.server.extract_js", return_value="EXTRACT"),
+            patch(
+                "sbsllm.server.capture_response",
+                return_value=dict(self.ATTACHED),
+            ),
+        ):
+            handler._handle_streaming_chat_completions(
+                "req-1", "gpt-4", "chatgpt", MagicMock(), 1, prompt, 0.0, 60.0
+            )
+
+    def test_streaming_duplicate_attaches_without_resubmitting(self):
+        registry = _TurnRegistry()
+        handler = self._make_streaming_handler(registry)
+        self._call_streaming(handler, "hi")
+        assert handler._inject_and_submit_with_recovery.call_count == 1
+        assert registry.is_duplicate("gpt-4", "hi", self.COOLDOWN) is True
+
+        self._call_streaming(handler, "hi")
+        # The retry must NOT re-inject -- one submission total.
+        assert handler._inject_and_submit_with_recovery.call_count == 1
+        # And the retry still got the answer that is on screen: it sent its
+        # own SSE stream (headers once per request) ending in [DONE] with
+        # the attached answer as a delta.
+        assert handler._send_sse_headers.call_count == 2
+        done_calls = [
+            call
+            for call in handler._send_sse.call_args_list
+            if call.args[0] == "[DONE]"
+        ]
+        assert done_calls, "stream must end with [DONE]"
+        content_chunks = [
+            call
+            for call in handler._sse_chunk.call_args_list
+            if call.args[3].get("content") == "the answer"
+        ]
+        assert content_chunks, "attached answer must be streamed"
+
+    def test_streaming_new_prompt_submits_again(self):
+        registry = _TurnRegistry()
+        handler = self._make_streaming_handler(registry)
+        self._call_streaming(handler, "hi")
+        self._call_streaming(handler, "different question")
+        assert handler._inject_and_submit_with_recovery.call_count == 2
+
+    def test_streaming_cooldown_zero_disables_guard(self):
+        registry = _TurnRegistry()
+        handler = self._make_streaming_handler(registry)
+        handler._server_setting = MagicMock(return_value=0)
+        self._call_streaming(handler, "hi")
+        self._call_streaming(handler, "hi")
+        assert handler._inject_and_submit_with_recovery.call_count == 2
+
+    def test_streaming_duplicate_in_flight_follows_turn(self):
+        registry = _TurnRegistry()
+        handler = self._make_streaming_handler(registry)
+        # First request submits and records.
+        self._call_streaming(handler, "hi")
+        assert handler._inject_and_submit_with_recovery.call_count == 1
+
+        # Retry arrives while the turn is still generating: no re-inject,
+        # the response is followed via the poller instead.
+        handler._stream_web_chat.reset_mock()
+        with (
+            patch("sbsllm.server.extract_js", return_value="EXTRACT"),
+            patch(
+                "sbsllm.server.capture_response",
+                return_value=dict(self.IN_FLIGHT),
+            ),
+        ):
+            handler._handle_streaming_chat_completions(
+                "req-2", "gpt-4", "chatgpt", MagicMock(), 1, "hi", 0.0, 60.0
+            )
+        assert handler._inject_and_submit_with_recovery.call_count == 1
+        assert handler._stream_web_chat.call_count == 1
+        baseline = handler._stream_web_chat.call_args.args[2]
+        assert baseline["busy"] is True
+
+    def _make_nonstreaming_handler(self, registry, prompt="hello"):
+        handler = OpenAIHandler.__new__(OpenAIHandler)
+        body = json.dumps(
+            {"model": "gpt-4", "messages": [{"role": "user", "content": prompt}]}
+        ).encode()
+        handler.headers = {
+            "Content-Length": str(len(body)),
+            "x-request-id": "test-request-id",
+        }
+        handler.rfile = MagicMock()
+        handler.rfile.read.return_value = body
+        handler.model_map = {"gpt-4": "chatgpt"}
+        page_mock = MagicMock()
+        page_mock.is_closed.return_value = False
+        page_mock.evaluate.return_value = 2
+        handler.tab_map = {"gpt-4": page_mock}
+        handler.server = types.SimpleNamespace(
+            model_locks=_ModelLockRegistry(),
+            browser_lock_timeout=10,
+            browser_timeout=60,
+            turn_registry=registry,
+            duplicate_prompt_cooldown=self.COOLDOWN,
+        )
+        handler._send_json = MagicMock()
+        handler._send_error = MagicMock()
+        handler.send_response = MagicMock()
+        handler.send_header = MagicMock()
+        handler.end_headers = MagicMock()
+        handler.wfile = MagicMock()
+        return handler
+
+    def _call_nonstreaming(self, handler):
+        with (
+            patch("sbsllm.server.inject_prompt", return_value="inject_js"),
+            patch("sbsllm.server.submit_js", return_value="submit_js"),
+            patch("sbsllm.server.extract_js", return_value="EXTRACT_JS"),
+            patch("sbsllm.server.check_page_health", return_value=True),
+            patch("sbsllm.server.capture_response", return_value=dict(self.ATTACHED)),
+            patch(
+                "sbsllm.server.inject_and_submit",
+                return_value={"tab": 1, "inject": "OK", "submit": "OK"},
+            ) as mock_submit,
+            patch(
+                "sbsllm.server.wait_for_response",
+                return_value={
+                    "found": True,
+                    "content": "the answer",
+                    "thinking": None,
+                    "done": True,
+                    "count": 1,
+                },
+            ),
+        ):
+            handler._handle_chat_completions()
+            return mock_submit.call_count
+
+    def test_nonstreaming_duplicate_attaches_without_resubmitting(self):
+        registry = _TurnRegistry()
+        first = self._make_nonstreaming_handler(registry, "hello")
+        submits = self._call_nonstreaming(first)
+        assert submits == 1
+        assert first._send_json.call_args[0][0] == 200
+
+        second = self._make_nonstreaming_handler(registry, "hello")
+        submits += self._call_nonstreaming(second)
+        # The retry must NOT re-submit -- one submission total.
+        assert submits == 1
+        # And the retry still received the answer on screen.
+        assert second._send_json.call_args[0][0] == 200
+        assert "the answer" in json.dumps(second._send_json.call_args[0][1])
+
+    def test_nonstreaming_new_prompt_submits_again(self):
+        registry = _TurnRegistry()
+        first = self._make_nonstreaming_handler(registry, "hello")
+        submits = self._call_nonstreaming(first)
+        second = self._make_nonstreaming_handler(registry, "a different question")
+        submits += self._call_nonstreaming(second)
+        assert submits == 2

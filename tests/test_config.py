@@ -43,6 +43,24 @@ class TestConfigModel:
         with pytest.raises(ValueError):
             Config(chats=["chatgpt"], login_wait=-1)
 
+    def test_duplicate_prompt_cooldown_default(self):
+        from sbsllm.server import DEFAULT_DUPLICATE_PROMPT_COOLDOWN
+
+        config = Config(chats=["chatgpt"])
+        assert config.duplicate_prompt_cooldown == DEFAULT_DUPLICATE_PROMPT_COOLDOWN
+
+    def test_duplicate_prompt_cooldown_custom(self):
+        config = Config(chats=["chatgpt"], duplicate_prompt_cooldown=15.0)
+        assert config.duplicate_prompt_cooldown == 15.0
+
+    def test_duplicate_prompt_cooldown_zero_allowed(self):
+        config = Config(chats=["chatgpt"], duplicate_prompt_cooldown=0)
+        assert config.duplicate_prompt_cooldown == 0
+
+    def test_duplicate_prompt_cooldown_negative_raises(self):
+        with pytest.raises(ValueError):
+            Config(chats=["chatgpt"], duplicate_prompt_cooldown=-1)
+
     def test_default_thinking_patience(self):
         """thinking_patience defaults to DEFAULT_THINKING_PATIENCE (120s)."""
         from sbsllm.config import DEFAULT_THINKING_PATIENCE  # noqa: F401

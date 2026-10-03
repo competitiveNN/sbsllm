@@ -9,7 +9,11 @@ from typing import Any
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-from .server import DEFAULT_RESPONSE_IDLE_TIMEOUT, DEFAULT_THINKING_PATIENCE
+from .server import (
+    DEFAULT_DUPLICATE_PROMPT_COOLDOWN,
+    DEFAULT_RESPONSE_IDLE_TIMEOUT,
+    DEFAULT_THINKING_PATIENCE,
+)
 from .sites import list_sites
 
 MAX_LOGIN_WAIT = 24 * 60 * 60  # 24 hours
@@ -78,6 +82,17 @@ class Config(BaseModel):
     )
     json_log_format: bool = Field(
         default=False, description="Output logs in JSON format"
+    )
+    duplicate_prompt_cooldown: float = Field(
+        default=DEFAULT_DUPLICATE_PROMPT_COOLDOWN,
+        ge=0,
+        le=MAX_BROWSER_TIMEOUT,
+        description=(
+            "Seconds an identical prompt on the same chat tab is attached to "
+            "the existing answer instead of being sent again. Guards against "
+            "silent client retries (SSE reconnects, fetch/proxy retry) that "
+            "would otherwise re-post the prompt in a loop. 0 disables the guard."
+        ),
     )
 
     @field_validator("chats")

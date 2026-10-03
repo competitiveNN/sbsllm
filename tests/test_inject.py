@@ -415,3 +415,13 @@ class TestPostInjectSharedConstant:
 
         assert "shadowRoot" in _POST_INJECT_CONTENTEDITABLE
         assert "[data-sbsllm-input" in _POST_INJECT_CONTENTEDITABLE
+
+    def test_shared_constant_handles_both_editor_types(self):
+        """The shared constant must handle both contenteditable and
+        textarea/input editors (the else branch for plain text fields)."""
+        from sbsllm.sites import _POST_INJECT_CONTENTEDITABLE
+
+        assert "isContentEditable" in _POST_INJECT_CONTENTEDITABLE
+        assert "execCommand" in _POST_INJECT_CONTENTEDITABLE
+        assert "beforeinput" in _POST_INJECT_CONTENTEDITABLE
+        assert "dispatchEvent" in _POST_INJECT_CONTENTEDITABLE
