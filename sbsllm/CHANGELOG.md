@@ -4,6 +4,23 @@
 
 ### Fixed
 
+- **meta.ai stopped forwarding prompts after the first message.**
+  After the first send, meta.ai navigates to `/prompt/<uuid>`, which
+  renders a "Conversation title" input (`input[type="text"]`) next to
+  the composer. The meta inject selector list contained that generic
+  `input[type="text"]`, and it matched the title field *before* the
+  `textarea` / `[contenteditable]` fallbacks — so the second prompt
+  was typed into the conversation title instead of the composer. The
+  site then re-sent the previous turn's still-present text (a
+  duplicated answer), and once the composer had cleared, the third
+  prompt was never sent at all: Send stayed disabled and the local
+  chat read the stale answer (or waited it out). The selector list now
+  only matches the composer: the aria-labelled input, the
+  "Ask Meta AI" placeholder on input/textarea, the visible
+  contenteditable, then generic textareas. Verified against the live
+  site (three sequential turns each forwarded and extracted their own
+  answer) and with a mock `/prompt/<uuid>` page regression test
+  asserting the prompt never reaches the title input.
 - **Meta AI replies were never relayed to the local chat.** The assistant
   message row (`group/assistant-message`,
   `data-testid="assistant-message"`) shares its class substring with the

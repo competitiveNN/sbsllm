@@ -72,6 +72,16 @@ browser tab on a specific chat website (configured via `model_map`).
   replies never reached the local chat. The catch-all now excludes the action
   bar, and `data-streaming-state` / `data-streaming-complete="false"`
   attributes on the message row signal `busy` while generating.
+- **Meta chat**: after the first send the site navigates to
+  `/prompt/<uuid>`, which renders a "Conversation title" input
+  (`input[type="text"]`). The inject selector list contained that generic
+  `input[type="text"]`, which matched the title field before the
+  `textarea`/`[contenteditable]` fallbacks — from the second message on,
+  the prompt was typed into the conversation title (the site then
+  re-sent the previous turn's text, and later turns sent nothing).
+  The selector list now matches only the composer (aria-labelled
+  input, "Ask Meta AI" placeholders, the visible contenteditable,
+  generic textareas).
 - **Extraction keeps paragraph breaks**: answers are normalised with
   `normalize()` (per-line squash, blank runs collapsed) instead of a
   whole-text `squash()`, and detached clones are read with `blockTextOf()`

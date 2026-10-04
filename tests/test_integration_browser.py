@@ -1410,3 +1410,179 @@ class TestKimiIntegration:
                 assert extracted["busy"] is False, "still busy after response"
             finally:
                 browser.close()
+
+
+# --- meta.ai /prompt/<uuid> page tests ---
+
+# After the first message, meta.ai navigates to /prompt/<uuid>, which
+# renders a "Conversation title" input (type=text) next to the
+# composer. The composer itself is a visible contenteditable div with
+# a hidden textarea mirror (placeholder "Ask Meta AI..."). An inject
+# selector list that includes a generic `input[type="text"]` matches
+# the title field first, so from the second message on the prompt was
+# typed into the conversation title instead of the composer: the site
+# re-sent the previous turn's text (or nothing once the composer
+# cleared), and the local chat read the stale answer. This mock
+# mirrors that page structure.
+_META_PROMPT_MOCK_PAGE_HTML = """<!doctype html>
+<html><head><meta charset="utf-8"><title>mock meta prompt</title></head>
+<body>
+  <form id="meta-form">
+    <input type="text" id="conv-title" placeholder="Conversation title">
+    <textarea id="meta-composer" placeholder="Ask Meta AI..."
+              style="display:none"></textarea>
+    <div id="meta-editor" contenteditable="true"></div>
+    <button type="submit" id="meta-send" aria-label="Send" disabled>Send</button>
+  </form>
+  <div id="thread">
+    <div class="group/assistant-message" data-testid="assistant-message"
+         data-streaming-state="DONE" data-streaming-complete="true">
+      <div class="mt-4"><div class="markdown-content">
+        <div dir="auto" class="ur-markdown prose">
+          <div class="space-y-4"><p dir="auto">Previous answer</p></div>
+        </div>
+      </div></div>
+      <div class="group/assistant-message-actions">
+        <button aria-label="Like this response"><svg></svg></button>
+        <button aria-label="Dislike this response"><svg></svg></button>
+      </div>
+    </div>
+  </div>
+  <script>
+    var title = document.getElementById('conv-title');
+    var composer = document.getElementById('meta-composer');
+    var editor = document.getElementById('meta-editor');
+    var sendBtn = document.getElementById('meta-send');
+    var form = document.getElementById('meta-form');
+    var thread = document.getElementById('thread');
+    window.__submitPrompts = [];
+    // The site syncs the hidden textarea into the visible editor and
+    // the send button's disabled state.
+    composer.addEventListener('input', function() {
+      editor.textContent = this.value;
+      sendBtn.disabled = !this.value.trim();
+    });
+    form.addEventListener('submit', function(e) {
+      e.preventDefault();
+      window.__submitPrompts.push(composer.value);
+      var prompt = composer.value;
+      composer.value = '';
+      editor.textContent = '';
+      sendBtn.disabled = true;
+      var row = document.createElement('div');
+      row.className = 'group/assistant-message';
+      row.setAttribute('data-testid', 'assistant-message');
+      row.setAttribute('data-streaming-state', 'STREAMING');
+      row.setAttribute('data-streaming-complete', 'false');
+      row.innerHTML =
+        '<div class="mt-4"><div class="markdown-content">' +
+        '<div dir="auto" class="ur-markdown prose"><div class="space-y-4">' +
+        '<p dir="auto">Generating...</p></div></div></div></div>' +
+        '<div class="group/assistant-message-actions">' +
+        '<button aria-label="Like this response"><svg></svg></button>' +
+        '<button aria-label="Dislike this response"><svg></svg></button>' +
+        '</div>';
+      thread.appendChild(row);
+      setTimeout(function() {
+        row.querySelector('p[dir="auto"]').textContent = 'Answer: ' + prompt;
+        row.setAttribute('data-streaming-state', 'DONE');
+        row.setAttribute('data-streaming-complete', 'true');
+      }, 300);
+    });
+  </script>
+</body></html>
+"""
+
+
+class _MetaPromptHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(_META_PROMPT_MOCK_PAGE_HTML.encode())
+
+    def log_message(self, *args):  # silence
+        pass
+
+
+@pytest.fixture(scope="module")
+def mock_meta_prompt_server():
+    with socketserver.TCPServer(("127.0.0.1", 0), _MetaPromptHandler) as httpd:
+        port = httpd.server_address[1]
+        url = f"http://127.0.0.1:{port}"
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        yield url
+    thread.join(timeout=5)
+
+
+class TestMetaPromptPage:
+    """meta.ai's post-first-message page: the prompt must land in the
+    composer, never in the conversation-title input."""
+
+    def test_inject_targets_composer_not_title_input(self, mock_meta_prompt_server):
+        """Regression guard: the inject selector list used to contain a
+        generic `input[type="text"]`, which matched the conversation-title
+        field rendered on /prompt/<uuid> before the composer -- so the
+        second and later prompts never reached the chat."""
+        with pw.sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+            page = browser.new_page()
+            page.goto(mock_meta_prompt_server, wait_until="networkidle")
+            try:
+                assert page.evaluate(
+                    inject_prompt("meta", "second turn prompt")
+                ) == "OK"
+                # The trap: the title input must stay empty.
+                title_value = page.evaluate(
+                    "document.getElementById('conv-title').value"
+                )
+                assert title_value == "", "prompt leaked into the title input"
+                # The prompt reached the hidden composer mirror...
+                composer_value = page.evaluate(
+                    "document.getElementById('meta-composer').value"
+                )
+                assert composer_value == "second turn prompt"
+                # ...and the site sync carried it into the visible editor.
+                editor_text = page.evaluate(
+                    "document.getElementById('meta-editor').textContent"
+                )
+                assert editor_text == "second turn prompt"
+                # The marked input is the composer, not the title field.
+                marked_placeholder = page.evaluate(
+                    "document.querySelector('[data-sbsllm-input=\"true\"]')"
+                    "?.getAttribute('placeholder')"
+                )
+                assert marked_placeholder == "Ask Meta AI..."
+            finally:
+                browser.close()
+
+    def test_full_cycle_sends_prompt_once(self, mock_meta_prompt_server):
+        """inject -> submit -> extract round-trips on the /prompt page:
+        the form submit handler receives exactly the injected prompt and
+        the new assistant row is extracted (not the previous answer)."""
+        with pw.sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+            page = browser.new_page()
+            page.goto(mock_meta_prompt_server, wait_until="networkidle")
+            try:
+                assert page.evaluate(
+                    inject_prompt("meta", "third turn prompt")
+                ) == "OK"
+                assert page.evaluate(submit_js("meta")) == "OK"
+                page.wait_for_function(
+                    "(() => { const rows ="
+                    " document.querySelectorAll('[data-testid=\"assistant-message\"]');"
+                    " return rows.length === 2 && rows[1].getAttribute("
+                    "'data-streaming-complete') === 'true'; })()",
+                    timeout=3000,
+                )
+                submitted = page.evaluate("window.__submitPrompts")
+                assert submitted == ["third turn prompt"], submitted
+                extracted = page.evaluate(extract_js("meta"))
+                assert extracted["found"] is True, f"expected answer: {extracted}"
+                assert "third turn prompt" in extracted["content"]
+                assert "Previous answer" not in extracted["content"]
+                assert extracted["busy"] is False
+            finally:
+                browser.close()

@@ -1280,11 +1280,10 @@ SITES: dict[str, dict] = {
         "inject": _inject_js("""
             document.querySelector('input[aria-label="Ask Meta AI"]')
                 || document.querySelector('input[placeholder*="Ask Meta AI"]')
-                || document.querySelector('input[placeholder*="Ask"]')
-                || document.querySelector('input[placeholder*="Message"]')
-                || document.querySelector('input[type="text"]')
-                || document.querySelector('textarea')
+                || document.querySelector('textarea[placeholder*="Ask Meta AI"]')
                 || document.querySelector('[contenteditable="true"]')
+                || document.querySelector('textarea[placeholder*="Ask"]')
+                || document.querySelector('textarea')
         """),
         "post_inject_js": _POST_INJECT_CONTENTEDITABLE,
         "setup_js": """
