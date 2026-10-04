@@ -117,6 +117,7 @@ def _extract(page, html, site_id="zai"):
         SITES[site_id]["thinking_selectors"],
         SITES[site_id]["loading_selectors"],
         SITES[site_id].get("login_wall_selectors", []),
+        SITES[site_id].get("response_container"),
     )
     return page.evaluate(js)
 
@@ -617,3 +618,171 @@ class TestMetaExtraction:
         result = _extract(extract_page, html, site_id="meta")
         assert result["content"] == "Newest reply."
         assert result["count"] == 2
+
+
+class TestHuggingFaceExtraction:
+    """huggingface.co/chat markup, as rendered by chat-ui's
+    ChatMessage.svelte / OpenReasoningResults.svelte.
+
+    The assistant turn is marked `data-message-role="assistant"` (NOT
+    `data-message-author-role`), the answer lives in a `div.prose`
+    whose class list has no `prose-sm`, and the reasoning viewport's
+    prose carries `prose-sm`. The old selectors
+    (`data-message-author-role`, `.assistant-message`,
+    `[class*="assistant"]`) never matched, so the answer was never
+    extracted: only the thinking trace streamed and the local chat
+    waited forever for the reply. The action bar (router metadata,
+    copy/retry buttons) also sits inside the turn, so a whole-turn
+    selector would leak "route with <model> via <org>" into the answer.
+    """
+
+    @staticmethod
+    def _message(answer, *, reasoning=None, streaming=False):
+        thinking = ""
+        if reasoning is not None:
+            thinking = f"""
+              <div data-exclude-from-copy class="not-last:mb-1 has-[+.prose]:mb-2!">
+                <div class="not-last:mb-1">
+                  <button type="button" aria-label="Collapse" class="group/header">
+                    <span class="text-sm thinking-shimmer">Thinking</span>
+                  </button>
+                  <div class="thinking-viewport mt-2 flex max-h-56 flex-col justify-end overflow-hidden md:max-h-80">
+                    <div class="prose prose-sm max-w-none text-sm leading-relaxed">
+                      <p>{reasoning}</p>
+                    </div>
+                  </div>
+                </div>
+              </div>"""
+        stop = (
+            '<button type="button" class="stop-generating-btn" aria-label="Stop generating">'
+            '<span class="sr-only">Stop generating</span></button>'
+            if streaming
+            else ""
+        )
+        # The answer prose only renders once text exists, so a
+        # thinking-only turn has no prose block at all.
+        answer_html = (
+            f"""
+            <div class="prose max-w-none text-smd dark:prose-invert prose-headings:font-semibold">
+              <p>{answer}</p>
+            </div>"""
+            if answer
+            else ""
+        )
+        return f"""
+        <div data-message-id="m1" data-message-role="assistant" role="presentation"
+             class="group relative -mb-4 flex w-fit max-w-full items-start justify-start gap-4 pb-4 leading-relaxed">
+          <div class="mt-5 size-3.5 flex-none select-none rounded-full"></div>
+          <div class="relative flex min-w-[60px] flex-col gap-2 rounded-2xl border px-5 py-3.5">
+            <div>
+              {answer_html}{thinking}
+            </div>
+          </div>
+          <div class="absolute -bottom-3.5 right-1 flex max-w-[100%] items-center gap-0.5">
+            <div class="mr-2 flex items-center gap-1.5 truncate text-gray-400">
+              <span>router</span><span>with</span><span>model</span><span>via</span><span>provider</span>
+            </div>
+            <button class="btn" title="Copy"><svg></svg></button>
+            <button class="btn" title="Retry"><svg></svg></button>
+          </div>
+        </div>
+        {stop}
+        """
+
+    def test_answer_extracted_without_thinking_or_metadata(self, extract_page):
+        result = _extract(
+            extract_page,
+            self._message("The answer is 4.", reasoning="Let me add 2 and 2."),
+            site_id="huggingface",
+        )
+        assert result["found"] is True
+        assert result["content"] == "The answer is 4.", result["content"]
+        # The reasoning trace streams as thinking, not as the answer...
+        assert result["thinking"] == "Let me add 2 and 2.", result["thinking"]
+        # ...and the action bar's router metadata never leaks in.
+        assert "via" not in result["content"]
+        assert "router" not in result["content"]
+        assert result["done"] is True
+        assert result["busy"] is False
+        assert result["count"] == 1
+
+    @staticmethod
+    def _pending_message(*, reasoning=None):
+        """The newest turn while it is still pending, exactly as a
+        live probe captured it: the container (with the loading
+        ball) is already in the DOM but no answer prose has
+        rendered yet -- and once reasoning streams, its viewport
+        renders before the answer prose does."""
+        thinking = ""
+        if reasoning is not None:
+            thinking = """
+              <div class="thinking-viewport mt-2 flex max-h-56 flex-col justify-end overflow-hidden md:max-h-80">
+                <div class="prose prose-sm max-w-none text-sm leading-relaxed">
+                  <p>""" + reasoning + """</p>
+                </div>
+              </div>"""
+        return f"""
+        <div data-message-id="m2" data-message-role="assistant" role="presentation"
+             class="group relative -mb-4 flex w-fit max-w-full items-start justify-start gap-4 pb-4 leading-relaxed">
+          <svg id="ball" width="1em" height="1em" viewBox="0 0 12 12"></svg>
+          <div class="relative flex min-w-[60px] flex-col gap-2 rounded-2xl border px-5 py-3.5">
+            <div>{thinking}</div>
+          </div>
+        </div>
+        """
+
+    def test_pending_turn_reports_no_content(self, extract_page):
+        """Regression: while the newest turn is still pending it has
+        no prose, so a document-wide selector's last match was the
+        PREVIOUS turn's answer -- the first response leaked into the
+        second. The extraction must report nothing until the newest
+        turn renders its own prose."""
+        html = self._message("First answer.") + self._pending_message()
+        result = _extract(extract_page, html, site_id="huggingface")
+        assert result["found"] is False, result
+        assert result["content"] == "", result
+        assert result["done"] is False, result
+
+    def test_pending_turn_thinking_scoped_to_newest(self, extract_page):
+        """The previous turn's reasoning block stays in the DOM; only
+        the newest turn's trace may stream as thinking."""
+        html = (
+            self._message("First answer.", reasoning="Old reasoning.")
+            + self._pending_message(reasoning="New reasoning.")
+        )
+        result = _extract(extract_page, html, site_id="huggingface")
+        assert result["found"] is False, result
+        assert result["content"] == "", result
+        assert result["thinking"] == "New reasoning.", result
+
+    def test_thinking_only_phase_yields_no_content(self, extract_page):
+        """While the model is still thinking there is no answer prose,
+        so extraction must report no content (the trace streams as
+        thinking) instead of rendering the reasoning as the answer."""
+        result = _extract(
+            extract_page,
+            self._message("", reasoning="Still reasoning about it."),
+            site_id="huggingface",
+        )
+        assert result["found"] is False
+        assert result["content"] == ""
+        assert result["thinking"] == "Still reasoning about it."
+        assert result["busy"] is False
+
+    def test_stop_control_keeps_stream_open(self, extract_page):
+        result = _extract(
+            extract_page,
+            self._message("Partial ans", streaming=True),
+            site_id="huggingface",
+        )
+        assert result["content"] == "Partial ans"
+        assert result["busy"] is True
+        assert result["done"] is False
+
+    def test_newest_turn_wins(self, extract_page):
+        html = self._message("Older reply.") + self._message("Newest reply.")
+        result = _extract(extract_page, html, site_id="huggingface")
+        assert result["content"] == "Newest reply."
+        # Count is scoped to the response container (the newest
+        # turn), so it is the prose matches inside that turn.
+        assert result["count"] == 1

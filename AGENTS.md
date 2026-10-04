@@ -102,6 +102,27 @@ browser tab on a specific chat website (configured via `model_map`).
 - **Grok chat**: `inject` and `submit_js` now fall back to scanning shadow roots
   for the TipTap/ProseMirror editor and send button.
 - **Kimi URL**: Corrected to `https://www.kimi.ai/`.
+- **HuggingFace chat**: chat-ui marks assistant turns with
+  `data-message-role="assistant"` (NOT `data-message-author-role`)
+  and renders the answer in a `div.prose` whose class list carries no
+  `prose-sm`; the reasoning viewport's prose does. The old selectors
+  (`data-message-author-role`, `.assistant-message`,
+  `[class*="assistant"])` never matched, so only the thinking trace
+  streamed and the answer never reached the local chat. The action
+  bar (router metadata, copy/retry) lives inside the turn, so a
+  whole-turn selector would leak "route with <model> via <org>" into
+  every answer. The extraction is also scoped to the newest turn via
+  `response_container` (`[data-message-role="assistant"]`): chat-ui
+  keeps every turn in the DOM, so while the newest turn is still
+  pending (container rendered, no prose yet) an unscoped last-match
+  selector returned the PREVIOUS turn's finished answer -- the first
+  response leaked into the second. With the container, a pending turn
+  reports `found=false` until its own prose appears, and reasoning
+  blocks are read only inside the newest turn. Also: the composer
+  placeholder is "Ask anything", and
+  the first-load welcome overlay's only button ("Start chatting")
+  redirects to login, so `setup_js` dismisses it with Escape (Modal
+  listens for keydown on window) instead of clicking.
 - **Browser worker lifecycle**: `_stop_browser_worker` no longer enqueues a
   `None` shutdown sentinel when the worker is already dead (it left the
   sentinel in the shared `_browser_queue`, so the next worker dequeued it and

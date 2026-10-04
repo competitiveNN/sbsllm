@@ -376,13 +376,17 @@ _RESPONSE_TEMPLATE = """
             }
             return elements;
         };
-        const matches = (selectors) => {
+        const matches = (selectors, root) => {
             // Light-DOM first (cheap, and the common case), then shadow roots.
+            // A root scopes the scan to one turn's subtree: older turns
+            // stay in the DOM, so an unscoped scan accumulates every
+            // turn's reasoning blocks into each capture.
+            const base = root || document;
             const light = [];
             const seen = new Set();
             for (const selector of selectors) {
                 try {
-                    for (const element of document.querySelectorAll(selector)) {
+                    for (const element of base.querySelectorAll(selector)) {
                         if (!seen.has(element)) {
                             seen.add(element);
                             light.push(element);
@@ -390,7 +394,10 @@ _RESPONSE_TEMPLATE = """
                     }
                 } catch (_) {}
             }
-            const shadow = matchesInShadow(selectors);
+            // Shadow roots live outside any light-DOM subtree, so a
+            // scoped scan cannot reach them; only unscoped sites get
+            // the shadow fallback.
+            const shadow = root ? [] : matchesInShadow(selectors);
             for (const element of shadow) {
                 if (!seen.has(element)) {
                     seen.add(element);
@@ -463,16 +470,42 @@ _RESPONSE_TEMPLATE = """
             }
             return out;
         };
+        // chat-ui keeps every turn of the conversation in the DOM, so a
+        // selector matching "the assistant prose" matches EVERY turn.
+        // Taking the last visible match is right once the newest turn
+        // has rendered its answer, but while that turn is still pending
+        // it has no prose at all -- the last match is then the PREVIOUS
+        // turn's finished answer, and the extraction reports a reply
+        // for a turn that has not produced one (the first response
+        // leaks into the second). Sites that mark each turn with a
+        // container attribute (chat-ui: data-message-role="assistant")
+        // can scope the extraction to the newest turn: the answer and
+        // the reasoning are read only inside the last container, and a
+        // pending turn reports found=false until its own prose appears.
+        const responseContainer = __RESPONSE_CONTAINER__;
+        let responseRoot = null;
+        if (responseContainer) {
+            const hosts = Array.from(
+                document.querySelectorAll(responseContainer)
+            ).filter(isVisible);
+            if (hosts.length) {
+                responseRoot = hosts[hosts.length - 1];
+            }
+        }
         let response = null;
         let responseCount = 0;
         for (const selector of responseSelectors) {
+            const root = responseRoot || document;
             let nodes = [];
             try {
-                nodes = Array.from(document.querySelectorAll(selector));
+                nodes = Array.from(root.querySelectorAll(selector));
             } catch (_) {
                 nodes = [];
             }
-            if (!nodes.length) {
+            // The shadow-root fallback scans the whole document; with a
+            // response container that would unscop the extraction, so it
+            // is only used for sites without one.
+            if (!nodes.length && !responseRoot) {
                 try {
                     nodes = _shadowAll(selector);
                 } catch (_) {
@@ -487,11 +520,13 @@ _RESPONSE_TEMPLATE = """
             }
         }
 
-        // Reasoning: read each thinking container from a detached copy with
-        // its collapsible header removed, and skip containers that only hold
-        // the collapsed label.
+        // Reasoning: read each thinking container from a detached copy
+        // with its collapsible header removed, and skip containers that
+        // only hold the collapsed label. Scoped to the response
+        // container when the site has one, so the previous turns'
+        // traces do not accumulate into this turn's capture.
         const thinkingParts = [];
-        for (const node of matches(thinkingSelectors)) {
+        for (const node of matches(thinkingSelectors, responseRoot)) {
             if (!isVisible(node)) continue;
             const clone = node.cloneNode(true);
             for (const header of Array.from(clone.querySelectorAll(
@@ -623,8 +658,16 @@ def _response_js(
     thinking_selectors: list[str] | tuple[str, ...] | None = None,
     loading_selectors: list[str] | tuple[str, ...] | None = None,
     login_wall_selectors: list[str] | tuple[str, ...] | None = None,
+    response_container: str | None = None,
 ) -> str:
-    """Build JS that extracts the newest assistant response from a page."""
+    """Build JS that extracts the newest assistant response from a page.
+
+    ``response_container`` is a selector for the per-turn container
+    (chat-ui's ``[data-message-role="assistant"]``). When set, the
+    answer and reasoning are read only inside the NEWEST matching
+    container, so a pending turn can never report the previous
+    turn's answer or reasoning.
+    """
     return (
         _RESPONSE_TEMPLATE.replace(
             "__RESPONSE_SELECTORS__", json.dumps(list(response_selectors or []))
@@ -634,6 +677,7 @@ def _response_js(
         .replace(
             "__LOGIN_WALL_SELECTORS__", json.dumps(list(login_wall_selectors or []))
         )
+        .replace("__RESPONSE_CONTAINER__", json.dumps(response_container))
     )
 
 
@@ -1353,7 +1397,8 @@ SITES: dict[str, dict] = {
     "huggingface": {
         "url": "https://huggingface.co/chat",
         "inject": _inject_js("""
-            document.querySelector('textarea[placeholder*="Message"]')
+            document.querySelector('textarea[placeholder*="Ask anything"]')
+                || document.querySelector('textarea[placeholder*="Message"]')
                 || document.querySelector('textarea[placeholder*="Ask"]')
                 || document.querySelector('textarea')
                 || document.querySelector('[contenteditable="true"]')
@@ -1365,13 +1410,56 @@ SITES: dict[str, dict] = {
                 || document.querySelector('button[class*=\"send\"]')
                 || document.querySelector('textarea')?.closest('form')?.querySelector('button')
         """),
+        "setup_js": """
+            (() => {
+                // chat-ui greets first-time visitors with a welcome
+                // overlay whose only button ("Start chatting") redirects
+                // to the login page, so it must never be clicked.
+                // Escape closes it (Modal.svelte listens for keydown on
+                // window) and leaves the chat behind it in place.
+                try {
+                    const overlay = document.querySelector('.fixed.inset-0');
+                    if (!overlay) return 'OK';
+                    if (!(overlay.innerText || '').includes('Start chatting')) {
+                        return 'OK';
+                    }
+                    const escape = new KeyboardEvent('keydown', {
+                        key: 'Escape', bubbles: true, cancelable: true,
+                    });
+                    window.dispatchEvent(escape);
+                    document.dispatchEvent(escape);
+                } catch (_) {}
+                return 'OK';
+            })()
+        """,
+        # chat-ui marks the assistant turn with data-message-role="assistant"
+        # (NOT data-message-author-role) and renders the answer in a
+        # div.prose whose class list carries no prose-sm; the reasoning
+        # viewport's prose does carry prose-sm, so :not() keeps the
+        # thinking trace out of the answer. The previous selectors
+        # (data-message-author-role, .assistant-message,
+        # [class*="assistant"]) never matched anything in chat-ui's
+        # markup, so the answer was never extracted: only the thinking
+        # trace streamed and the local chat waited forever for the
+        # reply. The action bar (router metadata, copy/retry buttons)
+        # also lives inside the turn, so a whole-turn selector would
+        # leak "route with <model> via <org>" into every answer.
+        # The container scopes the extraction to the NEWEST turn:
+        # chat-ui keeps every turn in the DOM, so while the newest
+        # turn is still pending (no prose rendered yet) an unscoped
+        # last-match selector returned the PREVIOUS turn's answer --
+        # the first response leaked into the second.
+        "response_container": '[data-message-role="assistant"]',
         "response_selectors": [
-            '[data-message-author-role="assistant"]',
-            ".assistant-message",
-            '[class*="assistant"]',
-            "article .markdown",
+            '[data-message-role="assistant"] div.prose:not([class*="prose-sm"])',
         ],
         "thinking_selectors": [
+            # The reasoning viewport holds the thinking prose while the
+            # block streams (it auto-expands while loading and unmounts
+            # when the block closes). The "Thinking" label span also
+            # matches the catch-all, but the extraction JS filters
+            # label-only text.
+            '.thinking-viewport',
             '[class*="thinking"]',
             '[class*="reasoning"]',
         ],
@@ -1382,6 +1470,9 @@ SITES: dict[str, dict] = {
         ],
         "loading_selectors": [
             *_LOADING_SELECTORS,
+            # chat-ui's stop control while a reply generates
+            # (aria-label="Stop generating", class stop-generating-btn).
+            ".stop-generating-btn",
         ],
     },
     "tencent": {
@@ -1432,6 +1523,8 @@ _SELECTOR_KEYS = frozenset(
 )
 # Optional JS blocks that must be non-empty strings when present.
 _OPTIONAL_JS_KEYS = ("post_inject_js", "setup_js")
+# Optional CSS selectors (non-empty strings) that refine extraction.
+_OPTIONAL_SELECTOR_KEYS = ("response_container",)
 
 
 def validate_site_config(site_id: str, site: dict) -> list[str]:
@@ -1467,6 +1560,11 @@ def validate_site_config(site_id: str, site: dict) -> list[str]:
             value = site[key]
             if not isinstance(value, str) or not value.strip():
                 problems.append(f"{site_id}: key {key!r} must be a non-empty string")
+    for key in _OPTIONAL_SELECTOR_KEYS:
+        if key in site:
+            value = site[key]
+            if not isinstance(value, str) or not value.strip():
+                problems.append(f"{site_id}: key {key!r} must be a non-empty selector")
     inject = site.get("inject")
     if isinstance(inject, str) and "PROMPT_PLACEHOLDER" not in inject:
         problems.append(f"{site_id}: inject JS must contain PROMPT_PLACEHOLDER")
