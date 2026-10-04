@@ -4,6 +4,18 @@
 
 ### Fixed
 
+- **Meta AI replies were never relayed to the local chat.** The assistant
+  message row (`group/assistant-message`,
+  `data-testid="assistant-message"`) shares its class substring with the
+  action bar (`group/assistant-message-actions`), so the
+  `[class*="assistant-message"]` catch-all matched both and selection —
+  which takes the last match — landed on the icon-only Like/Dislike/Copy
+  buttons, yielding empty content. Response selection now prefers the
+  precise `data-testid` and the catch-all excludes the action bar, and the
+  message row's own `data-streaming-state` / `data-streaming-complete`
+  attributes now drive `busy` so long answers are not cut at the first idle
+  window. Verified with extraction tests built from the live-site markup
+  (answer extraction, streaming busy signal, newest-message selection).
 - **Extracted answers lost their paragraph breaks.** The extraction pipeline
   squashed every whitespace run into a single space, and the pruning path
   read a detached clone with `textContent`, which carries no layout-derived

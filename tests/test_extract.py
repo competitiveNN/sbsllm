@@ -539,3 +539,81 @@ class TestLoginWallSelectors:
         """
         result = _extract(extract_page, html)
         assert result["login_wall"] is False
+
+
+class TestMetaExtraction:
+    """meta.ai message markup, as dumped from the live site.
+
+    The message row is `group/assistant-message` (so `.assistant-message`
+    never matches) with `data-testid="assistant-message"`. The action bar
+    shares the class substring (`group/assistant-message-actions`), so the
+    old `[class*="assistant-message"]` catch-all matched both and selection
+    took the LAST match — the icon-only action buttons. Content therefore
+    came back empty and replies were never relayed to the local chat.
+    """
+
+    @staticmethod
+    def _message(answer, *, streaming=False):
+        state = (
+            'data-streaming-state="STREAMING" data-streaming-complete="false"'
+            if streaming
+            else 'data-streaming-state="DONE" data-streaming-complete="true"'
+        )
+        return f"""
+        <div data-slot="flexbox" class="min-h-0 min-w-0 flex flex-col shrink-0">
+          <div class="relative w-full min-w-0">
+            <div class="group/assistant-message relative min-w-0"
+                 data-testid="assistant-message" {state}>
+              <div class="mx-auto flex w-full max-w-3xl items-start gap-3">
+                <div class="-ms-1 flex shrink-0 items-center">
+                  <img alt="" width="24" height="24" class="invisible"
+                       src="/images/cot_logo_static/orbit.png">
+                </div>
+              </div>
+              <div class="mt-4"><div class="markdown-content min-w-0">
+                <div dir="auto" class="ur-markdown prose prose-trimmed citation-aware">
+                  <div class="space-y-4 flex flex-col gap-6">
+                    <p dir="auto">{answer}</p>
+                  </div>
+                </div>
+              </div></div>
+              <div class="group/assistant-message-actions mx-auto flex min-h-11">
+                <button aria-label="Like this response"><svg viewBox="0 0 24 24"></svg></button>
+                <button aria-label="Dislike this response"><svg viewBox="0 0 24 24"></svg></button>
+                <button aria-label="Copy response"><svg viewBox="0 0 24 24"></svg></button>
+                <button aria-label="Share"><svg viewBox="0 0 24 24"></svg></button>
+              </div>
+              <div aria-hidden="true" class="rounded-22 absolute inset-0"></div>
+            </div>
+          </div>
+        </div>
+        """
+
+    def test_answer_is_extracted_not_the_action_bar(self, extract_page):
+        html = self._message("Hey — I'm here and listening. What do you want to test?")
+        result = _extract(extract_page, html, site_id="meta")
+        assert result["found"] is True
+        assert (
+            result["content"]
+            == "Hey — I'm here and listening. What do you want to test?"
+        ), result["content"]
+        assert result["done"] is True
+        assert result["busy"] is False
+        # Only the message row itself; the action bar must not be selected.
+        assert result["count"] == 1
+
+    def test_streaming_state_reports_busy(self, extract_page):
+        """While meta.ai is generating, its own streaming-state attributes
+        are the positive busy signal; without them the site never reports
+        busy and long answers end at the first idle window."""
+        html = self._message("Partial ans", streaming=True)
+        result = _extract(extract_page, html, site_id="meta")
+        assert result["busy"] is True
+        assert result["done"] is False
+        assert result["content"] == "Partial ans"
+
+    def test_newest_message_wins(self, extract_page):
+        html = self._message("Older reply.") + self._message("Newest reply.")
+        result = _extract(extract_page, html, site_id="meta")
+        assert result["content"] == "Newest reply."
+        assert result["count"] == 2

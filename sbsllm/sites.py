@@ -1312,11 +1312,20 @@ SITES: dict[str, dict] = {
                 || document.querySelector('button[class*="send"]')
                 || document.querySelector('textarea')?.closest('form')?.querySelector('button')
         """),
+        # meta.ai marks the message row with data-testid="assistant-message"
+        # (class token is `group/assistant-message`, so `.assistant-message`
+        # never matches). The catch-all below ALSO matched the action bar
+        # (`group/assistant-message-actions`), and with selection taking the
+        # LAST match the icon-only Like/Dislike/Copy buttons won — content
+        # came back empty, so replies were never relayed to the local chat.
+        # The precise testid therefore goes first, and the class catch-all
+        # excludes the action bar.
         "response_selectors": [
+            '[data-testid="assistant-message"]',
             '[data-testid="ai-message"]',
             '[data-message-author-role="assistant"]',
+            '[class*="assistant-message"]:not([class*="assistant-message-actions"])',
             ".assistant-message",
-            '[class*="assistant-message"]',
             "article .markdown",
         ],
         "thinking_selectors": [
@@ -1331,6 +1340,15 @@ SITES: dict[str, dict] = {
         ],
         "loading_selectors": [
             *_LOADING_SELECTORS,
+            # meta.ai flags the message row itself while generating
+            # (done state reads data-streaming-state="DONE" /
+            # data-streaming-complete="true"). Without one of these the site
+            # never reports busy and long answers end at the first idle
+            # window. The node IS the response, so it passes the
+            # inside-response test in the busy filter.
+            '[data-streaming-complete="false"]',
+            '[data-streaming-state="STREAMING"]',
+            '[data-streaming-state="IN_PROGRESS"]',
         ],
     },
     "huggingface": {

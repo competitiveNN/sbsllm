@@ -65,6 +65,13 @@ browser tab on a specific chat website (configured via `model_map`).
 
 ### Known fixes
 
+- **Meta chat**: response selection prefers `data-testid="assistant-message"`.
+  The `[class*="assistant-message"]` catch-all also matched the action bar
+  (`group/assistant-message-actions`) and, being the last match, won — so
+  content was read from the icon-only action buttons (always empty) and
+  replies never reached the local chat. The catch-all now excludes the action
+  bar, and `data-streaming-state` / `data-streaming-complete="false"`
+  attributes on the message row signal `busy` while generating.
 - **Extraction keeps paragraph breaks**: answers are normalised with
   `normalize()` (per-line squash, blank runs collapsed) instead of a
   whole-text `squash()`, and detached clones are read with `blockTextOf()`
