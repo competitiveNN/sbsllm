@@ -169,6 +169,40 @@ class TestInjectPrompt:
         assert SITES["kimi"]["url"] == "https://www.kimi.ai/"
         assert "kimi.com" not in SITES["kimi"]["url"]
 
+    def test_kimi_submit_targets_send_button_container(self):
+        """Kimi's send control is a div (.send-button-container), not a button."""
+        from sbsllm.sites import SITES
+
+        submit = SITES["kimi"]["submit_js"]
+        assert ".send-button-container" in submit
+
+    def test_kimi_post_inject_syncs_lexical_via_paste(self):
+        """Kimi's post_inject_js replaces the Lexical model via a paste event."""
+        from sbsllm.sites import SITES
+
+        post_inject = SITES["kimi"]["post_inject_js"]
+        assert "ClipboardEvent" in post_inject
+        assert "selectionchange" in post_inject
+        assert "selectNodeContents" in post_inject
+
+    def test_tencent_submit_targets_send_div(self):
+        """Tencent's send control is a div (div.hy-chat-input-send-btn)."""
+        from sbsllm.sites import SITES
+
+        submit = SITES["tencent"]["submit_js"]
+        assert "div.hy-chat-input-send-btn" in submit
+
+    def test_grok_response_selectors_exclude_user_bubbles(self):
+        """Grok user bubbles carry the prose-chat class; selectors must
+        exclude data-testid="user-message" so the prompt is not returned
+        as the assistant answer."""
+        from sbsllm.sites import SITES
+
+        selectors = SITES["grok"]["response_selectors"]
+        assert any(
+            "prose-chat" in s and "user-message" in s for s in selectors
+        )
+
     @pytest.mark.parametrize(
         "site_id",
         [
@@ -202,7 +236,6 @@ class TestInjectPrompt:
             "deepseek",
             "grok",
             "mistral",
-            "kimi",
             "perplexity",
             "poe",
             "cohere",
@@ -355,7 +388,7 @@ class TestPostInjectSharedConstant:
         duplicated contenteditable-sync IIFEs."""
         from sbsllm.sites import _POST_INJECT_CONTENTEDITABLE, SITES
 
-        custom_sites = {"google", "zai"}
+        custom_sites = {"google", "zai", "kimi"}
         for site_id, cfg in SITES.items():
             if site_id in custom_sites:
                 continue
@@ -366,8 +399,8 @@ class TestPostInjectSharedConstant:
                 f"got a custom block instead"
             )
 
-    def test_custom_post_inject_sites_exactly_google_and_zai(self):
-        """Only google and zai should have custom post_inject_js blocks."""
+    def test_custom_post_inject_sites_exactly_google_zai_kimi(self):
+        """Only google, zai and kimi should have custom post_inject_js blocks."""
         from sbsllm.sites import _POST_INJECT_CONTENTEDITABLE, SITES
 
         custom_sites = {
@@ -375,32 +408,38 @@ class TestPostInjectSharedConstant:
             for sid, cfg in SITES.items()
             if cfg.get("post_inject_js") != _POST_INJECT_CONTENTEDITABLE
         }
-        assert custom_sites == {"google", "zai"}, (
-            f"Expected custom sites {{google, zai}}, got {custom_sites}"
+        assert custom_sites == {"google", "zai", "kimi"}, (
+            f"Expected custom sites {{google, zai, kimi}}, got {custom_sites}"
         )
 
     def test_no_site_duplicated_contenteditable_logic(self):
         """No site should have a custom post_inject_js that duplicates the
         shared constant's execCommand/innerText/beforeinput pattern — only
-        google (ms-autosize-textarea) and zai (no-op) are allowed custom blocks."""
+        google (ms-autosize-textarea), zai (no-op) and kimi (Lexical paste)
+        are allowed custom blocks."""
         from sbsllm.sites import _POST_INJECT_CONTENTEDITABLE, SITES
 
         for site_id, cfg in SITES.items():
             post_inject = cfg.get("post_inject_js", "")
             if post_inject == _POST_INJECT_CONTENTEDITABLE:
                 continue
-            # Custom blocks are allowed only for google and zai.
-            assert site_id in {"google", "zai"}, (
+            # Custom blocks are allowed only for google, zai and kimi.
+            assert site_id in {"google", "zai", "kimi"}, (
                 f"{site_id} has a custom post_inject_js that should use "
                 f"the shared constant"
             )
             # google must sync data-value on ms-autosize-textarea.
             # zai must be a minimal no-op (no execCommand needed).
+            # kimi must sync its Lexical model via a paste event.
             if site_id == "google":
                 assert "data-value" in post_inject
                 assert "ms-autosize-textarea" in post_inject
             if site_id == "zai":
                 assert "execCommand" not in post_inject
+            if site_id == "kimi":
+                assert "ClipboardEvent" in post_inject
+                assert "paste" in post_inject
+                assert "selectionchange" in post_inject
 
     def test_shared_constant_has_no_dead_code(self):
         """The shared constant must not carry unused variables (e.g. isTextLike)."""

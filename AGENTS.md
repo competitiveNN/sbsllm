@@ -157,6 +157,35 @@ browser tab on a specific chat website (configured via `model_map`).
   slide the window forward, so a retry train cannot re-send the prompt; a
   deliberate re-send works again once the retries stop.
 
+- **Grok user-bubble leak**: Grok renders user bubbles with the same
+  `prose-chat` class as assistant answers
+  (`div.message-bubble ... prose prose-chat [data-testid="user-message"]`),
+  so the `div[class*="prose-chat"]` fallback returned the user's own
+  prompt as the "assistant answer". The fallback now excludes the user
+  bubble (`:not([data-testid="user-message"]):not([aria-label="You" i])`).
+- **Kimi Lexical composer**: Kimi's editor is Lexical, which keeps its
+  own document model — the shared contenteditable sync
+  (innerText clear + `execCommand('insertText')`) appended to the model
+  instead of replacing it (prompt duplicated 6x), and Lexical ignores
+  synthetic `beforeinput insertText`. Kimi now has a custom
+  `post_inject_js` (`_KIMI_POST_INJECT_LEXICAL`) that selects the whole
+  document and dispatches a `paste` event with the prompt as clipboard
+  data: Lexical's paste handler replaces the model content in one clean
+  step. Kimi's send control is also a div (`.send-button-container`),
+  not a `<button>`, so `submit_js` now clicks it directly. Note: kimi.ai
+  now requires sign-in to send (the send handler opens a login modal).
+- **Tencent send control**: the send control is a div
+  (`div.hy-chat-input-send-btn`), not a `<button>`, so the shared
+  submit template's button candidates never matched and every request
+  fell back to a synthetic Enter the composer ignores. `submit_js` now
+  clicks the div.
+- **DeepSeek sign-in page**: the login-wall selectors now also match the
+  Cloudflare sign-in page (`#cf-turnstile`).
+- **Google AI Studio welcome page**: logged-out visitors land on the
+  `/welcome` marketing page; its CTAs (`a.nav__cta`, `a.hero__cta`)
+  only exist there and now mark the pre-login state in
+  `login_wall_selectors`.
+
 ### Duplicate prompt guard
 
 `duplicate_prompt_cooldown` (config, default 60s, `0` disables) arms the

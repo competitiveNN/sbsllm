@@ -257,6 +257,61 @@ _POST_INJECT_CONTENTEDITABLE = """
     })()
     """
 
+# Kimi's composer is a Lexical editor. Lexical keeps its own
+# document model, so the shared contenteditable sync
+# (innerText clear + execCommand insertText) appends to the
+# model instead of replacing it -- the prompt ended up
+# duplicated six times -- and Lexical ignores synthetic
+# beforeinput insertText. Lexical DOES handle native paste
+# events: selecting the whole document and dispatching a paste
+# event with the prompt as clipboard data replaces the model
+# content in one clean step (verified against the live editor
+# state: __lexicalEditor.getEditorState() holds exactly the
+# prompt afterwards).
+_KIMI_POST_INJECT_LEXICAL = """
+    (() => {
+        let el = document.querySelector('[data-sbsllm-input="true"]');
+        if (!el) {
+            // The inject step may have found the editor inside a
+            // Shadow DOM (web component host). Search all shadow
+            // roots for the marker.
+            for (const host of document.querySelectorAll('*')) {
+                try {
+                    if (!host.shadowRoot) continue;
+                    el = host.shadowRoot.querySelector('[data-sbsllm-input="true"]');
+                    if (el) break;
+                } catch (_) {}
+            }
+        }
+        if (!el) return 'NO_MARKED_INPUT';
+        const value = el.dataset.sbsllmValue || '';
+        try {
+            el.focus();
+            // Select the whole document so the paste replaces it.
+            const sel = window.getSelection();
+            if (sel) {
+                const range = document.createRange();
+                range.selectNodeContents(el);
+                sel.removeAllRanges();
+                sel.addRange(range);
+            }
+            el.dispatchEvent(new Event('selectionchange', { bubbles: true }));
+            // Paste the prompt: Lexical's paste handler replaces
+            // the selection with the clipboard text inside its
+            // internal model.
+            const dt = new DataTransfer();
+            dt.setData('text/plain', value);
+            el.dispatchEvent(new ClipboardEvent('paste', {
+                bubbles: true, cancelable: true, clipboardData: dt
+            }));
+            el.dispatchEvent(new InputEvent('input', {
+                bubbles: true, inputType: 'insertText'
+            }));
+        } catch (_) {}
+        return 'OK';
+    })()
+    """
+
 # Selectors that positively indicate the site is still generating a reply.
 # Bare `[class*="loading"]` is deliberately excluded: sites keep decorative
 # skeletons and spinners in the DOM (often at zero opacity) long after
@@ -785,6 +840,7 @@ SITES: dict[str, dict] = {
         ],
         "login_wall_selectors": [
             "#login-wrap",
+            "#cf-turnstile",
             'button[aria-label*="Sign in" i]',
             'a[href*="signin" i]',
         ],
@@ -901,11 +957,17 @@ SITES: dict[str, dict] = {
         """,
             "document.querySelector('.tiptap, [contenteditable], textarea')",
         ),
+        # Grok renders user bubbles with the same prose-chat class as
+        # assistant answers (div.message-bubble ... prose prose-chat,
+        # data-testid="user-message", aria-label="You"), so the bare
+        # div[class*="prose-chat"] fallback matched the user's own
+        # prompt and streamed it back as the "assistant answer".
+        # Keep the user bubble out of the fallback.
         "response_selectors": [
             '.message-bubble:not([data-testid="user-message"])',
             '[data-testid="assistant-message"]',
             '[data-message-author-role="assistant"]',
-            'div[class*="prose-chat"]',
+            'div[class*="prose-chat"]:not([data-testid="user-message"]):not([aria-label="You" i])',
         ],
         "thinking_selectors": [
             '[data-testid*="thinking"]',
@@ -1087,9 +1149,14 @@ SITES: dict[str, dict] = {
             '[class*="reasoning"]',
         ],
         "login_wall_selectors": [
-            'button[class*="login"]',
+            'button[aria-label*="Sign in" i]',
             'a[href*="login" i]',
             'button[data-testid*="login" i]',
+            # Logged-out visitors land on the /welcome marketing
+            # page; its CTAs (nav__cta / hero__cta) only exist
+            # there, so they mark the pre-login state.
+            'a.nav__cta',
+            'a.hero__cta',
         ],
         "loading_selectors": [
             *_LOADING_SELECTORS,
@@ -1106,9 +1173,15 @@ SITES: dict[str, dict] = {
                 || document.querySelector('div.chat-input-editor[contenteditable="true"]')
                 || document.querySelector('div[contenteditable="true"]')
         """),
-        "submit_js": _submit_js(
-            """
-            document.querySelector('button[aria-label="Submit"]')
+        # Kimi's send control is a div wrapping an SVG icon
+        # (div.send-button-container), not a <button>, so the
+        # shared submit template's button candidates never
+        # matched and every request fell back to a synthetic
+        # Enter key that the Lexical composer swallows.
+        "submit_js": _submit_js("""
+            document.querySelector('.send-button-container')
+                || document.querySelector('div[class*="send-button"]')
+                || document.querySelector('button[aria-label="Submit"]')
                 || document.querySelector('button.send')
                 || document.querySelector('button[type="submit"]:not([disabled])')
                 || document.querySelector('textarea.ph, textarea[name="message"], textarea, div.chat-input-editor')?.closest('form')?.querySelector('button:not([disabled])')
@@ -1116,7 +1189,10 @@ SITES: dict[str, dict] = {
         """,
             "document.querySelector('textarea.ph, textarea[name=\"message\"], textarea, div.chat-input-editor')",
         ),
-        "post_inject_js": _POST_INJECT_CONTENTEDITABLE,
+        # Lexical editor: sync the model via a paste event (see
+        # _KIMI_POST_INJECT_LEXICAL) instead of the shared
+        # contenteditable constant, which duplicates the prompt.
+        "post_inject_js": _KIMI_POST_INJECT_LEXICAL,
         "response_selectors": [
             '[data-role="assistant"]',
             '[data-message-author-role="assistant"]',
@@ -1505,8 +1581,14 @@ SITES: dict[str, dict] = {
                 || document.querySelector('[contenteditable]')
         """),
         "post_inject_js": _POST_INJECT_CONTENTEDITABLE,
+        # Tencent's send control is a div (div.hy-chat-input-send-btn),
+        # not a <button>, so the shared submit template's button
+        # candidates never matched and every request fell back to a
+        # synthetic Enter key the composer ignores.
         "submit_js": _submit_js("""
-            document.querySelector('button[data-testid="send-button"]')
+            document.querySelector('div.hy-chat-input-send-btn')
+                || document.querySelector('div[class*="hy-chat-input-send"]')
+                || document.querySelector('button[data-testid="send-button"]')
                 || document.querySelector('button[aria-label="Send"]')
                 || document.querySelector('button[aria-label="Submit"]')
                 || document.querySelector('button[class*="send"]')

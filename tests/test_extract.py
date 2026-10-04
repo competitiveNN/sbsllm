@@ -911,3 +911,71 @@ class TestQwenExtraction:
         assert result["content"] == "", result
         assert result["busy"] is True, result
         assert result["done"] is False, result
+
+
+class TestGrokExtraction:
+    """grok.com markup, as captured live (2026-10).
+
+    Grok renders user bubbles with the SAME ``prose-chat`` class as
+    assistant answers:
+
+    ``div.message-bubble ... chat-md prose prose-chat ...
+    bg-surface-user-bubble [data-testid="user-message"]``
+
+    The OLD fallback selector ``div[class*="prose-chat"]`` matched
+    that user bubble, so the user's own prompt was streamed back as
+    the "assistant answer" (found=true, content="what is 2 plus 2").
+    The fallback now excludes the user bubble via
+    ``:not([data-testid="user-message"]):not([aria-label="You"])``.
+    """
+
+    @staticmethod
+    def _user(prompt):
+        return f"""
+        <div class="message-bubble relative text-fg-primary min-h-7 chat-md
+          prose prose-chat dark:prose-invert break-words max-w-[100%]
+          bg-surface-user-bubble rounded-2xl"
+          data-testid="user-message" aria-label="You">
+          <p class="py-2">{prompt}</p>
+        </div>"""
+
+    @staticmethod
+    def _assistant(answer):
+        return f"""
+        <div class="message-bubble relative text-fg-primary min-h-7 chat-md
+          prose prose-chat dark:prose-invert break-words max-w-[100%]
+          bg-surface-assistant-bubble rounded-2xl"
+          data-testid="assistant-message">
+          <p class="py-2">{answer}</p>
+        </div>"""
+
+    def test_user_prompt_not_returned_as_answer(self, extract_page):
+        """A bare user bubble (no assistant reply yet) must not be
+        extracted as an answer -- this is the regression that
+        streamed the prompt back as the reply."""
+        result = _extract(
+            extract_page,
+            self._user("what is 2 plus 2"),
+            site_id="grok",
+        )
+        assert result["found"] is False, result
+        assert result["content"] == "", result["content"]
+
+    def test_assistant_answer_extracted(self, extract_page):
+        result = _extract(
+            extract_page,
+            self._user("what is 2 plus 2") + self._assistant("Four."),
+            site_id="grok",
+        )
+        assert result["found"] is True, result
+        assert result["content"] == "Four.", result["content"]
+
+    def test_newest_turn_wins(self, extract_page):
+        html = (
+            self._user("q1")
+            + self._assistant("First reply.")
+            + self._user("q2")
+            + self._assistant("Second reply.")
+        )
+        result = _extract(extract_page, html, site_id="grok")
+        assert result["content"] == "Second reply.", result["content"]
