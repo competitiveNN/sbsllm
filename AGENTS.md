@@ -122,7 +122,23 @@ browser tab on a specific chat website (configured via `model_map`).
   placeholder is "Ask anything", and
   the first-load welcome overlay's only button ("Start chatting")
   redirects to login, so `setup_js` dismisses it with Escape (Modal
-  listens for keydown on window) instead of clicking.
+     listens for keydown on window) instead of clicking.
+- **Qwen chat**: the whole turn (status cards + answer + footer) sits
+  inside `.qwen-chat-message-assistant`. The old response selector
+  (`[class*="assistant"]`) matched that whole message, so the in-flow
+  thinking/status cards -- "Analyzing user input to determine intent
+  and tone", "Refining poetic expressions...", "Thinking completed" --
+  and the "Skip" control (`.qwen-chat-status-card-answer-now`) leaked
+  into the answer shown in the local chat. Those cards are UI chrome
+  (the real reasoning is in a collapsible "Thinking and Search"
+  sidebar that is hidden by default and absent from the flow DOM), so
+  they are not streamed as thinking. The extraction is scoped to the
+  answer markdown under the answer phase
+  (`.response-message-content.phase-answer .custom-qwen-markdown`) and
+  to the newest turn's container; the busy signal is the "Stop" button
+  (`button[aria-label*="Stop"]`, already in the shared loading set),
+  which Qwen shows for the whole generation including the long
+  thinking/refining phase that precedes the answer.
 - **Browser worker lifecycle**: `_stop_browser_worker` no longer enqueues a
   `None` shutdown sentinel when the worker is already dead (it left the
   sentinel in the shared `_browser_queue`, so the next worker dequeued it and

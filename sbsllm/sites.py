@@ -806,16 +806,35 @@ SITES: dict[str, dict] = {
                 || document.querySelector('button[class*="send"]:not([disabled])')
                 || document.querySelector('textarea')?.closest('form')?.querySelector('button:not([disabled])')
         """),
+        # chat.qwen.ai keeps the whole turn (status cards + answer +
+        # footer) inside .qwen-chat-message-assistant. The OLD response
+        # selector ([class*="assistant"]) matched that whole message, so
+        # the in-flow thinking/status cards -- "Analyzing user input to
+        # determine intent and tone", "Refining poetic expressions...",
+        # "Thinking completed" -- and the "Skip" control (.qwen-chat-
+        # status-card-answer-now) all leaked into the answer that the
+        # local chat displays. Those cards are UI chrome: the real
+        # reasoning lives in a collapsible "Thinking and Search" sidebar
+        # that is hidden by default and not present in the flow DOM.
+        #
+        # The actual answer is the markdown under the answer phase, so the
+        # extraction is scoped to it and to the newest turn's container.
+        # The busy signal is the "Stop" button (button[aria-label*="Stop"]),
+        # already in _LOADING_SELECTORS, which Qwen shows for the whole
+        # generation (including the long thinking/refining phase before
+        # the answer markdown renders).
+        "response_container": ".qwen-chat-message-assistant",
         "response_selectors": [
-            '[data-message-author-role="assistant"]',
-            ".assistant-message",
-            '[class*="assistant"]',
-            "article .markdown",
+            '.response-message-content.phase-answer .custom-qwen-markdown',
+            '.response-message-content .custom-qwen-markdown',
+            '.custom-qwen-markdown',
+            '.qwen-markdown',
         ],
-        "thinking_selectors": [
-            '[class*="thinking"]',
-            '[class*="reasoning"]',
-        ],
+        # No thinking selector: the in-flow element is only a status card
+        # whose titles and "Skip" button are chrome, not a reasoning trace.
+        # Capturing them would pollute the thinking field; the clean answer
+        # markdown is what we stream.
+        "thinking_selectors": [],
         "login_wall_selectors": [
             'button[aria-label*="Sign in" i]',
             'a[href*="login" i]',
@@ -823,6 +842,7 @@ SITES: dict[str, dict] = {
         ],
         "loading_selectors": [
             *_LOADING_SELECTORS,
+            '.response-loading',
         ],
     },
     "grok": {

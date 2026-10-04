@@ -131,6 +131,14 @@ class TestResponseSelectors:
 
     @pytest.mark.parametrize("site_id", list(SITES.keys()))
     def test_thinking_selectors_present(self, site_id):
+        """Every site except qwen has a thinking selector.
+
+        qwen's in-flow element is only a status card (title + "Skip"
+        button) whose titles are UI chrome, not a reasoning trace; the
+        real reasoning lives in a hidden sidebar that is absent from
+        the flow DOM, so there is nothing to stream as thinking."""
+        if site_id == "qwen":
+            pytest.skip("qwen has no in-flow reasoning trace")
         assert SITES[site_id]["thinking_selectors"]
 
     @pytest.mark.parametrize("site_id", list(SITES.keys()))

@@ -786,3 +786,128 @@ class TestHuggingFaceExtraction:
         # Count is scoped to the response container (the newest
         # turn), so it is the prose matches inside that turn.
         assert result["count"] == 1
+
+
+class TestQwenExtraction:
+    """chat.qwen.ai markup, as captured live (2026-10).
+
+    The whole turn -- status cards, answer, footer -- lives inside
+    ``.qwen-chat-message.qwen-chat-message-assistant``. The OLD response
+    selector ``[class*="assistant"]`` matched that whole message, so the
+    in-flow thinking/status cards leaked into the answer that the
+    local chat displays:
+
+    - ``.qwen-chat-thinking-status-card`` ("Thinking completed")
+    - ``.qwen-chat-status-card`` with a title
+      ("Analyzing user input to determine intent and tone",
+      "Refining poetic expressions to enhance elegance") and a
+      ``.qwen-chat-status-card-answer-now`` button ("Skip")
+
+    The real reasoning lives in a collapsible "Thinking and Search"
+    sidebar that is hidden by default and absent from the flow DOM, so
+    there is nothing to stream as thinking. The answer is the markdown
+    under the answer phase.
+    """
+
+    @staticmethod
+    def _message(answer, *, title=None, thinking_completed=False, skip=False):
+        title_html = ""
+        if title is not None:
+            title_html = f"""
+              <div class="qwen-chat-status-card ant-flex">
+                <div class="qwen-chat-status-card-title">
+                  <div class="qwen-chat-status-card-title-text">{title}</div>
+                </div>
+                <div class="qwen-chat-status-card-answer-now">Skip</div>
+              </div>"""
+        thinking_html = ""
+        if thinking_completed:
+            thinking_html = """
+              <div class="qwen-chat-thinking-tool-status-card-wraper">
+                <div class="qwen-chat-thinking-status-card-completed">
+                  <div class="qwen-chat-thinking-status-card-title-text">
+                    Thinking completed
+                  </div>
+                </div>
+              </div>"""
+        # The answer markdown only renders once text exists; a
+        # thinking/refining turn has no .custom-qwen-markdown at all.
+        answer_html = ""
+        if answer:
+            answer_html = f"""
+              <div class="response-message-content t2t phase-answer">
+                <div class="custom-qwen-markdown">
+                  <div class="qwen-markdown">
+                    <p>{answer}</p>
+                  </div>
+                </div>
+              </div>"""
+        return f"""
+        <div class="qwen-chat-message qwen-chat-message-assistant">
+          <div class="chat-response-message">
+            <div class="chat-response-message-right">
+              {thinking_html}{title_html}
+              {answer_html}
+            </div>
+          </div>
+        </div>
+        """
+
+    def test_answer_only_no_status_titles(self, extract_page):
+        """The thinking/status card titles and the "Skip" button must
+        never reach the answer that the local chat displays."""
+        result = _extract(
+            extract_page,
+            self._message(
+                "A poem about dogs.",
+                title="Analyzing user input to determine intent and tone",
+                thinking_completed=True,
+                skip=True,
+            ),
+            site_id="qwen",
+        )
+        assert result["found"] is True, result
+        assert result["content"] == "A poem about dogs.", result["content"]
+        assert "Skip" not in result["content"], result["content"]
+        assert "Analyzing" not in result["content"], result["content"]
+        assert "Thinking completed" not in result["content"], result["content"]
+        assert result["thinking"] in (None, ""), result["thinking"]
+
+    def test_thinking_only_phase_yields_no_content(self, extract_page):
+        """While the model is refining (no answer markdown yet) the
+        extraction must report no content -- the status card is UI
+        chrome, not a reply. ``found`` is False because the answer
+        markdown has not rendered yet."""
+        result = _extract(
+            extract_page,
+            self._message(
+                "",
+                title="Refining poetic expressions to enhance elegance",
+                thinking_completed=True,
+            ),
+            site_id="qwen",
+        )
+        assert result["content"] == "", result
+        assert result["thinking"] in (None, ""), result["thinking"]
+        assert result["done"] is False, result
+
+    def test_newest_turn_wins(self, extract_page):
+        html = self._message("Older reply.") + self._message("Newest reply.")
+        result = _extract(extract_page, html, site_id="qwen")
+        assert result["content"] == "Newest reply.", result["content"]
+        assert result["count"] == 1
+
+    def test_loading_signal_during_generation(self, extract_page):
+        """The "Stop" button and the loading lottie keep the stream
+        open while the answer is still arriving."""
+        result = _extract(
+            extract_page,
+            self._message("") + """
+            <div class="response-loading"><div class="qwen-lottie-web"></div></div>
+            <button aria-label="Stop">Stop</button>
+            """,
+            site_id="qwen",
+        )
+        assert result["content"] == "", result
+        assert result["busy"] is True, result
+        assert result["done"] is False, result
