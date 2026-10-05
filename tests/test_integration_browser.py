@@ -929,13 +929,19 @@ class TestGoogleShadowDom:
                 browser.close()
 
     def test_google_shadow_post_inject_enables_button(self, mock_google_shadow_server):
-        """post_inject_js must enable the Run button inside the shadow root."""
+        """post_inject_js must find the marker nested two shadow levels
+        deep and enable the Run button inside the shadow root."""
         with pw.sync_playwright() as p:
             browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
             page = browser.new_page()
             page.goto(mock_google_shadow_server, wait_until="networkidle")
             try:
                 page.evaluate(inject_prompt("google", "enable me"))
+                status = page.evaluate(SITES["google"]["post_inject_js"])
+                assert status == "OK", (
+                    "post_inject must find the marker nested inside "
+                    f"ms-autosize-textarea's shadow root, got {status}"
+                )
                 is_disabled = page.evaluate(
                     "document.querySelector('ms-run-button').shadowRoot"
                     ".querySelector('button.run-button').disabled"
@@ -943,6 +949,327 @@ class TestGoogleShadowDom:
                 assert not is_disabled, (
                     "Run button should be enabled after post_inject via shadow DOM"
                 )
+            finally:
+                browser.close()
+
+
+_GOOGLE_CHROME_MOCK_HTML = """<!doctype html>
+<html><head><meta charset="utf-8"><title>mock google chrome</title></head>
+<body>
+  <ms-chat-turn>
+    <div class="chat-turn-container model">
+      <div class="turn-header">
+        <span class="author-label">Model</span>
+        <time>1:32 PM</time>
+      </div>
+      <ms-chat-turn-options>
+        <button><span class="material-symbols-outlined">edit</span></button>
+        <button><span class="material-symbols-outlined">more_vert</span></button>
+      </ms-chat-turn-options>
+      <div class="turn-content"><p>Hello! How can I help you today?</p></div>
+      <div class="turn-footer">
+        <button><span class="material-symbols-outlined">thumb_up</span></button>
+        <button><span class="material-symbols-outlined">thumb_down</span></button>
+      </div>
+    </div>
+  </ms-chat-turn>
+</body></html>
+"""
+
+# Same turn, but without .turn-content: the fallback container
+# selector matches the whole turn, so the chrome sits INSIDE the
+# matched response and only response_exclude_selectors can prune it.
+_GOOGLE_CHROME_NO_TURN_CONTENT_HTML = _GOOGLE_CHROME_MOCK_HTML.replace(
+    '<div class="turn-content"><p>Hello! How can I help you today?</p></div>',
+    "<p>Hello! How can I help you today?</p>",
+)
+
+
+class _GoogleChromeHandler(http.server.BaseHTTPRequestHandler):
+    html = _GOOGLE_CHROME_MOCK_HTML
+
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(self.html.encode())
+
+    def log_message(self, *args):
+        pass
+
+
+class _GoogleChromeNoTurnContentHandler(_GoogleChromeHandler):
+    html = _GOOGLE_CHROME_NO_TURN_CONTENT_HTML
+
+
+# A "Thinking" label rendered OUTSIDE any ms-thought-chunk (a status
+# chip on its own line). Only the template's text safety net can remove
+# it; the element prune will not.
+_GOOGLE_THINKING_LABEL_LINE_MOCK_HTML = """<!doctype html>
+<html><head><meta charset="utf-8"><title>mock google label line</title></head>
+<body>
+  <ms-chat-turn>
+    <div class="chat-turn-container model">
+      <div class="turn-content">
+        <div class="thinking-status-chip">Thinking</div>
+        <p>The shadows soften into light,</p>
+        <p>A quiet stillness holds the room.</p>
+      </div>
+    </div>
+  </ms-chat-turn>
+</body></html>
+"""
+
+
+_GOOGLE_THINKING_ANSWER_PREFIX_MOCK_HTML = """<!doctype html>
+<html><head><meta charset="utf-8"><title>mock google label prefix</title></head>
+<body>
+  <ms-chat-turn>
+    <div class="chat-turn-container model">
+      <div class="turn-content">
+        <p>Thinking about the sun, a quiet glow on the wall.</p>
+      </div>
+    </div>
+  </ms-chat-turn>
+</body></html>
+"""
+
+
+_GOOGLE_THINKING_MOCK_HTML = """<!doctype html>
+<html><head><meta charset="utf-8"><title>mock google thinking</title></head>
+<body>
+  <ms-chat-turn>
+    <div class="chat-turn-container model">
+      <div class="turn-header">
+        <span class="author-label">google</span>
+        <time>1:32 PM</time>
+      </div>
+      <div class="turn-content">
+        <ms-prompt-chunk>
+          <ms-thought-chunk>
+            <div class="thought-header">
+              <span class="material-symbols-outlined">psychology</span>
+              <span class="thought-label">Thinking</span>
+            </div>
+          </ms-thought-chunk>
+        </ms-prompt-chunk>
+        <ms-prompt-chunk>
+          <ms-cmark-node class="cmark-node">
+            <p>A whisper of wind through the open door,</p>
+            <p>Sunlight pooling across the floor.</p>
+          </ms-cmark-node>
+        </ms-prompt-chunk>
+      </div>
+      <div class="turn-footer">
+        <button><span class="material-symbols-outlined">thumb_up</span></button>
+        <button><span class="material-symbols-outlined">thumb_down</span></button>
+      </div>
+    </div>
+  </ms-chat-turn>
+</body></html>
+"""
+
+
+class _GoogleThinkingHandler(_GoogleChromeHandler):
+    html = _GOOGLE_THINKING_MOCK_HTML
+
+
+class _GoogleThinkingLabelLineHandler(_GoogleChromeHandler):
+    html = _GOOGLE_THINKING_LABEL_LINE_MOCK_HTML
+
+
+class _GoogleThinkingAnswerPrefixHandler(_GoogleChromeHandler):
+    html = _GOOGLE_THINKING_ANSWER_PREFIX_MOCK_HTML
+
+
+@pytest.fixture(scope="module")
+def mock_google_thinking_label_line_server():
+    with socketserver.TCPServer(
+        ("127.0.0.1", 0), _GoogleThinkingLabelLineHandler
+    ) as httpd:
+        port = httpd.server_address[1]
+        url = f"http://127.0.0.1:{port}"
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        yield url
+    thread.join(timeout=5)
+
+
+@pytest.fixture(scope="module")
+def mock_google_thinking_answer_prefix_server():
+    with socketserver.TCPServer(
+        ("127.0.0.1", 0), _GoogleThinkingAnswerPrefixHandler
+    ) as httpd:
+        port = httpd.server_address[1]
+        url = f"http://127.0.0.1:{port}"
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        yield url
+    thread.join(timeout=5)
+
+
+@pytest.fixture(scope="module")
+def mock_google_thinking_server():
+    with socketserver.TCPServer(("127.0.0.1", 0), _GoogleThinkingHandler) as httpd:
+        port = httpd.server_address[1]
+        url = f"http://127.0.0.1:{port}"
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        yield url
+    thread.join(timeout=5)
+
+
+@pytest.fixture(scope="module")
+def mock_google_chrome_server():
+    with socketserver.TCPServer(("127.0.0.1", 0), _GoogleChromeHandler) as httpd:
+        port = httpd.server_address[1]
+        url = f"http://127.0.0.1:{port}"
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        yield url
+    thread.join(timeout=5)
+
+
+@pytest.fixture(scope="module")
+def mock_google_chrome_no_turn_content_server():
+    with socketserver.TCPServer(
+        ("127.0.0.1", 0), _GoogleChromeNoTurnContentHandler
+    ) as httpd:
+        port = httpd.server_address[1]
+        url = f"http://127.0.0.1:{port}"
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        yield url
+    thread.join(timeout=5)
+
+
+class TestGoogleExtractionChrome:
+    """Google AI Studio renders turn chrome (action icons, the
+    model/timestamp header, feedback buttons) around the answer.
+    The extraction must relay the answer, not the chrome."""
+
+    CHROME = (
+        "edit", "more_vert", "thumb_up", "thumb_down",
+        "Model", "1:32 PM",
+    )
+
+    def test_turn_content_selector_scopes_to_the_answer(
+        self, mock_google_chrome_server
+    ):
+        """The primary selector targets .turn-content, so the header,
+        options menu and feedback bar outside it never reach the
+        local chat."""
+        with pw.sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+            page = browser.new_page()
+            page.goto(mock_google_chrome_server, wait_until="networkidle")
+            try:
+                result = page.evaluate(extract_js("google"))
+                assert result["found"] is True
+                assert "Hello! How can I help you today?" in result["content"]
+                for chrome in self.CHROME:
+                    assert chrome not in result["content"], (
+                        f"turn chrome {chrome!r} leaked into the answer: "
+                        f"{result['content']!r}"
+                    )
+            finally:
+                browser.close()
+
+    def test_exclusions_prune_chrome_inside_the_container(
+        self, mock_google_chrome_no_turn_content_server
+    ):
+        """When the fallback container selector matches (no
+        .turn-content), response_exclude_selectors must prune the
+        buttons, icon ligatures, options menu, footer and header
+        from the response clone."""
+        with pw.sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+            page = browser.new_page()
+            page.goto(
+                mock_google_chrome_no_turn_content_server,
+                wait_until="networkidle",
+            )
+            try:
+                result = page.evaluate(extract_js("google"))
+                assert result["found"] is True
+                assert "Hello! How can I help you today?" in result["content"]
+                for chrome in self.CHROME:
+                    assert chrome not in result["content"], (
+                        f"turn chrome {chrome!r} leaked into the answer: "
+                        f"{result['content']!r}"
+                    )
+            finally:
+                browser.close()
+
+    def test_collapsed_thought_chunk_label_does_not_leak(
+        self, mock_google_thinking_server
+    ):
+        """A collapsed ms-thought-chunk renders only its 'Thinking'
+        label. The label must not reach the relayed answer, and a bare
+        label must not be forwarded as thinking content."""
+        with pw.sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+            page = browser.new_page()
+            page.goto(mock_google_thinking_server, wait_until="networkidle")
+            try:
+                result = page.evaluate(extract_js("google"))
+                assert result["found"] is True
+                assert "A whisper of wind through the open door," in result[
+                    "content"
+                ]
+                assert "Thinking" not in result["content"], (
+                    f"thinking label leaked into the answer: "
+                    f"{result['content']!r}"
+                )
+                assert not result["thinking"] or (
+                    result["thinking"].strip() != "Thinking"
+                ), f"bare thinking label forwarded: {result['thinking']!r}"
+            finally:
+                browser.close()
+
+    def test_standalone_thinking_label_line_is_stripped(
+        self, mock_google_thinking_label_line_server
+    ):
+        """A 'Thinking' label on its own line (status chip, not
+        inside any thinking selector) is stripped by the template's
+        safety net, while the answer lines after it are kept."""
+        with pw.sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+            page = browser.new_page()
+            page.goto(
+                mock_google_thinking_label_line_server,
+                wait_until="networkidle",
+            )
+            try:
+                result = page.evaluate(extract_js("google"))
+                assert result["found"] is True
+                assert "Thinking" not in result["content"], (
+                    f"standalone thinking label leaked: {result['content']!r}"
+                )
+                assert "The shadows soften into light" in result["content"]
+                assert "A quiet stillness holds the room" in result["content"]
+            finally:
+                browser.close()
+
+    def test_answer_starting_with_thinking_word_is_preserved(
+        self, mock_google_thinking_answer_prefix_server
+    ):
+        """An answer that merely starts with the word 'Thinking'
+        (lowercase continuation) is NOT stripped; only a
+        disclosure label is."""
+        with pw.sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+            page = browser.new_page()
+            page.goto(
+                mock_google_thinking_answer_prefix_server,
+                wait_until="networkidle",
+            )
+            try:
+                result = page.evaluate(extract_js("google"))
+                assert result["found"] is True
+                assert result["content"].startswith(
+                    "Thinking about the sun"
+                ), f"real answer truncated: {result['content']!r}"
             finally:
                 browser.close()
 

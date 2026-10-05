@@ -86,12 +86,22 @@ _SUBMIT_TEMPLATE = """
         let input = document.querySelector('[data-sbsllm-input="true"]')
             || (__INPUT_SELECTOR__);
         if (!input) {
-            for (const host of document.querySelectorAll('*')) {
-                try {
-                    if (!host.shadowRoot) continue;
-                    input = host.shadowRoot.querySelector('[data-sbsllm-input="true"]');
-                    if (input) break;
-                } catch (_) {}
+            // Depth-first shadow scan: the marker can sit in a shadow
+            // root nested inside another shadow root (the prompt
+            // textarea lives in ms-autosize-textarea's shadow root,
+            // itself inside ms-prompt-box's), which a single-level
+            // scan of the document's shadow hosts cannot reach.
+            const stack = Array.from(document.querySelectorAll('*'));
+            while (stack.length) {
+                const host = stack.pop();
+                let root;
+                try { root = host.shadowRoot; } catch (_) { continue; }
+                if (!root) continue;
+                input = root.querySelector('[data-sbsllm-input="true"]');
+                if (input) break;
+                for (const inner of root.querySelectorAll('*')) {
+                    stack.push(inner);
+                }
             }
         }
         if (input?.dataset?.sbsllmInput === 'true') {
@@ -208,14 +218,21 @@ _POST_INJECT_CONTENTEDITABLE = """
     (() => {
         let el = document.querySelector('[data-sbsllm-input="true"]');
         if (!el) {
-            // The inject step may have found the editor inside a Shadow DOM
-            // (web component host). Search all shadow roots for the marker.
-            for (const host of document.querySelectorAll('*')) {
-                try {
-                    if (!host.shadowRoot) continue;
-                    el = host.shadowRoot.querySelector('[data-sbsllm-input="true"]');
-                    if (el) break;
-                } catch (_) {}
+            // Depth-first shadow scan: the marker can sit in a shadow
+            // root nested inside another shadow root, which a
+            // single-level scan of the document's shadow hosts
+            // cannot reach.
+            const stack = Array.from(document.querySelectorAll('*'));
+            while (stack.length) {
+                const host = stack.pop();
+                let root;
+                try { root = host.shadowRoot; } catch (_) { continue; }
+                if (!root) continue;
+                el = root.querySelector('[data-sbsllm-input="true"]');
+                if (el) break;
+                for (const inner of root.querySelectorAll('*')) {
+                    stack.push(inner);
+                }
             }
         }
         if (!el) return 'NO_MARKED_INPUT';
@@ -272,15 +289,21 @@ _KIMI_POST_INJECT_LEXICAL = """
     (() => {
         let el = document.querySelector('[data-sbsllm-input="true"]');
         if (!el) {
-            // The inject step may have found the editor inside a
-            // Shadow DOM (web component host). Search all shadow
-            // roots for the marker.
-            for (const host of document.querySelectorAll('*')) {
-                try {
-                    if (!host.shadowRoot) continue;
-                    el = host.shadowRoot.querySelector('[data-sbsllm-input="true"]');
-                    if (el) break;
-                } catch (_) {}
+            // Depth-first shadow scan: the marker can sit in a shadow
+            // root nested inside another shadow root, which a
+            // single-level scan of the document's shadow hosts
+            // cannot reach.
+            const stack = Array.from(document.querySelectorAll('*'));
+            while (stack.length) {
+                const host = stack.pop();
+                let root;
+                try { root = host.shadowRoot; } catch (_) { continue; }
+                if (!root) continue;
+                el = root.querySelector('[data-sbsllm-input="true"]');
+                if (el) break;
+                for (const inner of root.querySelectorAll('*')) {
+                    stack.push(inner);
+                }
             }
         }
         if (!el) return 'NO_MARKED_INPUT';
@@ -327,6 +350,7 @@ _LOADING_SELECTORS = [
 _RESPONSE_TEMPLATE = """
     (() => {
         const responseSelectors = __RESPONSE_SELECTORS__;
+        const responseExcludeSelectors = __RESPONSE_EXCLUDE_SELECTORS__;
         const thinkingSelectors = __THINKING_SELECTORS__;
         const loadingSelectors = __LOADING_SELECTORS__;
         const loginWallSelectors = __LOGIN_WALL_SELECTORS__;
@@ -600,7 +624,7 @@ _RESPONSE_TEMPLATE = """
         // inside the same container as the answer, so replacing text there
         // either left the label behind or ate the answer.
         let content = textOf(response);
-        if (response && thinkingSelectors.length) {
+        if (response && (thinkingSelectors.length || responseExcludeSelectors.length)) {
             // A broad thinking selector can match a node that also wraps the
             // answer. z.ai keeps the answer in a .markdown-prose block, so
             // treat any candidate containing one as an answer host and leave
@@ -628,6 +652,26 @@ _RESPONSE_TEMPLATE = """
                     pruned = true;
                 }
             }
+            // Turn chrome renders inside the same container as the
+            // answer on some sites (Google AI Studio's action icons,
+            // model/timestamp header and feedback buttons), so a
+            // whole-container text read forwards it as part of the
+            // reply. Chrome is never the answer itself, so unlike the
+            // reasoning prune there is no wrapsAnswer guard here.
+            for (const selector of responseExcludeSelectors) {
+                let excluded;
+                try {
+                    excluded = Array.from(clone.querySelectorAll(selector));
+                } catch (_) {
+                    continue;
+                }
+                for (const node of excluded) {
+                    if (node.parentNode) {
+                        node.parentNode.removeChild(node);
+                        pruned = true;
+                    }
+                }
+            }
             if (pruned) {
                 // Use the pruned text even when empty. During the thinking
                 // phase the answer is legitimately empty, and falling back to
@@ -639,7 +683,33 @@ _RESPONSE_TEMPLATE = """
         // Safety net for sites that render the disclosure label outside any
         // element matched by thinking_selectors.
         content = content.replace(/Thought Process\\s*/gi, '');
+        // A thinking disclosure that survived the prune above either glues
+        // its label ("Thinking") to the first answer character or renders
+        // it on its own line (collapsed state, or a lingering "Thinking..."
+        // status chip). Strip the leading label when what follows (skipping
+        // whitespace) is an uppercase start, a digit, or nothing at all; a
+        // legitimate answer that merely starts with the word -- "Thinking
+        // about the sun", "Reasoning carefully" -- is followed by a
+        // lowercase letter and is left alone.
+        // (no /i flag: the lookahead's [A-Z0-9] must stay
+        // case-sensitive, else "Thinking about the sun" loses
+        // its first word to the strip)
+        content = content.replace(
+            /^\\s*(?:Thinking|Thoughts|Thought|Reasoning):?\\s*(?=[A-Z0-9]|$)/,
+            ''
+        );
         content = normalize(content);
+        // A whole line that is nothing but a disclosure label is chrome,
+        // not an answer. An answer line that merely contains the word
+        // ("Thinking about the meaning of life") is preserved.
+        const labelLine = /^(?:Thinking|Thoughts|Thought|Reasoning|Thought Process)[:\\s]*$/i;
+        content = content
+            .split('\\n')
+            .filter((line) => {
+                const t = line.trim();
+                return t === '' || !labelLine.test(t);
+            })
+            .join('\\n');
         // "Working for 12s" / "Worked for 12s" appear while a reply streams.
         const isWorking = /^Work(?:ing|ed) for \\d+s/.test(content);
         content = content.replace(/^Work(?:ing|ed) for \\d+s\\s*/, '');
@@ -714,6 +784,7 @@ def _response_js(
     loading_selectors: list[str] | tuple[str, ...] | None = None,
     login_wall_selectors: list[str] | tuple[str, ...] | None = None,
     response_container: str | None = None,
+    response_exclude_selectors: list[str] | tuple[str, ...] | None = None,
 ) -> str:
     """Build JS that extracts the newest assistant response from a page.
 
@@ -722,10 +793,19 @@ def _response_js(
     answer and reasoning are read only inside the NEWEST matching
     container, so a pending turn can never report the previous
     turn's answer or reasoning.
+
+    ``response_exclude_selectors`` prunes turn chrome (action buttons,
+    headers, feedback bars) from a copy of the response before its
+    text is read, for sites that render that chrome inside the same
+    container as the answer.
     """
     return (
         _RESPONSE_TEMPLATE.replace(
             "__RESPONSE_SELECTORS__", json.dumps(list(response_selectors or []))
+        )
+        .replace(
+            "__RESPONSE_EXCLUDE_SELECTORS__",
+            json.dumps(list(response_exclude_selectors or [])),
         )
         .replace("__THINKING_SELECTORS__", json.dumps(list(thinking_selectors or [])))
         .replace("__LOADING_SELECTORS__", json.dumps(list(loading_selectors or [])))
@@ -1033,24 +1113,69 @@ SITES: dict[str, dict] = {
                 // both light DOM and shadow roots.
                 let el = document.querySelector('[data-sbsllm-input="true"]');
                 if (!el) {
-                    for (const host of document.querySelectorAll('*')) {
-                        try {
-                            if (!host.shadowRoot) continue;
-                            el = host.shadowRoot.querySelector('[data-sbsllm-input="true"]');
-                            if (el) break;
-                        } catch (_) {}
+                    // Depth-first shadow scan: the marked textarea
+                    // lives in ms-autosize-textarea's shadow root,
+                    // itself nested inside ms-prompt-box's, so a
+                    // single-level scan of the document's shadow
+                    // hosts never reaches it.
+                    const stack = Array.from(document.querySelectorAll('*'));
+                    while (stack.length) {
+                        const host = stack.pop();
+                        let root;
+                        try { root = host.shadowRoot; } catch (_) { continue; }
+                        if (!root) continue;
+                        el = root.querySelector('[data-sbsllm-input="true"]');
+                        if (el) break;
+                        for (const inner of root.querySelectorAll('*')) {
+                            stack.push(inner);
+                        }
                     }
                 }
                 if (!el) return 'NO_MARKED_INPUT';
-                const autosize = el.closest('ms-autosize-textarea');
+                // closest() cannot cross shadow boundaries, so when the
+                // textarea lives inside the component's shadow root the
+                // ms-autosize-textarea host is never found and the Run
+                // button stays disabled -- the prompt sits in the box but
+                // is never sent. Locate the host whose shadow root
+                // contains the marked textarea instead (there is only one
+                // prompt box per page), with the light-DOM ancestor check
+                // as the fallback for components that render without a
+                // shadow root.
+                let autosize = null;
+                try {
+                    autosize = el.closest('ms-autosize-textarea');
+                } catch (_) {}
+                if (!autosize) {
+                    // The host may itself live inside another shadow
+                    // root (ms-autosize-textarea inside
+                    // ms-prompt-box), so scan every shadow tree, not
+                    // just the document's light DOM.
+                    const stack = Array.from(document.querySelectorAll('*'));
+                    while (stack.length && !autosize) {
+                        const host = stack.pop();
+                        let root;
+                        try { root = host.shadowRoot; } catch (_) { continue; }
+                        if (!root) continue;
+                        try {
+                            if (host.matches('ms-autosize-textarea')
+                                && root.contains(el)) {
+                                autosize = host;
+                            }
+                        } catch (_) {}
+                        for (const inner of root.querySelectorAll('*')) {
+                            stack.push(inner);
+                        }
+                    }
+                }
                 if (autosize) {
                     autosize.setAttribute('data-value', el.value || '');
                 }
                 try {
                     // Dispatch a proper InputEvent (not just Event) so the
                     // web component's internal listener updates its state.
+                    // composed:true lets it cross the shadow boundary.
                     el.dispatchEvent(new InputEvent('input', {
-                        bubbles: true, cancelable: true,
+                        bubbles: true, cancelable: true, composed: true,
                         inputType: 'insertText', data: el.value
                     }));
                     el.dispatchEvent(new Event('change', { bubbles: true }));
@@ -1060,10 +1185,21 @@ SITES: dict[str, dict] = {
                 }
                 // The Run button lives inside ms-run-button's shadow DOM;
                 // standard querySelector cannot reach into shadow roots, so
-                // traverse shadowRoot explicitly. Fall back to light-DOM
+                // traverse shadowRoot explicitly. It may itself be nested
+                // inside ms-prompt-box's shadow root. Fall back to light-DOM
                 // querySelector for components that don't use shadow DOM.
-                const runButtonHost = document.querySelector('ms-run-button');
-                if (runButtonHost) {
+                let runButtonHosts = Array.from(
+                    document.querySelectorAll('ms-run-button')
+                );
+                const promptBoxHost = document.querySelector('ms-prompt-box');
+                try {
+                    if (promptBoxHost?.shadowRoot) {
+                        runButtonHosts = runButtonHosts.concat(Array.from(
+                            promptBoxHost.shadowRoot.querySelectorAll('ms-run-button')
+                        ));
+                    }
+                } catch (_) {}
+                for (const runButtonHost of runButtonHosts) {
                     try {
                         runButtonHost.removeAttribute('disabled');
                         const root = (runButtonHost.shadowRoot || runButtonHost);
@@ -1077,38 +1213,129 @@ SITES: dict[str, dict] = {
                 return 'OK';
             })()
         """,
-        "submit_js": _submit_js(
-            """
-            // Google AI Studio uses ms-* web components that may use Shadow DOM.
-            // Standard querySelector cannot reach into shadow roots, so we
-            // traverse shadowRoot first, then fall back to light-DOM selectors.
-            (document.querySelector('ms-run-button')?.shadowRoot?.querySelector('button[aria-label="Run"]'))
-                || (document.querySelector('ms-run-button')?.shadowRoot?.querySelector('button[type="submit"]'))
-                || (document.querySelector('ms-run-button')?.shadowRoot?.querySelector('button:not([disabled])'))
-                || (document.querySelector('ms-prompt-box')?.shadowRoot?.querySelector('ms-run-button')?.shadowRoot?.querySelector('button[aria-label="Run"]'))
-                || document.querySelector('ms-run-button button[aria-label="Run"]')
-                || document.querySelector('ms-prompt-box ms-run-button button[aria-label="Run"]')
-                || document.querySelector('ms-prompt-box ms-run-button button[type="submit"]')
-                || document.querySelector('ms-run-button button[type="submit"].run-button')
-                || document.querySelector('button[aria-label="Run"].run-button')
-                || document.querySelector('button[aria-label*="Run" i]')
-                || document.querySelector('button[aria-label*="Send" i]')
-                || document.querySelector('button[aria-label*="Submit" i]')
-                || document.querySelector('button[class*="build-button"]:not([disabled])')
-                || document.querySelector('button[class*="ms-button-primary"]:not([disabled])')
-                || document.querySelector('button[type="submit"]:not([disabled])')
-                || document.querySelector('ms-prompt-box textarea')?.closest('form')?.querySelector('button:not([disabled])')
-                || document.querySelector('ms-prompt-box textarea')?.parentElement?.querySelector('button:not([disabled])')
-                || document.querySelector('ms-prompt-box textarea')?.parentElement?.parentElement?.querySelector('button:not([disabled])')
+        "submit_js": """
+            (() => {
+                // Google AI Studio sends with Ctrl+Enter; plain Enter
+                // only inserts a newline. The Run button is rendered by
+                // the ms-run-button web component inside its shadow root
+                // and stays disabled until ms-autosize-textarea's state
+                // is synced (post_inject_js does that). Strategy: click
+                // the Run button when it is enabled; when no clickable
+                // button exists, fall back to the Ctrl+Enter shortcut
+                // on the marked prompt textarea.
+                const isUploadButton = (btn) => {
+                    if (!btn || typeof btn.getAttribute !== 'function') return false;
+                    const id = (btn.id || '').toLowerCase();
+                    const cls = (btn.className || '').toLowerCase();
+                    const aria = (btn.getAttribute('aria-label') || '').toLowerCase();
+                    const title = (btn.getAttribute('title') || '').toLowerCase();
+                    const text = (btn.textContent || '').toLowerCase();
+                    return id.includes('upload') || id.includes('attach') || id.includes('file')
+                        || cls.includes('upload') || cls.includes('attach')
+                        || aria.includes('upload') || aria.includes('attach')
+                        || title.includes('upload') || title.includes('attach')
+                        || text.includes('upload') || text.includes('attach')
+                        || text.includes('file');
+                };
+                // The inject step marks the prompt textarea; it may
+                // live inside a shadow root of the ms-* components.
+                let input = document.querySelector('[data-sbsllm-input="true"]');
+                if (!input) {
+                    // Depth-first shadow scan: the marked textarea
+                    // lives in ms-autosize-textarea's shadow root,
+                    // itself nested inside ms-prompt-box's, so a
+                    // single-level scan of the document's shadow
+                    // hosts never reaches it.
+                    const stack = Array.from(document.querySelectorAll('*'));
+                    while (stack.length) {
+                        const host = stack.pop();
+                        let root;
+                        try { root = host.shadowRoot; } catch (_) { continue; }
+                        if (!root) continue;
+                        input = root.querySelector('[data-sbsllm-input="true"]');
+                        if (input) break;
+                        for (const inner of root.querySelectorAll('*')) {
+                            stack.push(inner);
+                        }
+                    }
+                }
+                if (!input) return 'NO_INPUT';
+                if (input?.dataset?.sbsllmInput === 'true') {
+                    delete input.dataset.sbsllmInput;
+                }
+                // 1) Click the Run button (light DOM, or inside
+                //    ms-prompt-box's shadow root).
+                let runHosts = Array.from(document.querySelectorAll('ms-run-button'));
+                const promptBox = document.querySelector('ms-prompt-box');
+                try {
+                    if (promptBox?.shadowRoot) {
+                        runHosts = runHosts.concat(Array.from(
+                            promptBox.shadowRoot.querySelectorAll('ms-run-button')
+                        ));
+                    }
+                } catch (_) {}
+                for (const host of runHosts) {
+                    try {
+                        const root = host.shadowRoot || host;
+                        const btn = root.querySelector('button[aria-label="Run"]')
+                            || root.querySelector('button[type="submit"]')
+                            || root.querySelector('button:not([disabled])');
+                        if (!btn || typeof btn.click !== 'function'
+                            || btn.disabled
+                            || btn.getAttribute('aria-disabled') === 'true'
+                            || isUploadButton(btn)) continue;
+                        btn.click();
+                        return 'OK';
+                    } catch (_) {}
+                }
+                // 2) No clickable Run button: send via the Ctrl+Enter
+                //    shortcut, which is AI Studio's native send key.
+                //    composed:true lets the event cross the shadow
+                //    boundary if the textarea sits in one.
+                const combo = {
+                    key: 'Enter', code: 'Enter', keyCode: 13, which: 13,
+                    bubbles: true, cancelable: true, composed: true,
+                    ctrlKey: true,
+                };
+                try {
+                    input.focus();
+                    input.dispatchEvent(new KeyboardEvent('keydown', combo));
+                    input.dispatchEvent(new KeyboardEvent('keypress', combo));
+                    input.dispatchEvent(new KeyboardEvent('keyup', combo));
+                } catch (_) {}
+                return 'ENTER_SENT';
+            })()
         """,
-            "document.querySelector('ms-prompt-box textarea, textarea')",
-        ),
         "response_selectors": [
+            # The turn content area holds the answer. The turn header
+            # (model name + timestamp), the options menu and the
+            # feedback bar render outside it, so a whole-container
+            # match forwards them as part of the reply.
+            ".chat-turn-container.model .turn-content",
             "ms-chat-turn .chat-turn-container.model",
             'ms-chat-turn:has([data-turn-role="Model"])',
             'ms-chat-turn [data-turn-role="Model"]',
         ],
+        # Chrome that renders INSIDE the matched response container
+        # on Google AI Studio: action and feedback buttons (their
+        # Material Symbols ligature text reads "edit", "more_vert",
+        # "thumb_up", "thumb_down") and the model/timestamp header.
+        # Pruned from the response clone before the text is read.
+        "response_exclude_selectors": [
+            "button, [role='button']",
+            "ms-chat-turn-options, .turn-footer",
+            ".material-symbols-outlined, .material-symbols-rounded, .material-icons, [class*='material-symbols'], [class*='material-icons']",
+            ".author-label, [class*='turn-header'], [class*='timestamp'], time",
+        ],
         "thinking_selectors": [
+            # AI Studio renders the reasoning trace in the
+            # ms-thought-chunk web component (a tag, not a class),
+            # optionally flagged with a .thought-panel class. When
+            # collapsed it renders only its "Thinking" label; if the
+            # chunk is not matched here the label leaks into the
+            # relayed answer.
+            "ms-thought-chunk",
+            ".thought-panel",
             'ms-chat-turn [class*="thinking"]',
             'ms-chat-turn [class*="reasoning"]',
         ],

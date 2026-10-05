@@ -6,6 +6,7 @@ and routes them to the appropriate chat website via browser automation.
 
 from __future__ import annotations
 
+import concurrent.futures
 import hashlib
 import json
 import logging
@@ -75,6 +76,11 @@ DEFAULT_DUPLICATE_PROMPT_COOLDOWN = 60.0
 DEFAULT_HEALTH_INTERVAL = 30
 # Request ID header name
 REQUEST_ID_HEADER = "X-Request-ID"
+# Virtual model that fans one prompt out to every configured tab and
+# returns a single completion with each tab's answer under a
+# `### <model>` heading. It maps to itself in `model_map` and has no
+# tab of its own, so the handler intercepts it before the per-tab path.
+MULTI_MODEL_ID = "multi"
 
 
 def _estimate_tokens(text: str) -> int:
@@ -1511,6 +1517,23 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             )
             return
 
+        if site_id == MULTI_MODEL_ID:
+            # The virtual fan-out model has no tab of its own, so it
+            # bypasses the single-tab path below entirely.
+            if data.get("stream") is True:
+                self._send_error(
+                    400,
+                    "Streaming is not supported for the 'multi' model. "
+                    "Omit 'stream' to receive one aggregated response "
+                    "with every model's answer.",
+                    "invalid_request_error",
+                    request_id=request_id,
+                    model=model,
+                )
+                return
+            self._handle_multi_model(request_id, model, prompt, len(messages))
+            return
+
         # Get page for this model
         page = self.tab_map.get(model)
         tab_index = (
@@ -2082,6 +2105,416 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         _update_metrics(elapsed, error=False)
         self._send_json(200, response, request_id)
 
+    def _acquire_all_browser_locks(self, models: list[str]):
+        """Acquire the tab lock for every model in `models`.
+
+        Returns (locks, acquired, timeout). `locks` is empty when
+        acquisition failed, so the caller cannot release locks it
+        does not hold. All locks share one deadline
+        (`browser_lock_timeout`), so the total wait stays bounded
+        no matter how many tabs are involved. Locks are taken in
+        `models` order, so concurrent fan-outs acquire in the same
+        order and cannot deadlock against each other.
+        """
+        registry = getattr(getattr(self, "server", None), "model_locks", None)
+        lock_timeout = self._server_setting(
+            "browser_lock_timeout", DEFAULT_BROWSER_LOCK_TIMEOUT
+        )
+        if registry is None:
+            return [], True, lock_timeout
+        deadline = time.monotonic() + float(lock_timeout)
+        acquired: list[threading.Lock] = []
+        for model in models:
+            remaining = deadline - time.monotonic()
+            lock = registry.get(model)
+            if remaining > 0 and lock.acquire(timeout=remaining):
+                acquired.append(lock)
+                continue
+            for held in acquired:
+                held.release()
+            return [], False, lock_timeout
+        return acquired, True, lock_timeout
+
+    def _response_wait_kwargs(self) -> dict:
+        """wait_for_response settings shared by every polling call."""
+        return {
+            "idle_timeout": self._server_setting(
+                "response_idle_timeout", DEFAULT_RESPONSE_IDLE_TIMEOUT
+            ),
+            "poll_interval": self._server_setting(
+                "poll_interval", DEFAULT_POLL_INTERVAL
+            ),
+            "done_confirm": self._server_setting(
+                "response_done_confirm", DEFAULT_RESPONSE_DONE_CONFIRM
+            ),
+            "thinking_patience": self._server_setting(
+                "thinking_patience", DEFAULT_THINKING_PATIENCE
+            ),
+            "busy_patience": self._server_setting(
+                "busy_patience", DEFAULT_BUSY_PATIENCE
+            ),
+            "first_token_timeout": self._server_setting(
+                "first_token_timeout", DEFAULT_FIRST_TOKEN_TIMEOUT
+            ),
+        }
+
+    def _handle_multi_model(
+        self,
+        request_id: str,
+        model: str,
+        prompt: str,
+        message_count: int,
+    ) -> None:
+        """Fan one prompt out to every tab and aggregate the answers.
+
+        Submits the prompt on all configured tabs concurrently,
+        waits for every turn to finish, and returns a single
+        completion whose content is each tab's full answer under a
+        `### <model>` heading. Any tab failing fails the whole
+        request -- a partial aggregate would silently hide which
+        model failed. Streaming is not supported: the fan-out has
+        no single ordering to multiplex into one SSE stream.
+        """
+        logger = logging.getLogger(__name__)
+        request_start = time.monotonic()
+        tab_models = [
+            tab_model
+            for tab_model, site_id in self.model_map.items()
+            if site_id != MULTI_MODEL_ID
+        ]
+        if len(tab_models) < 2:
+            self._send_error(
+                502,
+                "The 'multi' model needs at least two browser tabs. "
+                "Configure more chats and restart sbsllm.",
+                "server_error",
+                request_id=request_id,
+                model=model,
+            )
+            return
+
+        browser_timeout = self._server_setting(
+            "browser_timeout", DEFAULT_BROWSER_TIMEOUT
+        )
+        logger.info(
+            "chat_completion request_start",
+            extra={
+                "model": model,
+                "tab_count": len(tab_models),
+                "tabs": tab_models,
+                "messages": message_count,
+                "request_id": request_id,
+                "prompt_preview": prompt[:200],
+                "stream": False,
+            },
+        )
+
+        # Grab every tab's lock before submitting anything, so a
+        # concurrent request cannot interleave into any of the tabs
+        # mid-fan-out.
+        locks, lock_acquired, lock_timeout = self._acquire_all_browser_locks(
+            tab_models
+        )
+        if not lock_acquired:
+            logger.warning(
+                "chat_completion tab_busy",
+                extra={
+                    "model": model,
+                    "lock_timeout": lock_timeout,
+                    "busy_models": self._busy_models(),
+                    "request_id": request_id,
+                    "stream": False,
+                },
+            )
+            self._send_busy_error(request_id, model, lock_timeout)
+            _update_metrics(
+                time.monotonic() - request_start,
+                error=True,
+                error_type="lock_timeout",
+            )
+            return
+
+        try:
+            results = self._fan_out_to_tabs(tab_models, prompt, browser_timeout)
+        finally:
+            for browser_lock in locks:
+                self._release_browser_lock(browser_lock)
+
+        failures = [result for result in results if result.get("error_type")]
+        if failures:
+            first = failures[0]
+            failed_models = ", ".join(
+                result["model"] for result in failures
+            )
+            elapsed = time.monotonic() - request_start
+            logger.warning(
+                "chat_completion multi_failed",
+                extra={
+                    "model": model,
+                    "request_id": request_id,
+                    "failed_models": failed_models,
+                    "error_type": first["error_type"],
+                    "error": first["message"],
+                },
+            )
+            _update_metrics(elapsed, error=True, error_type=first["error_type"])
+            self._send_error(
+                first["status_code"],
+                f"{first['message']} [multi: failed on {failed_models}]",
+                "server_error",
+                request_id,
+                model=model,
+            )
+            return
+
+        content = "\n\n".join(
+            f"### {result['model']}\n\n{result['content']}"
+            for result in results
+        )
+        thinking = "\n\n".join(
+            f"### {result['model']}\n\n{result['thinking']}"
+            for result in results
+            if result.get("thinking")
+        )
+        response = self._build_completion_response(
+            model, prompt, content, thinking, "stop", request_id
+        )
+
+        elapsed = time.monotonic() - request_start
+        logger.info(
+            "chat_completion request_end",
+            extra={
+                "model": model,
+                "status_code": 200,
+                "duration_ms": int(elapsed * 1000),
+                "request_id": request_id,
+                "tab_count": len(results),
+                "content_len": len(content),
+            },
+        )
+        _update_metrics(elapsed, error=False)
+        self._send_json(200, response, request_id)
+
+    def _fan_out_to_tabs(
+        self, tab_models: list[str], prompt: str, browser_timeout: float
+    ) -> list[dict]:
+        """Run one turn on every tab concurrently.
+
+        Each tab's work runs on its own thread: the Playwright
+        calls inside are marshalled onto the single browser worker
+        thread, so the tabs' answer waits overlap instead of
+        queueing behind each other. Results are returned in
+        `tab_models` order.
+        """
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=len(tab_models)
+        ) as executor:
+            futures = {
+                executor.submit(
+                    self._run_multi_tab,
+                    tab_model,
+                    self.model_map[tab_model],
+                    self.tab_map.get(tab_model),
+                    prompt,
+                    list(self.model_map.keys()).index(tab_model) + 1,
+                    browser_timeout,
+                ): tab_model
+                for tab_model in tab_models
+            }
+            results: dict[str, dict] = {}
+            for future in concurrent.futures.as_completed(futures):
+                results[futures[future]] = future.result()
+        return [results[tab_model] for tab_model in tab_models]
+
+    def _run_multi_tab(
+        self,
+        tab_model: str,
+        site_id: str,
+        page,
+        prompt: str,
+        tab_index: int,
+        browser_timeout: float,
+    ) -> dict:
+        """Submit the prompt on one tab and wait for its answer.
+
+        Never raises: a failure is returned as an error result so
+        one bad tab cannot take down its sibling turns mid-flight
+        (they are already generating in the browser and their
+        results are discarded by the caller anyway).
+        """
+        try:
+            if page is None:
+                return {
+                    "model": tab_model,
+                    "error_type": "no_tab",
+                    "status_code": 502,
+                    "message": f"No browser tab for model: {tab_model}.",
+                }
+            extraction = extract_js(site_id)
+            if not extraction:
+                return {
+                    "model": tab_model,
+                    "error_type": "extraction_unsupported",
+                    "status_code": 502,
+                    "message": (
+                        f"Response extraction is not supported for "
+                        f"site: {site_id}."
+                    ),
+                }
+
+            duplicate = self._duplicate_turn(tab_model, prompt)
+            if duplicate:
+                # An identical prompt was just submitted on this tab
+                # (a client retry train): attach to the turn already
+                # on screen instead of re-injecting.
+                attach = capture_response(page, extraction)
+                if not attach.get("busy") and (
+                    attach.get("content") or ""
+                ).strip():
+                    response_result = attach
+                else:
+                    response_result = wait_for_response(
+                        page,
+                        extraction,
+                        browser_timeout,
+                        baseline=attach,
+                        **self._response_wait_kwargs(),
+                    )
+            else:
+                baseline = capture_response(page, extraction)
+                status, page = self._inject_and_submit_with_recovery(
+                    page, tab_model, site_id, prompt, tab_index
+                )
+                browser_error = next(
+                    (
+                        status[field]
+                        for field in ("inject", "submit")
+                        if isinstance(status.get(field), str)
+                        and status[field].startswith("BROWSER_ERROR:")
+                    ),
+                    None,
+                )
+                if browser_error:
+                    return {
+                        "model": tab_model,
+                        "error_type": "browser_error",
+                        "status_code": 502,
+                        "message": (
+                            f"Browser error from {site_id}: "
+                            f"{browser_error}."
+                        ),
+                    }
+                if (
+                    status.get("inject") != "OK"
+                    or status.get("submit")
+                    not in {"OK", "ENTER_SENT", "ENTER_SENT_UNVERIFIED"}
+                ):
+                    if status.get("inject") != "OK":
+                        detail = f"Failed to inject prompt: {status['inject']}"
+                    else:
+                        detail = f"Failed to submit: {status['submit']}"
+                    return {
+                        "model": tab_model,
+                        "error_type": "inject_submit_failed",
+                        "status_code": 502,
+                        "message": f"{detail} on {site_id}.",
+                    }
+                # Only a real submission arms the duplicate-submit guard.
+                self._record_turn(tab_model, prompt)
+                response_result = wait_for_response(
+                    page,
+                    extraction,
+                    browser_timeout,
+                    baseline=baseline,
+                    **self._response_wait_kwargs(),
+                )
+        except BrowserError as e:
+            return {
+                "model": tab_model,
+                "error_type": "browser_error",
+                "status_code": 502,
+                "message": f"Browser error from {site_id}: {e}.",
+            }
+        except BrowserOperationTimeout as e:
+            return {
+                "model": tab_model,
+                "error_type": "browser_timeout",
+                "status_code": 502,
+                "message": (
+                    f"Browser is unresponsive: {e}. The browser worker "
+                    f"thread for {site_id} is blocked and will not "
+                    f"recover on its own — restart sbsllm."
+                ),
+            }
+        except Exception as e:
+            logger = logging.getLogger(__name__)
+            logger.exception(
+                "chat_completion multi_tab_error",
+                extra={
+                    "model": tab_model,
+                    "site_id": site_id,
+                    "tab_index": tab_index,
+                    "error": str(e),
+                    "error_type": type(e).__name__,
+                },
+            )
+            return {
+                "model": tab_model,
+                "error_type": type(e).__name__,
+                "status_code": 500,
+                "message": f"Internal error in {site_id}: {e}",
+            }
+
+        # Validate the turn the same way the single-model path does:
+        # a truncated, empty or login-walled capture is a failure,
+        # not a partial answer.
+        if response_result.get("timed_out") or response_result.get(
+            "busy_timeout"
+        ):
+            return {
+                "model": tab_model,
+                "error_type": "timeout",
+                "status_code": 504,
+                "message": (
+                    f"Request timeout: the {site_id} assistant response "
+                    f"was not completed within {browser_timeout:g}s."
+                ),
+            }
+        if response_result.get("no_output"):
+            return {
+                "model": tab_model,
+                "error_type": "no_output",
+                "status_code": 504,
+                "message": (
+                    f"The {site_id} page produced no answer within the "
+                    f"first-token window."
+                ),
+            }
+        if not response_result.get("found"):
+            if response_result.get("login_wall"):
+                return {
+                    "model": tab_model,
+                    "error_type": "login_required",
+                    "status_code": 502,
+                    "message": (
+                        f"The {site_id} chat requires a signed-in session."
+                    ),
+                }
+            return {
+                "model": tab_model,
+                "error_type": "no_response",
+                "status_code": 504,
+                "message": (
+                    f"No assistant response was detected from {site_id} "
+                    f"after submission."
+                ),
+            }
+        return {
+            "model": tab_model,
+            "content": response_result.get("content", ""),
+            "thinking": response_result.get("thinking") or "",
+        }
+
     def _build_completion_response(
         self,
         model: str,
@@ -2193,14 +2626,26 @@ class Server:
         poll_interval: float = DEFAULT_POLL_INTERVAL,
         duplicate_prompt_cooldown: float = DEFAULT_DUPLICATE_PROMPT_COOLDOWN,
     ):
-        self.model_map = model_map or {}
+        self.model_map = dict(model_map) if model_map else {}
+        # The virtual `multi` model fans a prompt out to every
+        # configured tab, so it only exists once there is more
+        # than one tab to compare. It maps to itself: the handler
+        # intercepts it before any per-tab lookup, and it shows
+        # up in GET /v1/models like a real model.
+        if len(self.model_map) >= 2 and MULTI_MODEL_ID not in self.model_map:
+            self.model_map[MULTI_MODEL_ID] = MULTI_MODEL_ID
         self.tab_map = tab_map or {}
         # Fail fast on mappings that can never work: an unknown
         # site id only surfaces per-request as a 500, long after
         # the operator has walked away. The config layer already
         # validates `chats`; this guards programmatic callers.
+        # `multi` is virtual, not a site id, so it is exempt.
         unknown_sites = sorted(
-            {site_id for site_id in self.model_map.values() if site_id not in SITES}
+            {
+                site_id
+                for site_id in self.model_map.values()
+                if site_id not in SITES and site_id != MULTI_MODEL_ID
+            }
         )
         if unknown_sites:
             logger = logging.getLogger(__name__)

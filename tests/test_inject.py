@@ -162,6 +162,60 @@ class TestInjectPrompt:
         result = submit_js("google")
         assert "ms-run-button" in result
 
+    def test_google_submit_sends_with_ctrl_enter(self):
+        """AI Studio sends with Ctrl+Enter; plain Enter only inserts a
+        newline, so the fallback must dispatch a ctrl-modified Enter."""
+        result = submit_js("google")
+        assert "ctrlKey: true" in result
+        assert "ENTER_SENT" in result
+
+    def test_google_submit_falls_back_when_button_not_clickable(self):
+        """The Ctrl+Enter fallback fires when no enabled Run button is
+        found (the button stays disabled until post_inject syncs the
+        ms-autosize-textarea state)."""
+        result = submit_js("google")
+        # Button click is attempted first...
+        assert "btn.click()" in result
+        # ...and the shortcut is dispatched only if no button was
+        # clicked (the click path returns early).
+        assert "return 'OK'" in result
+
+    def test_google_post_inject_finds_autosize_across_shadow_boundary(self):
+        """closest() cannot cross shadow boundaries; post_inject must
+        locate the ms-autosize-textarea host whose shadow root contains
+        the marked textarea, or the Run button stays disabled."""
+        result = inject_prompt("google", "test")
+        assert "root.contains(el)" in result
+        assert "ms-autosize-textarea" in result
+
+    def test_google_response_selectors_target_model_turns(self):
+        """Google's response selectors must target the Model turn, not
+        the user's prompt turn, so the relayed answer is the reply."""
+        from sbsllm.sites import SITES
+
+        selectors = SITES["google"]["response_selectors"]
+        assert any("Model" in s for s in selectors)
+        assert any("chat-turn-container.model" in s for s in selectors)
+        # The primary selector scopes to the turn content area so the
+        # model/timestamp header and action menus are not relayed.
+        assert any(".turn-content" in s for s in selectors)
+
+    def test_google_response_exclude_selectors_prune_turn_chrome(self):
+        """Google's turn container renders action icons, the model/
+        timestamp header and feedback buttons inside the matched
+        response; they must be pruned before the text is read."""
+        from sbsllm.inject import extract_js
+        from sbsllm.sites import SITES
+
+        exclusions = SITES["google"]["response_exclude_selectors"]
+        assert any("button" in s for s in exclusions)
+        assert any("material-symbols" in s for s in exclusions)
+        assert any("turn-footer" in s for s in exclusions)
+        js = extract_js("google")
+        # The placeholder must be replaced, not left in the JS.
+        assert "__RESPONSE_EXCLUDE_SELECTORS__" not in js
+        assert "responseExcludeSelectors" in js
+
     def test_kimi_url_uses_kimi_ai(self):
         """Kimi URL should be kimi.ai, not kimi.com."""
         from sbsllm.sites import SITES

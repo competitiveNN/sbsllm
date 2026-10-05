@@ -96,6 +96,58 @@ browser tab on a specific chat website (configured via `model_map`).
   message.
 - **Google AI Studio**: `inject` and `submit_js` now traverse Shadow DOM roots
   of `ms-prompt-box` / `ms-autosize-textarea` / `ms-run-button` web components.
+- **Google AI Studio send**: the prompt was inserted but never sent. Two
+  compounding bugs: (1) `post_inject_js` located the `ms-autosize-textarea`
+  host with `el.closest()`, which cannot cross shadow boundaries, so the
+  `data-value` sync silently no-oped and the Run button stayed disabled;
+  the host is now found via a depth-first shadow scan (`shadowRoot.contains(el)`),
+  because the marked textarea lives in `ms-autosize-textarea`'s shadow
+  root, itself nested inside `ms-prompt-box`'s — a single-level scan of
+  the document's shadow hosts never reaches it. The same recursive scan
+  replaces the single-level marker search in the generic submit template,
+  the contenteditable/Lexical post-inject blocks, and Google's own
+  `post_inject_js`/`submit_js`. (2) With the button
+  disabled, the generic submit template fell back to dispatching *plain*
+  Enter, which only inserts a newline in AI Studio (its send key is
+  Ctrl+Enter). Google's `submit_js` now clicks the enabled Run button
+  (shadow-aware) and otherwise falls back to a `composed` Ctrl+Enter
+  keydown on the marked textarea. Response relay verified: extraction
+  selectors target `ms-chat-turn` Model turns.
+- **Google AI Studio turn chrome in answers**: the relayed answer
+  carried the turn's UI chrome (`edit`, `more_vert`, `Model
+  1:32 PM`, `thumb_up`, `thumb_down`). Two layers fix it: (1) the
+  primary `response_selectors` entry scopes to
+  `.chat-turn-container.model .turn-content` — the turn header
+  (model name + timestamp), options menu and feedback bar render
+  outside it; (2) a new per-site `response_exclude_selectors`
+  (threaded through `_response_js`/`extract_js` into
+  `_RESPONSE_TEMPLATE`) prunes buttons, `ms-chat-turn-options`,
+  `.turn-footer`, Material Symbols icon ligatures and
+  header/timestamp elements from a clone of the response before its
+  text is read — covering the fallback path where the whole turn
+  container matches. Chrome is never the answer, so unlike the
+  reasoning prune there is no `wrapsAnswer` guard.
+- **Google AI Studio "Thinking" label in answers**: the relayed
+  answer started with a glued `Thinking` word. The reasoning trace
+  lives in the `ms-thought-chunk` web component (a tag, not a
+  class), so the old `thinking_selectors`
+  (`[class*="thinking"]`/`[class*="reasoning"]`) never matched it
+  and a collapsed chunk — which renders only its label — leaked
+  into the answer. Google's `thinking_selectors` now lead with
+  `ms-thought-chunk`/`.thought-panel`, so the chunk is captured as
+  thinking (the bare label is filtered by the existing
+  label-only check) and pruned from the answer clone. A template
+  safety net also handles labels that survive the prune: a
+  leading `Thinking`/`Thoughts`/`Thought`/`Reasoning` label is
+  stripped when the next non-space character is an uppercase
+  letter, a digit, or nothing at all; and a line that is nothing
+  but a disclosure label (a lingering "Thinking" status chip
+  rendered outside any thinking selector) is dropped whole. The
+  leading-label regex carries no `/i` flag on purpose: with it,
+  the lookahead's `[A-Z0-9]` matches case-insensitively and a
+  legitimate answer like "Thinking about the sun" would lose
+  its first word — a lowercase continuation marks a real answer
+  and is left untouched.
 - **Zai chat**: URL changed to `https://chat.z.ai/` to avoid auth wall;
   `login_wall_selectors` narrowed to exclude nav sign-in button false-positive;
   double-send from Enter key dispatch in `post_inject_js` eliminated.
@@ -209,8 +261,28 @@ only whitespace) still returns 504.
 ### Token usage
 
 `prompt_tokens` / `completion_tokens` / `total_tokens` are estimated by
-`_estimate_tokens` in `server.py`: CJK characters (Han / Hiragana / Katakana /
-Hangul) count ~1 token each, everything else ~4 characters per token. Web chats
-expose no tokenizer, so these are ballpark figures for cost/progress display,
-not billing. Included on the final SSE chunk (streaming) and on the completion
-object (non-streaming).
+`_estimate_tokens` in `server.py`: CJK characters (Han / Hiragana /
+Katakana / Hangul) count ~1 token each, everything else ~4 characters per
+token. Web chats expose no tokenizer, so these are ballpark figures for
+cost/progress display, not billing. Included on the final SSE chunk
+(streaming) and on the completion object (non-streaming).
+
+### Multi model
+
+When two or more chats are configured, the server registers a virtual
+`multi` model (`MULTI_MODEL_ID` in `server.py`, appended to `model_map`
+by `Server.__init__`). A non-streaming request to `multi` submits the
+prompt on every tab concurrently (`_handle_multi_model` →
+`_fan_out_to_tabs`, one thread per tab; the Playwright calls inside are
+marshalled onto the single browser worker thread, so the answer waits
+overlap), waits for all of them, and returns one completion whose
+content is each answer under a `### <model>` heading (thinking traces
+aggregated the same way). Every tab's lock is acquired upfront under one
+shared `browser_lock_timeout` deadline. Failure semantics are strict:
+any tab failing (timeout, no output, login wall, inject/submit failure,
+unsupported extraction) fails the whole request with that tab's status
+code plus `[multi: failed on <models>]` — no partial aggregates.
+`"stream": true` with `multi` is rejected with 400: there is no sane
+ordering for multiplexing concurrent browser streams into one SSE
+stream. The per-tab duplicate-submit guard applies unchanged, keyed on
+each real tab's model name.

@@ -61,4 +61,5 @@ def extract_js(site_id: str) -> str | None:
         site.get("loading_selectors"),
         site.get("login_wall_selectors"),
         site.get("response_container"),
+        site.get("response_exclude_selectors"),
     )

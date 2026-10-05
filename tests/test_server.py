@@ -3544,3 +3544,205 @@ class TestDuplicatePromptSuppression:
         second = self._make_nonstreaming_handler(registry, "a different question")
         submits += self._call_nonstreaming(second)
         assert submits == 2
+
+
+class TestMultiModel:
+    """The virtual `multi` model fans a prompt out to every tab."""
+
+    BASELINE: ClassVar[dict] = {
+        "found": False,
+        "content": "",
+        "thinking": None,
+        "busy": False,
+        "done": False,
+        "count": 0,
+    }
+
+    @staticmethod
+    def _page(name):
+        page = MagicMock()
+        page.is_closed.return_value = False
+        page.name = name
+        return page
+
+    def _make_handler(self, model_map, tab_map, stream=False):
+        handler = OpenAIHandler.__new__(OpenAIHandler)
+        body = json.dumps(
+            {
+                "model": "multi",
+                "messages": [{"role": "user", "content": "hello"}],
+                **({"stream": True} if stream else {}),
+            }
+        ).encode()
+        handler.headers = {
+            "Content-Length": str(len(body)),
+            "x-request-id": "test-request-id",
+        }
+        handler.rfile = MagicMock()
+        handler.rfile.read.return_value = body
+        handler.model_map = model_map
+        handler.tab_map = tab_map
+        handler.server = types.SimpleNamespace(
+            model_locks=_ModelLockRegistry(),
+            browser_lock_timeout=10,
+            browser_timeout=60,
+        )
+        handler._send_json = MagicMock()
+        handler._send_error = MagicMock()
+        handler.send_response = MagicMock()
+        handler.send_header = MagicMock()
+        handler.end_headers = MagicMock()
+        handler.wfile = MagicMock()
+        return handler
+
+    def test_server_registers_multi_model(self):
+        server = create_server(
+            model_map={"chatgpt": "chatgpt", "claude": "claude"},
+            tab_map={},
+        )
+        assert server.model_map["multi"] == "multi"
+        single = create_server(
+            model_map={"chatgpt": "chatgpt"}, tab_map={}
+        )
+        assert "multi" not in single.model_map
+
+    def test_multi_aggregates_every_answer(self):
+        handler = self._make_handler(
+            {"chatgpt": "chatgpt", "claude": "claude", "multi": "multi"},
+            {"chatgpt": self._page("chatgpt"), "claude": self._page("claude")},
+        )
+        outcomes = {
+            id(handler.tab_map["chatgpt"]): {
+                "found": True,
+                "content": "GPT answer",
+                "thinking": None,
+                "done": True,
+                "count": 1,
+            },
+            id(handler.tab_map["claude"]): {
+                "found": True,
+                "content": "Claude answer",
+                "thinking": "Claude reasoning",
+                "done": True,
+                "count": 1,
+            },
+        }
+
+        def fake_wait_by_page(page, extraction, _timeout, **kwargs):
+            return dict(outcomes[id(page)])
+
+        with (
+            patch("sbsllm.server.extract_js", return_value="EXTRACT_JS"),
+            patch("sbsllm.server.check_page_health", return_value=True),
+            patch(
+                "sbsllm.server.capture_response",
+                return_value=dict(self.BASELINE),
+            ),
+            patch(
+                "sbsllm.server.inject_and_submit",
+                return_value={"tab": 1, "inject": "OK", "submit": "OK"},
+            ),
+            patch(
+                "sbsllm.server.wait_for_response",
+                side_effect=fake_wait_by_page,
+            ),
+        ):
+            handler._handle_chat_completions()
+
+        assert handler._send_json.call_args[0][0] == 200
+        response = handler._send_json.call_args[0][1]
+        assert response["model"] == "multi"
+        assert response["choices"][0]["finish_reason"] == "stop"
+        content = response["choices"][0]["message"]["content"]
+        assert content == (
+            "### chatgpt\n\nGPT answer\n\n### claude\n\nClaude answer"
+        )
+        assert response["choices"][0]["message"]["reasoning_content"] == (
+            "### claude\n\nClaude reasoning"
+        )
+        assert response["usage"]["prompt_tokens"] > 0
+        assert response["usage"]["completion_tokens"] > 0
+
+    def test_multi_failure_fails_whole_request(self):
+        handler = self._make_handler(
+            {"chatgpt": "chatgpt", "claude": "claude", "multi": "multi"},
+            {"chatgpt": self._page("chatgpt"), "claude": self._page("claude")},
+        )
+        outcomes = {
+            id(handler.tab_map["chatgpt"]): {
+                "found": False,
+                "content": "",
+                "timed_out": True,
+            },
+            id(handler.tab_map["claude"]): {
+                "found": True,
+                "content": "Claude answer",
+                "done": True,
+                "count": 1,
+            },
+        }
+
+        def fake_wait_by_page(page, extraction, _timeout, **kwargs):
+            return dict(outcomes[id(page)])
+
+        with (
+            patch("sbsllm.server.extract_js", return_value="EXTRACT_JS"),
+            patch("sbsllm.server.check_page_health", return_value=True),
+            patch(
+                "sbsllm.server.capture_response",
+                return_value=dict(self.BASELINE),
+            ),
+            patch(
+                "sbsllm.server.inject_and_submit",
+                return_value={"tab": 1, "inject": "OK", "submit": "OK"},
+            ),
+            patch(
+                "sbsllm.server.wait_for_response",
+                side_effect=fake_wait_by_page,
+            ),
+        ):
+            handler._handle_chat_completions()
+
+        assert handler._send_json.call_count == 0
+        assert handler._send_error.call_args[0][0] == 504
+        assert "failed on chatgpt" in handler._send_error.call_args[0][1]
+
+    def test_multi_streaming_rejected(self):
+        handler = self._make_handler(
+            {"chatgpt": "chatgpt", "claude": "claude", "multi": "multi"},
+            {"chatgpt": self._page("chatgpt"), "claude": self._page("claude")},
+            stream=True,
+        )
+        handler._handle_chat_completions()
+        assert handler._send_error.call_args[0][0] == 400
+        assert "stream" in handler._send_error.call_args[0][1].lower()
+
+    def test_multi_requires_two_tabs(self):
+        handler = self._make_handler(
+            {"chatgpt": "chatgpt", "multi": "multi"},
+            {"chatgpt": self._page("chatgpt")},
+        )
+        handler._handle_chat_completions()
+        assert handler._send_error.call_args[0][0] == 502
+
+    def test_acquire_all_browser_locks(self):
+        handler = OpenAIHandler.__new__(OpenAIHandler)
+        handler.server = types.SimpleNamespace(
+            model_locks=_ModelLockRegistry(),
+            browser_lock_timeout=10,
+        )
+        locks, acquired, _timeout = handler._acquire_all_browser_locks(
+            ["a", "b"]
+        )
+        assert acquired is True
+        assert len(locks) == 2
+        # A second acquisition of the held locks fails and releases
+        # nothing it does not hold.
+        handler.server.browser_lock_timeout = 0.01
+        locks2, acquired2, _ = handler._acquire_all_browser_locks(
+            ["a", "b"]
+        )
+        assert acquired2 is False
+        assert locks2 == []
+        for browser_lock in locks:
+            browser_lock.release()
