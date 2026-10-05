@@ -1440,8 +1440,22 @@ SITES: dict[str, dict] = {
             '[data-role="assistant"]',
             '[data-message-author-role="assistant"]',
             ".message.assistant",
-            '[class*="assistant"] .markdown',
+            # NOT '.markdown' bare: Kimi nests the thinking trace in a
+            # .markdown-container.toolcall-content-text inside
+            # .thinking-container, and a bare .markdown fallback matched
+            # it first, so the thinking text was relayed as the answer.
+            # Scope to .markdown-container:not(.toolcall-content-text)
+            # so the answer's .markdown (the sibling, outside the thinking
+            # container) is matched and the thinking one is not.
+            ".markdown-container:not(.toolcall-content-text) .markdown",
             "article .markdown",
+        ],
+        "response_exclude_selectors": [
+            # Belt and braces: prune the thinking container from a clone
+            # of the response in case the selector above ever misses.
+            ".toolcall-container.thinking-container",
+            ".toolcall-content-text",
+            ".segment-assistant-actions",
         ],
         "thinking_selectors": [
             '[class*="thinking"]',

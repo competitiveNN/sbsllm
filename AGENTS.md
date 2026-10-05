@@ -233,6 +233,18 @@ browser tab on a specific chat website (configured via `model_map`).
   exactly once. The clear runs both paths (real selection +
   Ctrl+A+Delete) so it also works on plain contenteditable editors and
   the mock tests. Kimi's send control is also a div
+- **Kimi thinking trace leaking into the answer**: Kimi renders the
+  thinking chain in a `.markdown-container.toolcall-content-text` inside
+  `.thinking-container`, and the answer in a sibling `.markdown-container`
+  (both hold a `.markdown` div). The old `response_selectors` fell back to
+  `[class*="assistant"] .markdown`, which matched the thinking node first
+  (it has no `.thinking-container` ancestor relative to itself), so the
+  thinking text was relayed as the answer. Fixed: the fallback is now
+  `.markdown-container:not(.toolcall-content-text) .markdown`, which
+  matches the answer's container and skips the thinking one. Verified
+  against the live page across a full streaming poll: the answer and
+  thinking stay separate at every tick, including mid-stream when only
+  the thinking `.markdown` exists yet.
   (`.send-button-container`), not a `<button>`, so `submit_js` now clicks
   it directly. Note: kimi.ai now requires sign-in to send (the send
   handler opens a login modal).

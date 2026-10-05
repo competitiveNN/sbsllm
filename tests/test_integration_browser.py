@@ -1738,6 +1738,76 @@ class TestKimiIntegration:
             finally:
                 browser.close()
 
+    def test_kimi_response_selector_excludes_thinking_markdown(self):
+        """Kimi nests the thinking trace in a
+        .markdown-container.toolcall-content-text inside
+        .thinking-container. A bare '.markdown' fallback matched that
+        node first, so the thinking text was relayed as the answer.
+        The response selector must scope to
+        .markdown-container:not(.toolcall-content-text)."""
+        from sbsllm.sites import SITES
+
+        selectors = SITES["kimi"]["response_selectors"]
+        assert any(
+            ".markdown-container:not(.toolcall-content-text) .markdown" in s
+            for s in selectors
+        )
+        # The bare fallback must not be the one that reaches the
+        # thinking node.
+        assert ".markdown'" not in " ".join(selectors)
+
+    def test_kimi_thinking_does_not_leak_into_answer(self, mock_kimi_server):
+        """A Kimi turn whose thinking trace is already on screen must
+        still be captured as thinking, not relayed as the answer."""
+        with pw.sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+            page = browser.new_page()
+            page.goto(mock_kimi_server, wait_until="networkidle")
+            try:
+                # Seed a thinking block + the answer in the same segment.
+                page.evaluate("""() => {
+                    const seg = document.createElement('div');
+                    seg.className = 'segment segment-assistant';
+                    const box = document.createElement('div');
+                    box.className = 'segment-content-box';
+                    const rollup = document.createElement('div');
+                    rollup.className = 'toolcall-rollup';
+                    const think = document.createElement('div');
+                    think.className = 'toolcall-container thinking-container block-container is-flat-think';
+                    const thinkContent = document.createElement('div');
+                    thinkContent.className = 'toolcall-content';
+                    const thinkMd = document.createElement('div');
+                    thinkMd.className = 'markdown-container toolcall-content-text';
+                    const thinkM = document.createElement('div');
+                    thinkM.className = 'markdown';
+                    thinkM.textContent = 'Thinking complete\\nCompute 17*23.';
+                    thinkMd.appendChild(thinkM);
+                    thinkContent.appendChild(thinkMd);
+                    think.appendChild(thinkContent);
+                    rollup.appendChild(think);
+                    const ansMd = document.createElement('div');
+                    ansMd.className = 'markdown-container';
+                    const ansM = document.createElement('div');
+                    ansM.className = 'markdown';
+                    ansM.textContent = '17 × 23 = 391';
+                    ansMd.appendChild(ansM);
+                    rollup.appendChild(ansMd);
+                    box.appendChild(rollup);
+                    seg.appendChild(box);
+                    document.body.appendChild(seg);
+                }""")
+                result = page.evaluate(extract_js("kimi"))
+                assert result["found"] is True
+                assert "Compute 17*23" in (result.get("thinking") or ""), (
+                    f"thinking not captured: {result.get('thinking')!r}"
+                )
+                assert "Compute 17*23" not in result["content"], (
+                    f"thinking leaked into answer: {result['content']!r}"
+                )
+                assert "17 × 23 = 391" in result["content"]
+            finally:
+                browser.close()
+
     def test_kimi_post_inject_is_idempotent(self, mock_kimi_server):
         """Running the full inject+post_inject cycle repeatedly must not
         accumulate copies of the prompt in the editor. Kimi's composer is
