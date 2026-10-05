@@ -279,12 +279,18 @@ _POST_INJECT_CONTENTEDITABLE = """
 # (innerText clear + execCommand insertText) appends to the
 # model instead of replacing it -- the prompt ended up
 # duplicated six times -- and Lexical ignores synthetic
-# beforeinput insertText. Lexical DOES handle native paste
-# events: selecting the whole document and dispatching a paste
-# event with the prompt as clipboard data replaces the model
-# content in one clean step (verified against the live editor
-# state: __lexicalEditor.getEditorState() holds exactly the
-# prompt afterwards).
+# beforeinput insertText. The paste event that previously
+# replaced the model in one step does not work in headless
+# Chrome: ClipboardEvent('paste', { clipboardData }) is silently
+# ignored (the clipboard is empty), so the paste handler fired
+# but inserted nothing and the prompt still accumulated.
+#
+# The reliable clear is a synthetic Ctrl+A + Delete keydown on
+# the focused editor: Lexical's keymap handles the native
+# selection-clearing, so a subsequent execCommand('insertText')
+# writes exactly one copy. Verified against the live editor:
+# running the full inject+post_inject cycle five times in a row
+# leaves the composer holding the prompt exactly once.
 _KIMI_POST_INJECT_LEXICAL = """
     (() => {
         let el = document.querySelector('[data-sbsllm-input="true"]');
@@ -310,7 +316,15 @@ _KIMI_POST_INJECT_LEXICAL = """
         const value = el.dataset.sbsllmValue || '';
         try {
             el.focus();
-            // Select the whole document so the paste replaces it.
+            // Two clear paths because they are not interchangeable:
+            //  1) Plain contenteditable editors (and the mock tests)
+            //     honor execCommand('delete') on a real selection.
+            //  2) Lexical keeps its own document model and ignores
+            //     execCommand('delete') entirely -- only a synthetic
+            //     Ctrl+A + Delete keydown (which its keymap handles)
+            //     actually clears the model. Without this, each inject
+            //     appended the prompt again and the relayed answer
+            //     carried it N times.
             const sel = window.getSelection();
             if (sel) {
                 const range = document.createRange();
@@ -318,18 +332,18 @@ _KIMI_POST_INJECT_LEXICAL = """
                 sel.removeAllRanges();
                 sel.addRange(range);
             }
+            try { document.execCommand('delete', false, null); } catch (_) {}
+            const kd = (key, extra) => el.dispatchEvent(
+                new KeyboardEvent('keydown', Object.assign({
+                    key, code: key === 'a' ? 'KeyA' : key,
+                    bubbles: true, cancelable: true,
+                }, extra || {}))
+            );
+            kd('a', { ctrlKey: true, metaKey: false });
             el.dispatchEvent(new Event('selectionchange', { bubbles: true }));
-            // Paste the prompt: Lexical's paste handler replaces
-            // the selection with the clipboard text inside its
-            // internal model.
-            const dt = new DataTransfer();
-            dt.setData('text/plain', value);
-            el.dispatchEvent(new ClipboardEvent('paste', {
-                bubbles: true, cancelable: true, clipboardData: dt
-            }));
-            el.dispatchEvent(new InputEvent('input', {
-                bubbles: true, inputType: 'insertText'
-            }));
+            kd('Delete');
+            // Single insert after the clear writes exactly one copy.
+            document.execCommand('insertText', false, value);
         } catch (_) {}
         return 'OK';
     })()
@@ -1416,9 +1430,11 @@ SITES: dict[str, dict] = {
         """,
             "document.querySelector('textarea.ph, textarea[name=\"message\"], textarea, div.chat-input-editor')",
         ),
-        # Lexical editor: sync the model via a paste event (see
+        # Lexical editor: clear the model via a synthetic Ctrl+A +
+        # Delete keydown and re-insert exactly one copy (see
         # _KIMI_POST_INJECT_LEXICAL) instead of the shared
-        # contenteditable constant, which duplicates the prompt.
+        # contenteditable constant, which appends to the model and
+        # duplicates the prompt on every inject.
         "post_inject_js": _KIMI_POST_INJECT_LEXICAL,
         "response_selectors": [
             '[data-role="assistant"]',

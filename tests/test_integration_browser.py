@@ -1738,6 +1738,32 @@ class TestKimiIntegration:
             finally:
                 browser.close()
 
+    def test_kimi_post_inject_is_idempotent(self, mock_kimi_server):
+        """Running the full inject+post_inject cycle repeatedly must not
+        accumulate copies of the prompt in the editor. Kimi's composer is
+        a Lexical editor whose model is not cleared by execCommand('delete'),
+        so without a real Ctrl+A + Delete clear each cycle appended the
+        prompt again and the relayed answer carried it N times."""
+        with pw.sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+            page = browser.new_page()
+            page.goto(mock_kimi_server, wait_until="networkidle")
+            try:
+                prompt = "kimi idempotency check 42"
+                js = inject_prompt("kimi", prompt)
+                for _ in range(5):
+                    assert page.evaluate(js) == "OK"
+                    page.wait_for_timeout(50)
+                text = page.evaluate(
+                    "() => document.querySelector('div.chat-input-editor')"
+                    " ? document.querySelector('div.chat-input-editor').innerText : ''"
+                )
+                assert text.count(prompt) == 1, (
+                    f"prompt accumulated in editor: {text!r}"
+                )
+            finally:
+                browser.close()
+
 
 # --- meta.ai /prompt/<uuid> page tests ---
 

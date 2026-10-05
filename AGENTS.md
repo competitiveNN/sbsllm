@@ -220,12 +220,22 @@ browser tab on a specific chat website (configured via `model_map`).
   (innerText clear + `execCommand('insertText')`) appended to the model
   instead of replacing it (prompt duplicated 6x), and Lexical ignores
   synthetic `beforeinput insertText`. Kimi now has a custom
-  `post_inject_js` (`_KIMI_POST_INJECT_LEXICAL`) that selects the whole
-  document and dispatches a `paste` event with the prompt as clipboard
-  data: Lexical's paste handler replaces the model content in one clean
-  step. Kimi's send control is also a div (`.send-button-container`),
-  not a `<button>`, so `submit_js` now clicks it directly. Note: kimi.ai
-  now requires sign-in to send (the send handler opens a login modal).
+  `post_inject_js` (`_KIMI_POST_INJECT_LEXICAL`) that clears the model
+  with a synthetic Ctrl+A + Delete keydown (Lexical's keymap handles the
+  native selection-clearing; `execCommand('delete')` alone does NOT clear
+  Lexical — it returns true but the model keeps its nodes) and then
+  writes exactly one copy via `execCommand('insertText')`. The earlier
+  paste-event approach was silently ignored by headless Chrome
+  (`ClipboardEvent('paste', { clipboardData })` is a no-op), so the paste
+  handler fired but inserted nothing and the prompt still accumulated.
+  Verified against the live editor: running the full inject+post_inject
+  cycle five times in a row leaves the composer holding the prompt
+  exactly once. The clear runs both paths (real selection +
+  Ctrl+A+Delete) so it also works on plain contenteditable editors and
+  the mock tests. Kimi's send control is also a div
+  (`.send-button-container`), not a `<button>`, so `submit_js` now clicks
+  it directly. Note: kimi.ai now requires sign-in to send (the send
+  handler opens a login modal).
 - **Tencent send control**: the send control is a div
   (`div.hy-chat-input-send-btn`), not a `<button>`, so the shared
   submit template's button candidates never matched and every request

@@ -230,14 +230,18 @@ class TestInjectPrompt:
         submit = SITES["kimi"]["submit_js"]
         assert ".send-button-container" in submit
 
-    def test_kimi_post_inject_syncs_lexical_via_paste(self):
-        """Kimi's post_inject_js replaces the Lexical model via a paste event."""
+    def test_kimi_post_inject_clears_lexical_via_ctrl_a_delete(self):
+        """Kimi's post_inject_js clears the Lexical editor with a
+        synthetic Ctrl+A + Delete keydown before re-inserting the
+        prompt (the paste-event approach was silently ignored by
+        headless Chrome)."""
         from sbsllm.sites import SITES
 
         post_inject = SITES["kimi"]["post_inject_js"]
-        assert "ClipboardEvent" in post_inject
-        assert "selectionchange" in post_inject
-        assert "selectNodeContents" in post_inject
+        assert "KeyA" in post_inject
+        assert "ctrlKey: true" in post_inject
+        assert "Delete" in post_inject
+        assert "execCommand('insertText'" in post_inject
 
     def test_tencent_submit_targets_send_div(self):
         """Tencent's send control is a div (div.hy-chat-input-send-btn)."""
@@ -484,16 +488,18 @@ class TestPostInjectSharedConstant:
             )
             # google must sync data-value on ms-autosize-textarea.
             # zai must be a minimal no-op (no execCommand needed).
-            # kimi must sync its Lexical model via a paste event.
+            # kimi must clear its Lexical model via a synthetic
+            # Ctrl+A + Delete keydown before re-inserting the prompt.
             if site_id == "google":
                 assert "data-value" in post_inject
                 assert "ms-autosize-textarea" in post_inject
             if site_id == "zai":
                 assert "execCommand" not in post_inject
             if site_id == "kimi":
-                assert "ClipboardEvent" in post_inject
-                assert "paste" in post_inject
-                assert "selectionchange" in post_inject
+                assert "KeyA" in post_inject
+                assert "ctrlKey: true" in post_inject
+                assert "execCommand('insertText'" in post_inject
+                assert "ClipboardEvent" not in post_inject
 
     def test_shared_constant_has_no_dead_code(self):
         """The shared constant must not carry unused variables (e.g. isTextLike)."""
