@@ -1756,6 +1756,19 @@ class TestKimiIntegration:
         # thinking node.
         assert ".markdown'" not in " ".join(selectors)
 
+    def test_kimi_thinking_selectors_match_container_not_inner_blocks(self):
+        """Kimi renders the thinking trace as a chain of sibling
+        .toolcall-content-text blocks inside one
+        .thinking-container. Matching each block separately relayed the
+        trace once per step (the screenshot showed the same paragraph
+        repeated). The selectors must lead with the container so its whole
+        subtree is read in one pass."""
+        from sbsllm.sites import SITES
+
+        selectors = SITES["kimi"]["thinking_selectors"]
+        assert selectors[0] == ".toolcall-container.thinking-container"
+        assert ".toolcall-content-text" not in selectors
+
     def test_kimi_thinking_does_not_leak_into_answer(self, mock_kimi_server):
         """A Kimi turn whose thinking trace is already on screen must
         still be captured as thinking, not relayed as the answer."""

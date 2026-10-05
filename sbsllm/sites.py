@@ -1458,6 +1458,13 @@ SITES: dict[str, dict] = {
             ".segment-assistant-actions",
         ],
         "thinking_selectors": [
+            # NOT '.toolcall-content-text': Kimi renders the thinking trace
+            # as a chain of sibling .toolcall-content-text blocks inside
+            # one .thinking-container, and matching each one separately
+            # relayed the trace once per step (the screenshot showed the
+            # same paragraph repeated). Match the container and read its
+            # whole subtree in one pass instead.
+            ".toolcall-container.thinking-container",
             '[class*="thinking"]',
             '[class*="reasoning"]',
             '[data-testid*="thinking"]',

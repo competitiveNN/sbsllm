@@ -245,6 +245,18 @@ browser tab on a specific chat website (configured via `model_map`).
   against the live page across a full streaming poll: the answer and
   thinking stay separate at every tick, including mid-stream when only
   the thinking `.markdown` exists yet.
+- **Kimi thinking trace relayed once per step**: Kimi renders the
+  thinking chain as a sequence of sibling `.toolcall-content-text`
+  blocks inside one `.thinking-container`. The old `thinking_selectors`
+  (`[class*="thinking"]` etc.) matched each block separately, so the trace
+  was forwarded once per step and the local chat showed the same
+  paragraph repeated. Fixed: the selectors now lead with
+  `.toolcall-container.thinking-container`, whose whole subtree is read
+  in one pass. (The container's title span — "Thinking complete" vs
+  "Thinking" — distinguishes multi-step traces, so two sibling containers
+  with different titles are correctly relayed as two parts; only
+  identical siblings are deduplicated by the existing `thinkingParts`
+  check.)
   (`.send-button-container`), not a `<button>`, so `submit_js` now clicks
   it directly. Note: kimi.ai now requires sign-in to send (the send
   handler opens a login modal).
