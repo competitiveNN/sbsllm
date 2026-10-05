@@ -112,12 +112,14 @@ def extract_page():
 
 def _extract(page, html, site_id="zai"):
     page.set_content(f"<html><body>{html}</body></html>")
+    site = SITES[site_id]
     js = _response_js(
-        SITES[site_id]["response_selectors"],
-        SITES[site_id]["thinking_selectors"],
-        SITES[site_id]["loading_selectors"],
-        SITES[site_id].get("login_wall_selectors", []),
-        SITES[site_id].get("response_container"),
+        site["response_selectors"],
+        site["thinking_selectors"],
+        site["loading_selectors"],
+        site.get("login_wall_selectors", []),
+        site.get("response_container"),
+        site.get("response_exclude_selectors", []),
     )
     return page.evaluate(js)
 
@@ -979,3 +981,248 @@ class TestGrokExtraction:
         )
         result = _extract(extract_page, html, site_id="grok")
         assert result["content"] == "Second reply.", result["content"]
+
+
+TENCENT_TURN = """
+<div class="agent-chat__list">
+  <div class="agent-chat__list__item agent-chat__list__item--ai agent-chat__list__item--last">
+    <div class="agent-chat__list__item__content">
+      <div class="agent-chat__list__item__checkbox"><label class="t-checkbox t-is-disabled"><span class="t-checkbox__input"></span></label></div>
+      <div class="agent-chat__bubble agent-chat__bubble--ai">
+        <div class="agent-chat__bubble__content">
+          <div class="agent-chat__conv--ai__speech_show">
+            <div class="hy-collapse">
+              <div class="hy-collapse-header"><span class="hy-collapse-chevron"></span></div>
+              <div class="hy-collapse-body"><div class="hy-collapse-content"><div class="scroll-content">
+                <div class="hy-detail-block hy-think">
+                  <div class="hy-detail-block-header">
+                    <span class="hy-detail-block-header-title">Deep thinking completed (Ran for 1.2s)</span>
+                  </div>
+                  <div class="hy-detail-block-body"><div class="hy-detail-block-content">
+                    <div class="hy-cherry-markdown"><p>First I check the arithmetic, then I answer plainly.</p></div>
+                  </div></div>
+                </div>
+              </div></div>
+            </div>
+            <div class="hyc-content-md">
+              <div class="hyc-common-markdown hyc-common-markdown-style">
+                <p>The answer is 16.</p>
+              </div>
+            </div>
+          </div>
+          <div class="agent-chat__conv--ai__toolbar">
+            <div class="agent-chat__toolbar__item agent-chat__toolbar__copy">Copy</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+"""
+
+TENCENT_PENDING_THINKING = """
+<div class="agent-chat__list">
+  <div class="agent-chat__list__item agent-chat__list__item--ai">
+    <div class="agent-chat__list__item__content">
+      <div class="agent-chat__bubble agent-chat__bubble--ai">
+        <div class="agent-chat__bubble__content">
+          <div class="agent-chat__conv--ai__speech_show">
+            <div class="hy-collapse">
+              <div class="hy-collapse-header"><span class="hy-collapse-chevron"></span></div>
+              <div class="hy-collapse-body" style="display:none">
+                <div class="hy-collapse-content"><div class="scroll-content">
+                  <div class="hy-detail-block hy-think">
+                    <div class="hy-detail-block-header">
+                      <span class="hy-detail-block-header-title">Thinking...</span>
+                    </div>
+                    <div class="hy-detail-block-body"><div class="hy-detail-block-content">
+                      <div class="hy-cherry-markdown"><p>First I check the arithmetic, then I answer.</p></div>
+                    </div></div>
+                  </div>
+                </div></div>
+              </div>
+            </div>
+            <span class="t-loading"></span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+"""
+
+TENCENT_TURN_LOADING = """
+<div class="agent-chat__list">
+  <div class="agent-chat__list__item agent-chat__list__item--ai agent-chat__list__item--last">
+    <div class="agent-chat__list__item__content">
+      <div class="agent-chat__bubble agent-chat__bubble--ai">
+        <div class="agent-chat__bubble__content">
+          <div class="agent-chat__conv--ai__speech_show">
+            <div class="hy-collapse">
+              <div class="hy-collapse-header"><span class="hy-collapse-chevron"></span></div>
+              <div class="hy-collapse-body"><div class="hy-collapse-content"><div class="scroll-content">
+                <div class="hy-detail-block hy-think">
+                  <div class="hy-detail-block-header">
+                    <span class="hy-detail-block-header-title">Thinking...</span>
+                  </div>
+                  <div class="hy-detail-block-body"><div class="hy-detail-block-content">
+                    <div class="hy-cherry-markdown"><p>First I check the arithmetic.</p></div>
+                  </div></div>
+                </div>
+              </div></div>
+            </div>
+            <div class="hyc-content-md">
+              <div class="hyc-common-markdown hyc-common-markdown-style">
+                <p>The answer is </p><span class="hyc-common-markdown__loading"></span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+"""
+
+# The newest-turn item (TENCENT_TURN's item) must be the LAST
+# match inside the list, so an unscoped selector cannot return the
+# older turn's answer. Build it programmatically: strip the list
+# wrapper off TENCENT_TURN and sandwich the older "First reply."
+# turn in front of it.
+_TENCENT_TURN_ITEM = (
+    TENCENT_TURN.strip()
+    .removeprefix('<div class="agent-chat__list">')
+    .removesuffix('</div>')
+    .strip()
+)
+TENCENT_TWO_TURNS = (
+    '<div class="agent-chat__list">'
+    + '\n  <div class="agent-chat__list__item agent-chat__list__item--ai">'
+    + '\n    <div class="agent-chat__list__item__content">'
+    + '\n      <div class="agent-chat__bubble agent-chat__bubble--ai">'
+    + '\n        <div class="agent-chat__bubble__content">'
+    + '\n          <div class="agent-chat__conv--ai__speech_show">'
+    + '\n            <div class="hyc-content-md">'
+    + '\n              <div class="hyc-common-markdown hyc-common-markdown-style">'
+    + '\n                <p>First reply.</p>'
+    + '\n              </div>'
+    + '\n            </div>'
+    + '\n          </div>'
+    + '\n        </div>'
+    + '\n      </div>'
+    + '\n    </div>'
+    + '\n  </div>'
+    + _TENCENT_TURN_ITEM + '\n</div>'
+)
+
+TENCENT_MODEL_DETAILS = """
+<div class="all-chatlist-wrapper">
+  <div class="model-desc-wrapper">
+    <div class="mvfqmiYoVreC1bYK_YyC VqtPtlVR7qtmDEsq01_H">
+      <div class="t0RzcsGrBHWFkFBdssj6"><h3>Model Details</h3></div>
+      <div class="qjrgrCxYd76NfBWeWOem">
+        <p class="nOo3ZxtBTAzyo04FTbsu">Hy4 preview features 770B total parameters
+        with 49B active parameters and is optimized for agentic coding scenarios.</p>
+      </div>
+    </div>
+  </div>
+</div>
+"""
+
+TENCENT_TURN_WITH_MODEL_DETAILS = TENCENT_TURN + TENCENT_MODEL_DETAILS
+
+
+class TestTencentExtraction:
+    def test_answer_and_thinking_are_separated(self, extract_page):
+        """Streaming regression: thinking must not leak into the answer."""
+        result = _extract(extract_page, TENCENT_TURN, "tencent")
+        assert result["found"] is True
+        assert result["content"] == "The answer is 16."
+        assert "Deep thinking completed (Ran for 1.2s)" in (result["thinking"] or "")
+        assert "First I check the arithmetic" in (result["thinking"] or "")
+        # Turn chrome must never be the reply.
+        assert "Copy" not in result["content"]
+        assert "checkbox" not in result["content"]
+
+    def test_reasoning_phase_reports_busy(self, extract_page):
+        """A turn that is still reasoning (no answer yet) reports
+        found=true with empty content, no thinking and busy=true.
+
+        This is what a fresh tencent tab shows for several seconds
+        while the model reasons. The speech-area fallback in
+        response_selectors keeps `found` true so the reasoning-phase
+        spinner counts as a node INSIDE the response and `busy`
+        stays true -- the poller then keeps waiting (neither the
+        idle rule nor the done rule fires while content/thinking
+        are empty) instead of ending the turn early. The
+        response_container scoping is what stops a previous turn's
+        answer from being pulled as this turn's reply here: an
+        unscoped scan would match the older turn's prose.
+        """
+        result = _extract(extract_page, TENCENT_PENDING_THINKING, "tencent")
+        assert result["found"] is True
+        assert result["content"] == ""
+        assert result["thinking"] is None
+        assert result["done"] is False
+        assert result["busy"] is True
+
+    def test_thinking_keeps_busy_during_reasoning(self, extract_page):
+        """The reasoning-phase spinner sits inside the speech area,
+        so busy stays true and the poller keeps waiting instead of
+        ending the turn at the idle threshold. `found` is true and
+        `content` empty during the reasoning phase; a non-blank
+        capture only appears once the answer starts streaming.
+        """
+        result = _extract(extract_page, TENCENT_PENDING_THINKING, "tencent")
+        assert result["busy"] is True
+
+    def test_answer_loading_dot_keeps_busy(self, extract_page):
+        """The cursor dot lives inside .hyc-content-md while the answer
+        streams, so busy stays true until the answer is fully on screen."""
+        result = _extract(extract_page, TENCENT_TURN_LOADING, "tencent")
+        assert result["found"] is True
+        assert result["busy"] is True
+        assert result["done"] is False
+
+    def test_model_details_panel_is_not_thinking(self, extract_page):
+        """The page's obfuscated .mvfqmiYoVreC1bYK panel is a model-spec sidebar
+        (770B parameters), NOT a thinking block. It must never pollute
+        thinking_content, so we never match the hy-think element by accident.
+
+        This is the exact shape the user reported as "thinking block" and it
+        is deliberately NOT in thinking_selectors -- the real trace is
+        .hy-detail-block.hy-think.
+        """
+        result = _extract(extract_page, TENCENT_MODEL_DETAILS, "tencent")
+        assert result["found"] is False
+        assert "770B" not in (result["content"] or "")
+        assert "770B" not in (result["thinking"] or "")
+
+    def test_model_details_mixed_with_a_turn_is_excluded(self, extract_page):
+        """When the model-spec sidebar coexists with a turn, extraction must
+        return that turn's answer + thinking and nothing from the sidebar."""
+        result = _extract(extract_page, TENCENT_TURN_WITH_MODEL_DETAILS, "tencent")
+        assert result["found"] is True
+        assert result["content"] == "The answer is 16."
+        assert "770B" not in result["content"]
+        assert "770B" not in result["thinking"]
+        assert "First I check the arithmetic" in (result["thinking"] or "")
+
+    def test_newest_turn_wins_no_leak(self, extract_page):
+        """A turn container keeps every turn in the DOM, so the last match must
+        be the newest turn's answer (this is exactly the regression the
+        response_container=.agent-chat__list__item--ai fix addresses)."""
+        result = _extract(extract_page, TENCENT_TWO_TURNS, "tencent")
+        assert result["content"] == "The answer is 16.", result["content"]
+        assert "First reply." not in result["content"]
+        assert "First reply." not in (result["thinking"] or "")
+
+    def test_thinking_contains_header_label(self, extract_page):
+        """The disclosure header label (e.g. "Deep thinking completed (Ran
+        for 1.2s)") is part of the relayed trace, not dropped. It is
+        informative rather than chrome."""
+        result = _extract(extract_page, TENCENT_TURN, "tencent")
+        assert "Deep thinking completed" in (result["thinking"] or "")
+
+
+

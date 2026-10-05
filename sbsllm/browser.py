@@ -1038,6 +1038,29 @@ class ResponsePoller:
         return None
 
 
+def _with_last_thinking(current: dict, seen_thinking: str | None) -> dict:
+    """Re-attach the last reasoning trace a site dropped on completion.
+
+    Some chats (Tencent AI Studio) collapse their reasoning disclosure
+    when the answer completes, so the final capture reports no thinking
+    even though a full trace streamed a moment earlier. Keep the last
+    non-empty trace seen while the turn was live so the non-streaming
+    caller still receives it -- the streaming loop already delivered the
+    deltas as they arrived, so this only affects the one-shot path.
+    """
+    if (
+        seen_thinking
+        and current.get("thinking") is None
+        and not current.get("thinking_timeout")
+        and not current.get("no_output")
+        and not current.get("busy_timeout")
+        and not current.get("timed_out")
+    ):
+        current = dict(current)
+        current["thinking"] = seen_thinking
+    return current
+
+
 def wait_for_response(
     page: Page,
     extract_js: str,
@@ -1057,7 +1080,7 @@ def wait_for_response(
     generating is trusted once it stops *and* the text has been
     stable for `done_confirm`; a site that never signals is trusted
     after the text has been unchanged for `idle_timeout`; a stall
-    while the site still reports generating ends after
+    while the page still reports generation ends after
     `busy_patience` (answer) or `thinking_patience` (reasoning-only
     trace); a prompt that produces no output at all ends after
     `first_token_timeout`.
@@ -1086,30 +1109,33 @@ def wait_for_response(
         "done": False,
         "count": 0,
     }
+    seen_thinking = None
     while time.monotonic() <= deadline:
         current = capture_response(page, extract_js)
         stop = poller.observe(current, time.monotonic())
+        if poller.is_new and current.get("thinking"):
+            seen_thinking = current["thinking"]
         if stop == "site_done":
-            return current
+            return _with_last_thinking(current, seen_thinking)
         if stop == "idle":
             current["done"] = True
-            return current
+            return _with_last_thinking(current, seen_thinking)
         if stop == "thinking_timeout":
             current["thinking_timeout"] = True
-            return current
+            return _with_last_thinking(current, seen_thinking)
         if stop == "busy_timeout":
             current["busy_timeout"] = True
-            return current
+            return _with_last_thinking(current, seen_thinking)
         if stop == "no_output":
             current["no_output"] = True
-            return current
+            return _with_last_thinking(current, seen_thinking)
         last = current
         time.sleep(max(float(poll_interval), 0.01))
     _state_logger.debug(
         "response_state: budget_exhausted",
         extra={"timed_out": True, "count": last.get("count")},
     )
-    return {**last, "timed_out": True}
+    return _with_last_thinking({**last, "timed_out": True}, seen_thinking)
 
 
 def _do_inject_and_submit(

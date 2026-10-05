@@ -381,7 +381,13 @@ _RESPONSE_TEMPLATE = """
         };
         const textOf = (element) => {
             if (!element) return '';
-            const text = element.innerText || element.textContent || '';
+            let text = element.innerText;
+            if (text === undefined) {
+                // innerText is unavailable only in exotic environments;
+                // textContent never distinguishes visible from hidden,
+                // so it is used only as a last resort.
+                text = element.textContent || '';
+            }
             return text.replace(/\\u00a0/g, ' ');
         };
         const squash = (text) => (text || '').replace(/\\s+/g, ' ').trim();
@@ -1845,9 +1851,10 @@ SITES: dict[str, dict] = {
     "tencent": {
         "url": "https://aistudio.tencent.ai/",
         "inject": _inject_js("""
-            document.querySelector('textarea')
+            document.querySelector('textarea.t-textarea__inner')
+                || document.querySelector('textarea[placeholder*="Ask me anything"]')
                 || document.querySelector('textarea[placeholder*="Ask"]')
-                || document.querySelector('textarea[placeholder*="Message"]')
+                || document.querySelector('textarea')
                 || document.querySelector('div[contenteditable="true"]')
                 || document.querySelector('[contenteditable]')
         """),
@@ -1855,9 +1862,11 @@ SITES: dict[str, dict] = {
         # Tencent's send control is a div (div.hy-chat-input-send-btn),
         # not a <button>, so the shared submit template's button
         # candidates never matched and every request fell back to a
-        # synthetic Enter key the composer ignores.
+        # synthetic Enter the composer ignores. Clicking the div works
+        # (its Vue @click handler fires on a synthetic .click()).
         "submit_js": _submit_js("""
-            document.querySelector('div.hy-chat-input-send-btn')
+            document.querySelector('div.hy-chat-input-send-btn:not(.hy-chat-input-send-btn--disabled)')
+                || document.querySelector('div.hy-chat-input-send-btn')
                 || document.querySelector('div[class*="hy-chat-input-send"]')
                 || document.querySelector('button[data-testid="send-button"]')
                 || document.querySelector('button[aria-label="Send"]')
@@ -1867,13 +1876,64 @@ SITES: dict[str, dict] = {
                 || document.querySelector('button[type="submit"]')
                 || document.querySelector('textarea')?.closest('form')?.querySelector('button')
         """),
+        # One turn = one div.agent-chat__list__item--ai (it carries
+        # data-chat-record-id-ai). Every turn stays in the DOM, so an
+        # unscoped last-match selector returns the PREVIOUS turn's
+        # answer while the newest one is still thinking. Scoping to
+        # the newest item makes a pending turn report found=false (or,
+        # once the speech area renders, an empty content) until its
+        # own .hyc-content-md appears.
+        "response_container": ".agent-chat__list__item--ai",
         "response_selectors": [
-            '[data-message-author-role="assistant"]',
-            ".assistant-message",
-            '[class*="assistant"]',
-            "article .markdown",
+            # The answer markdown. It does not exist while the model
+            # is still thinking (verified: .hyc-content-md count is 0
+            # for the whole thinking phase), so the selector below it
+            # only matches once the answer starts streaming.
+            ".hyc-content-md",
+            # The turn's speech area exists as soon as the turn
+            # starts (it wraps both the thinking disclosure and the
+            # answer). Matching it as a FALLBACK keeps `found` true
+            # and -- crucially -- makes the thinking-phase loading
+            # spinners (.t-loading inside the disclosure) count as
+            # nodes INSIDE the response, so `busy` stays true while
+            # reasoning. Without it the poller's 3s idle rule could
+            # end the wait mid-thinking. The thinking disclosure and
+            # the action toolbar are pruned from it by
+            # response_exclude_selectors, so its text is the answer
+            # only (empty until the answer renders).
+            ".agent-chat__conv--ai__speech_show",
+            ".agent-chat__bubble--ai .hyc-common-markdown",
+            ".hyc-common-markdown",
         ],
+        "response_exclude_selectors": [
+            # The whole thinking disclosure (collapsible panel that
+            # holds the reasoning trace) and its action toolbar are
+            # turn chrome, not the answer. Exclude selectors prune
+            # unconditionally (unlike thinking selectors, which skip
+            # nodes that wrap an answer host), so the speech-area
+            # fallback cannot leak the reasoning into the answer.
+            ".hy-collapse",
+            ".hy-detail-block",
+            ".agent-chat__conv--ai__toolbar",
+            ".agent-chat__list__item__checkbox",
+            ".agent-chat__bubble__prefix",
+            ".agent-chat__bubble__suffix",
+            ".hyc-content-loading",
+        ],
+        # The reasoning trace lives in div.hy-detail-block.hy-think
+        # (inside the hy-collapse disclosure). Its header title
+        # ("Thinking..." / "Deep thinking completed (Ran for Ns)") is
+        # part of the trace text and is kept. NOTE: the page's
+        # "Model Details" sidebar panel uses OBFUSCATED classes
+        # (div.mvfqmiYoVreC1bYK_YyC ... inside .model-desc-wrapper)
+        # and is NOT a thinking block -- it renders model specs
+        # (770B parameters, API name, ...) and must never be added
+        # to thinking_selectors, or every capture would carry the
+        # model card. It sits outside the turn items anyway, so the
+        # response_container scoping already keeps it out.
         "thinking_selectors": [
+            ".hy-detail-block.hy-think",
+            ".hy-detail-block",
             '[class*="thinking"]',
             '[class*="reasoning"]',
         ],
@@ -1884,6 +1944,20 @@ SITES: dict[str, dict] = {
         ],
         "loading_selectors": [
             *_LOADING_SELECTORS,
+            # Busy signals. Only nodes INSIDE the response (or
+            # aria-busy / buttons) pass the busy filter, so these
+            # matter in two places: .t-loading and the detail-block
+            # loading title sit inside the thinking disclosure (thus
+            # inside the speech-area fallback) for the whole
+            # reasoning phase, and .hyc-common-markdown__loading /
+            # the loading dot sit inside .hyc-content-md while the
+            # answer streams.
+            ".hyc-common-markdown__loading",
+            ".hy-cherry-markdown__loading-dot",
+            ".hyc-content-loading",
+            ".agent-chat__list__content-loading",
+            ".hy-detail-block-header-title--loading",
+            ".t-loading",
         ],
     },
 }

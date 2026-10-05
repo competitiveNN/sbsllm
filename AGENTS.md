@@ -274,7 +274,44 @@ browser tab on a specific chat website (configured via `model_map`).
   (`div.hy-chat-input-send-btn`), not a `<button>`, so the shared
   submit template's button candidates never matched and every request
   fell back to a synthetic Enter the composer ignores. `submit_js` now
-  clicks the div.
+  prefers the enabled div (`:not(.hy-chat-input-send-btn--disabled)`)
+  and otherwise clicks the div.
+- **Tencent AI Studio extraction (nothing streamed back)**: the old
+  selectors (`[data-message-author-role="assistant"]`,
+  `[class*="assistant"]`) match nothing on aistudio.tencent.ai, so
+  every turn returned `found=false` and no answer or reasoning ever
+  reached the local chat. The real DOM: one turn = one
+  `div.agent-chat__list__item--ai`; the answer markdown renders in
+  `.hyc-content-md` (only once the answer starts streaming), wrapped
+  by the turn's speech area `.agent-chat__conv--ai__speech_show`,
+  which also wraps the reasoning disclosure. The extraction now leads
+  with `.hyc-content-md` (answer) and falls back to the speech area,
+  scoped to the newest turn via `response_container`
+  (`.agent-chat__list__item--ai`) so a pending turn reports
+  `found=true` with empty content and `busy=true` (the reasoning
+  spinner `.t-loading` sits inside the speech area) instead of
+  leaking the previous turn's answer. The reasoning trace is
+  `div.hy-detail-block.hy-think` inside the `hy-collapse`
+  disclosure; the speech-area fallback would carry it, so
+  `response_exclude_selectors` prunes `.hy-collapse` /
+  `.hy-detail-block` / the action toolbar / checkbox from the answer
+  clone. The page's obfuscated "Model Details" sidebar
+  (`.mvfqmiYoVreC1bYK_YyC`, 770B parameters) is NOT a thinking
+  block and must never be added to `thinking_selectors` — it sits
+  outside the turn items, so the container scoping already keeps it
+  out. Because the site collapses its reasoning disclosure when the
+  answer completes, the final capture reports no thinking even though
+  the full trace streamed a moment earlier; `_with_last_thinking` in
+  `browser.py` re-attaches the last non-empty trace seen while the
+  turn was live so the non-streaming path still returns it.
+- **Extraction no longer reads hidden text**: the shared
+  `textOf` helper used `innerText || textContent`, so a response
+  element whose visible text was empty (e.g. the speech-area
+  fallback during Tencent's reasoning phase, where every child is
+  inside a collapsed disclosure) fell back to `textContent` and
+  leaked the hidden reasoning trace as the answer. `textOf` now uses
+  `innerText` and only falls back to `textContent` when `innerText`
+  is unavailable (exotic environments), never merely empty.
 - **DeepSeek sign-in page**: the login-wall selectors now also match the
   Cloudflare sign-in page (`#cf-turnstile`).
 - **Google AI Studio welcome page**: logged-out visitors land on the
