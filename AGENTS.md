@@ -257,6 +257,16 @@ browser tab on a specific chat website (configured via `model_map`).
   with different titles are correctly relayed as two parts; only
   identical siblings are deduplicated by the existing `thinkingParts`
   check.)
+- **Kimi previous-turn answer leaking into the next turn**: Kimi keeps
+  every turn in the DOM, so the last answer `.markdown` belongs to the
+  PREVIOUS turn while the current one is still thinking (it has a thinking
+  block but no answer yet) — the previous turn's poem was relayed as this
+  turn's answer, which is why the CIA turn's reply carried the Majin Buu
+  poem. Fixed: Kimi now sets `response_container` to `.chat-content-item`,
+  so the extraction scopes to the newest turn and a pending turn reports
+  `found=false` until its own answer `.markdown` appears. This is the same
+  framework mechanism qwen uses for the "first response leaks into the
+  second" bug.
   (`.send-button-container`), not a `<button>`, so `submit_js` now clicks
   it directly. Note: kimi.ai now requires sign-in to send (the send
   handler opens a login modal).

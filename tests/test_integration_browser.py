@@ -1756,6 +1756,17 @@ class TestKimiIntegration:
         # thinking node.
         assert ".markdown'" not in " ".join(selectors)
 
+    def test_kimi_response_container_scopes_to_newest_turn(self):
+        """Without a response container, the last answer .markdown in the
+        document belongs to the PREVIOUS turn while the current one is
+        still thinking (it has a thinking block but no answer yet), so the
+        previous turn's poem was relayed as this turn's answer. Kimi now
+        scopes to .chat-content-item, so a pending turn reports
+        found=false until its own answer .markdown appears."""
+        from sbsllm.sites import SITES
+
+        assert SITES["kimi"].get("response_container") == ".chat-content-item"
+
     def test_kimi_thinking_selectors_match_container_not_inner_blocks(self):
         """Kimi renders the thinking trace as a chain of sibling
         .toolcall-content-text blocks inside one

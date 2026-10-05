@@ -1436,6 +1436,13 @@ SITES: dict[str, dict] = {
         # contenteditable constant, which appends to the model and
         # duplicates the prompt on every inject.
         "post_inject_js": _KIMI_POST_INJECT_LEXICAL,
+        # Scope the extraction to the newest turn. Without it, the last
+        # answer .markdown in the document belongs to the PREVIOUS turn
+        # while the current one is still thinking (it has a thinking
+        # block but no answer yet), so the previous turn's poem was
+        # relayed as this turn's answer. A pending turn reports
+        # found=false until its own answer .markdown appears.
+        "response_container": ".chat-content-item",
         "response_selectors": [
             '[data-role="assistant"]',
             '[data-message-author-role="assistant"]',
