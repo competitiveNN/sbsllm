@@ -76,7 +76,6 @@ The server runs until interrupted. Stopping it also closes the Chromium pages.
 
 ## Supported Chats
 
-- `chatgpt` — https://chatgpt.com/
 - `claude` — https://claude.ai/
 - `copilot` — https://copilot.com/
 - `deepseek` — https://chat.deepseek.com/
@@ -92,6 +91,10 @@ The server runs until interrupted. Stopping it also closes the Chromium pages.
 - `meta` — https://meta.ai/
 - `huggingface` — https://huggingface.co/chat
 - `tencent` — https://aistudio.tencent.ai/
+
+## Unsupported
+
+- `chatgpt` — the old selectors no longer hit the composer on chatgpt.com; support is pending a DOM update.
 
 ## How It Works
 
