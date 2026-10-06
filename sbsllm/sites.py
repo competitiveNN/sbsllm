@@ -1389,15 +1389,36 @@ SITES: dict[str, dict] = {
                 || document.querySelector('.ProseMirror')?.closest('form')?.querySelector('button')
         """),
         "post_inject_js": _POST_INJECT_CONTENTEDITABLE,
+        # Mistral renders each turn as one
+        # `div.flex.w-full.flex-col.gap-1.break-words` containing two
+        # `data-message-part` subtrees: the reasoning disclosure
+        # (`data-message-part-type="reasoning"`) and the answer
+        # (`data-message-part-type="answer"`). The old selectors
+        # (`[class*="assistant"]`, `[class*="thinking"]`,
+        # `[class*="reasoning"]`) matched the whole message row, so the
+        # disclosure labels ("Thought for 1s"), the step harness, the
+        # timestamp and the reasoning text all leaked into the answer, and
+        # the reasoning was never captured as thinking at all (the local
+        # chat showed the trace glued to the reply). The answer and
+        # reasoning are now read from their `data-message-part-type`
+        # subtrees, scoped to the newest turn container so a pending turn
+        # cannot report the previous turn's reply.
+        "response_container": "div.flex.w-full.flex-col.gap-1.break-words",
         "response_selectors": [
-            '[data-message-author-role="assistant"]',
-            ".assistant-message",
-            '[class*="assistant"]',
-            "article .markdown",
+            '[data-message-part-type="answer"]',
+            '[data-testid="text-message-part"]',
+            ".markdown-container-style",
         ],
         "thinking_selectors": [
-            '[class*="thinking"]',
-            '[class*="reasoning"]',
+            '[data-message-part-type="reasoning"]',
+        ],
+        "response_exclude_selectors": [
+            "button",
+            '[role="button"]',
+            "summary",
+            '[data-testid="harness-steps-summary"]',
+            "svg",
+            ".text-muted",
         ],
         "login_wall_selectors": [
             'button[aria-label*="Sign in" i]',

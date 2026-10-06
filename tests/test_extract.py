@@ -1365,3 +1365,120 @@ class TestCopilotExtraction:
         assert result["content"] == "New reply.", result["content"]
         assert "First reply." not in result["content"]
         assert "First reply." not in (result["thinking"] or "")
+
+
+# --- Mistral (chat.mistral.ai) fixtures ---
+# Mistral renders each turn as one `div.flex.w-full.flex-col.gap-1.break-words`
+# containing two `data-message-part` subtrees: the reasoning disclosure
+# (`data-message-part-type="reasoning"`) and the answer
+# (`data-message-part-type="answer"`). Every turn stays in the DOM, so the
+# extraction is scoped to the newest turn container.
+MISTRAL_MESSAGE = """
+<div dir="auto" class="flex w-full flex-col gap-1 break-words">
+  <div style="opacity: 1; height: auto;">
+    <div data-state="open" class="text-base w-full min-w-0">
+      <button type="button" aria-expanded="true" class="flex w-full items-center justify-start">
+        <span class="text-muted">Thought for 1s</span>
+      </button>
+      <div class="grid-rows-[1fr]">
+        <div class="min-h-0 overflow-hidden">
+          <div data-message-part-type="reasoning" class="markdown-container-style">
+            <p>Simple greeting, respond in English (established).</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div style="opacity: 1; height: auto;">
+    <div data-message-part-type="answer" data-testid="text-message-part">
+      <div class="markdown-container-style">
+        <p>All good, thanks! Ready to help whenever you are — just tell me what you'd like to do.</p>
+      </div>
+    </div>
+  </div>
+</div>
+"""
+
+MISTRAL_THINKING_ONLY = """
+<div dir="auto" class="flex w-full flex-col gap-1 break-words">
+  <div style="opacity: 1; height: auto;">
+    <div data-state="open" class="text-base w-full min-w-0">
+      <button type="button" aria-expanded="true" class="flex w-full items-center justify-start">
+        <span class="text-muted">Thought for 1s</span>
+      </button>
+      <div class="grid-rows-[1fr]">
+        <div class="min-h-0 overflow-hidden">
+          <div data-message-part-type="reasoning" class="markdown-container-style">
+            <p>Still reasoning.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div style="opacity: 1; height: auto;">
+    <div data-message-part-type="answer" data-testid="text-message-part">
+      <div class="markdown-container-style"></div>
+    </div>
+  </div>
+  <button aria-label="Stop">Stop</button>
+</div>
+"""
+
+MISTRAL_TWO_TURNS = """
+<div dir="auto" class="flex w-full flex-col gap-1 break-words">
+  <div data-message-part-type="answer" data-testid="text-message-part">
+    <div class="markdown-container-style"><p>First reply.</p></div>
+  </div>
+</div>
+<div dir="auto" class="flex w-full flex-col gap-1 break-words">
+  <div data-message-part-type="answer" data-testid="text-message-part">
+    <div class="markdown-container-style"><p>New reply.</p></div>
+  </div>
+</div>
+"""
+
+
+class TestMistralExtraction:
+    """Site-specific extraction checks for https://chat.mistral.ai/.
+
+    Mistral marks the reasoning and answer with `data-message-part-type`
+    attributes inside the per-turn container
+    `div.flex.w-full.flex-col.gap-1.break-words`. The old class-based
+    selectors matched the whole message row, so disclosure labels
+    ("Thought for 1s"), the step harness, the timestamp and the reasoning
+    text all leaked into the answer, and the reasoning was never captured
+    as thinking at all.
+    """
+
+    def test_answer_and_reasoning_separated(self, extract_page):
+        """The answer is read from `data-message-part-type="answer"` and the
+        reasoning from `data-message-part-type="reasoning"`; the disclosure
+        label and harness chrome never reach either field."""
+        result = _extract(extract_page, MISTRAL_MESSAGE, "mistral")
+        assert result["found"] is True
+        assert result["content"] == (
+            "All good, thanks! Ready to help whenever you are — just tell me "
+            "what you'd like to do."
+        ), result["content"]
+        assert result["thinking"] == "Simple greeting, respond in English (established)."
+        assert "Thought for 1s" not in (result["thinking"] or "")
+        assert "Thought for 1s" not in result["content"]
+
+    def test_thinking_only_reports_empty_answer_and_busy(self, extract_page):
+        """While the newest turn is still thinking, its answer block exists
+        but is empty: found=true, content="", thinking has the trace, and the
+        visible Stop control keeps busy=true so the poller keeps waiting."""
+        result = _extract(extract_page, MISTRAL_THINKING_ONLY, "mistral")
+        assert result["found"] is True
+        assert result["content"] == "", result["content"]
+        assert "Still reasoning." in (result["thinking"] or "")
+        assert result["busy"] is True
+        assert result["done"] is False
+
+    def test_newest_turn_wins_no_leak(self, extract_page):
+        """response_container scopes to the newest turn, so the previous
+        turn's prose never leaks in."""
+        result = _extract(extract_page, MISTRAL_TWO_TURNS, "mistral")
+        assert result["content"] == "New reply.", result["content"]
+        assert "First reply." not in result["content"]
+        assert "First reply." not in (result["thinking"] or "")
