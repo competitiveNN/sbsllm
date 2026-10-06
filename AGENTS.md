@@ -29,6 +29,8 @@ https://chat.z.ai/
 https://meta.ai/
 # huggingface
 https://huggingface.co/chat
+# copilot
+https://copilot.com/
 # tencent
 https://aistudio.tencent.ai/
 
@@ -314,6 +316,15 @@ browser tab on a specific chat website (configured via `model_map`).
   is unavailable (exotic environments), never merely empty.
 - **DeepSeek sign-in page**: the login-wall selectors now also match the
   Cloudflare sign-in page (`#cf-turnstile`).
+- **Copilot support added** (`sbsllm/sites.py`): a new `copilot` site for
+  https://copilot.com/ ships with a textarea composer, a send-button
+  submit handler, a multi-variant turn-marker cascade (`data-content` /
+  `data-message-author-role` / testid), exclusion of citation, feedback,
+  suggested-action and status-chip chrome, and thinking/answer separation.
+  Because the consumer chat is auth-gated, enable it in `config.yaml` only
+  after signing in; 5 Chromium-backed extraction tests exercise
+  newest-turn selection, chrome pruning, paragraph structure and the
+  thinking-only busy signal.
 - **Google AI Studio welcome page**: logged-out visitors land on the
   `/welcome` marketing page; its CTAs (`a.nav__cta`, `a.hero__cta`)
   only exist there and now mark the pre-login state in

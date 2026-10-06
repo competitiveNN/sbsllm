@@ -1228,3 +1228,150 @@ class TestTencentExtraction:
         informative rather than chrome."""
         result = _extract(extract_page, TENCENT_TURN, "tencent")
         assert "Deep thinking completed" in (result["thinking"] or "")
+
+
+# --- Copilot (copilot.com) fixtures ---
+# Copilot marks each turn with data-message-author-role. Every turn stays in
+# the DOM, so the newest assistant turn must be the last match. The turn
+# header holds a "Thinking"/"Searching the web" status chip plus citation
+# sources and a feedback toolbar — none of that may leak into the answer.
+
+COPIL_TURN = """
+<div class="cib-conversation">
+  <div class="cib-message" data-message-author-role="user">
+    <div class="message-body">Explain 2 + 2 * 4.</div>
+  </div>
+  <div class="cib-message" data-message-author-role="assistant">
+    <div class="cib-message-header">
+      <span class="cib-message-status">Thinking</span>
+      <span class="cib-message-status">Searching the web</span>
+    </div>
+    <div class="cib-suggested-actions">
+      <span class="cib-suggested-action">Follow-up suggestion</span>
+    </div>
+    <div class="cib-choices">
+      <div class="choice-item">Sources</div>
+    </div>
+    <div class="cib-message-content markdown">
+      <p>2 + 2 * 4 = <strong>10</strong>.</p>
+      <p>Here is the reasoning: multiplication comes before addition, so we
+      compute 2 * 4 = 8, then 2 + 8 = 10.</p>
+    </div>
+    <div class="cib-message-actions">
+      <button>Copy</button>
+      <button>Copy code</button>
+      <button data-testid="thumb_up"></button>
+      <button data-testid="thumb_down"></button>
+    </div>
+  </div>
+</div>
+"""
+
+COPIL_THINKING_WITH_SOURCES = """
+<div class="cib-conversation">
+  <div class="cib-message" data-message-author-role="assistant">
+    <div class="cib-message-header">
+      <span class="cib-message-status">Thinking</span>
+      <span class="cib-message-status">Searching the web</span>
+    </div>
+    <div class="cib-thinking">
+      <div class="cib-reasoning">First I consider the order of operations, then I verify the arithmetic.</div>
+    </div>
+    <div class="cib-message-content markdown">
+      <p>2 + 2 * 4 = <strong>10</strong>.</p>
+    </div>
+    <div class="cib-message-actions">
+      <button>Copy</button>
+    </div>
+  </div>
+</div>
+"""
+
+COPIL_PENDING_THINKING = """
+<div class="cib-conversation">
+  <div class="cib-message" data-message-author-role="assistant">
+    <div class="cib-message-header">
+      <span class="cib-message-status">Thinking</span>
+      <span class="cib-message-status">Searching the web</span>
+    </div>
+    <div class="cib-thinking">
+      <div class="cib-reasoning">Computing 2 * 4 = 8...</div>
+    </div>
+    <div class="cib-message-content markdown"></div>
+    <div class="cib-message-actions">
+      <button>Copy</button>
+    </div>
+  </div>
+</div>
+"""
+
+COPIL_STOP_BUTTON_PRESENT = """
+<div class="cib-conversation">
+  <div class="cib-message" data-message-author-role="assistant">
+    <div class="cib-message-header">
+      <span class="cib-message-status">Thinking</span>
+    </div>
+    <div class="cib-message-content markdown">
+      <p>Answer streaming</p>
+    </div>
+    <button aria-label="Stop generating">Stop</button>
+    <button data-testid="thumb_up"></button>
+  </div>
+</div>
+"""
+
+
+class TestCopilotExtraction:
+    """Site-specific extraction checks for https://copilot.com/."""
+
+    def test_answer_and_thinking_are_separated(self, extract_page):
+        """Streaming regression: thinking must not leak into the answer."""
+        result = _extract(extract_page, COPIL_THINKING_WITH_SOURCES, "copilot")
+        assert result["found"] is True
+        # The answer is plain text: the extraction reads the answer block,
+        # the reasoning subtree and turn chrome are pruned before the text is
+        # read.
+        assert result["content"] == "2 + 2 * 4 = 10."
+        assert "First I consider the order of operations" in (result["thinking"] or "")
+        assert "Searching the web" not in result["content"]
+        assert "Copilot" not in result["content"]
+        assert "Copy" not in result["content"]
+        assert "thumb_up" not in result["content"]
+        assert "thumb_down" not in result["content"]
+        assert "source" not in result["content"]
+
+    def test_answer_has_paragraphs(self, extract_page):
+        """Multi-paragraph answers stay on separate lines."""
+        result = _extract(extract_page, COPIL_TURN, "copilot")
+        assert result["found"] is True
+        # blockTextOf walks block boundaries: two <p> elements give two lines.
+        assert "2 + 2 * 4 = 10.\n\nHere is the reasoning" in result["content"]
+        # The status chips, suggested actions, choices/sources and feedback
+        # buttons are turn chrome; they are pruned from the answer clone.
+        assert "Thinking" not in result["content"]
+        assert "Searching the web" not in result["content"]
+        assert "Follow-up suggestion" not in result["content"]
+        assert "Copy" not in result["content"]
+
+    def test_pending_turn_reports_found_without_leak(self, extract_page):
+        """While the newest turn is thinking, the last match is still its
+        own (empty) answer — no old turn's text leaks in."""
+        result = _extract(extract_page, COPIL_PENDING_THINKING, "copilot")
+        assert result["found"] is True
+        assert result["content"] == ""
+        assert "Computing 2 * 4 = 8" in (result["thinking"] or "")
+
+    def test_busy_stays_true_with_stop(self, extract_page):
+        """A stop control inside the turn pins busy=true mid-stream."""
+        result = _extract(extract_page, COPIL_STOP_BUTTON_PRESENT, "copilot")
+        assert result["busy"] is True
+        assert result["content"] == "Answer streaming"
+        assert result["done"] is False
+
+    def test_thinking_label_not_relaid(self, extract_page):
+        """The "Thinking"/"Searching the web" status chips are status
+        indicators, not a reasoning trace; they must not be relayed as
+        thinking_content."""
+        result = _extract(extract_page, COPIL_TURN, "copilot")
+        assert "Thinking" not in (result["thinking"] or "")
+        assert "Searching the web" not in (result["thinking"] or "")

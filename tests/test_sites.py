@@ -35,6 +35,7 @@ class TestListSites:
             "meta",
             "huggingface",
             "tencent",
+            "copilot",
         ]
         for site in expected:
             assert site in sites, f"Missing site: {site}"

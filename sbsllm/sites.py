@@ -1768,6 +1768,92 @@ SITES: dict[str, dict] = {
             '[data-streaming-state="IN_PROGRESS"]',
         ],
     },
+    "copilot": {
+        # https://copilot.com/ — Microsoft Copilot. The modern UI is a React
+        # app whose assistant turns carry a role marker. Research reports
+        # either `data-content="assistant"` or `data-message-author-role`
+        # (same family as chatgpt) on the message container. The marker
+        # cascade is ordered fallbacks: the first marker that matches any
+        # turn drives both `found` (count) and turn selection (last match),
+        # so the newest turn is always used and a thinking-only turn can be
+        # distinguished from the previous turn's prose.
+        "url": "https://copilot.com/",
+        "inject": _inject_js("""
+            document.querySelector('textarea[data-testid="composer-input"]')
+                || document.querySelector('textarea#userInput')
+                || document.querySelector('textarea[placeholder*="Ask anything"]')
+                || document.querySelector('textarea[placeholder*="Type your message"]')
+                || document.querySelector('textarea[placeholder*="Message"]')
+                || document.querySelector('textarea[placeholder*="Ask"]')
+                || document.querySelector('textarea')
+                || document.querySelector('div[contenteditable="true"]')
+                || document.querySelector('[contenteditable]')
+        """),
+        "post_inject_js": _POST_INJECT_CONTENTEDITABLE,
+        "submit_js": _submit_js("""
+            document.querySelector('button[data-testid="send-button"]')
+                || document.querySelector('button[aria-label*="Send"]')
+                || document.querySelector('button[aria-label*="Submit"]')
+                || document.querySelector('button[class*="send"]:not([disabled])')
+                || document.querySelector('button[class*="send"]')
+                || document.querySelector('textarea')?.closest('form')?.querySelector('button:not([disabled])')
+        """),
+        # Turn markers (multiple variants — different Copilot eras/sites use
+        # different role attributes). Turn-level matches are taken LAST, so
+        # they always point at the newest turn and can never return an older
+        # prose block as this turn's answer. Prose fallbacks are deliberately
+        # last: they only run if the turn markers matched nothing on the page,
+        # in which case extraction will report found=false until a turn marker
+        # selector is added for the current DOM.
+        "response_selectors": [
+            '[data-content="assistant"]',
+            '[data-message-author-role="assistant"]',
+            '[data-testid="response-message"]',
+            '[data-role="assistant"]',
+            '[class*="assistant-message"]',
+            # prose-level fallbacks
+            ".bot-turn",
+            ".ac-textBlock",
+            '[class*="assistant"] .markdown',
+            "article .markdown",
+        ],
+        # Copilot's "Thinking" / "Searching the web" status chips, citation
+        # sources, feedback buttons and suggested follow-ups render inside the
+        # turn; they are chrome, not the answer. Pruned from the response
+        # clone before the text is read.
+        "response_exclude_selectors": [
+            "button, [role='button']",
+            "[class*='citation'], [class*='source']",
+            "[class*='toolbar'], [class*='action-bar']",
+            "[class*='feedback'], [class*='thumb']",
+            "[class*='follow-up'], [class*='suggested']",
+            "[class*='choices']",
+            "[class*='message-header'], [class*='message-status']",
+        ],
+        "thinking_selectors": [
+            '[class*="thinking"]',
+            '[class*="reasoning"]',
+            '[class*="searching"]',
+        ],
+        "login_wall_selectors": [
+            'button[aria-label*="Sign in" i]',
+            'button[aria-label*="Log in" i]',
+            'a[href*="login" i]',
+            'a[href*="signin" i]',
+            '[class*="signin"]',
+            '[class*="login-modal"]',
+        ],
+        "loading_selectors": [
+            *_LOADING_SELECTORS,
+            # Copilot flags the turn while it is generating and shows a
+            # "Stop" control (already in _LOADING_SELECTORS). The
+            # generating/status bar is an extra busy signal that sits
+            # inside the response, so it passes the inside-response test.
+            '[class*="generating"]',
+            '[class*="in-progress"]',
+            '[data-state="generating"]',
+        ],
+    },
     "huggingface": {
         "url": "https://huggingface.co/chat",
         "inject": _inject_js("""

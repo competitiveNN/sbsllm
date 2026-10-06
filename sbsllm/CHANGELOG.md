@@ -178,6 +178,15 @@
 - **README kimi URL corrected** (`README.md`): was `https://www.kimi.com/`,
   now `https://kimi.ai/` to match `sites.py`.
 
+- **Microsoft Copilot support** (`sbsllm/sites.py` + tests): a new `copilot`
+  site (https://copilot.com/) was added — textarea composer, send-button
+  submit, turn-marker response selection (`data-content` /
+  `data-message-author-role` fallback cascade), exclusion of citation /
+  feedback / suggested-action chrome, thinking/answer separation, and
+  `TestCopilotExtraction` (5 Chromium-backed extraction tests). Note: the
+  consumer chat is auth-gated, so the site is enabled in `config.yaml`
+  after signing in.
+
 - **Per-tab locks** (`_ModelLockRegistry`): different chats run in parallel,
   same chat serializes.
 - **New knobs**: `first_token_timeout=60s`, `busy_patience=20s`,
