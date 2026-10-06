@@ -78,6 +78,7 @@ The server runs until interrupted. Stopping it also closes the Chromium pages.
 
 - `chatgpt` — https://chatgpt.com/
 - `claude` — https://claude.ai/
+- `copilot` — https://copilot.com/
 - `deepseek` — https://chat.deepseek.com/
 - `qwen` — https://chat.qwen.ai/
 - `grok` — https://grok.com/
