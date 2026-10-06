@@ -1530,16 +1530,33 @@ SITES: dict[str, dict] = {
                 || document.querySelector('button[aria-label*="Send"]')
                 || document.querySelector('textarea')?.closest('form')?.querySelector('button')
         """),
-        "post_inject_js": _POST_INJECT_CONTENTEDITABLE,
+        "post_inject_js": _POST_INJECT_COMPOSITE_EDITOR,
+        # Perplexity renders the answer in a `div.prose ... [data-renderer="lm"]`
+        # block and the research/reasoning step as a collapsible
+        # `div.group/step-header` ("Researched" + duration). The old selectors
+        # (`[data-message-author-role="assistant"]`, `[class*="assistant"]`,
+        # `article .markdown`) matched nothing on the current DOM, so every
+        # turn returned found=false and no answer or reasoning ever reached
+        # the local chat. The answer is now read from the prose block, the
+        # reasoning from the step header, and the extraction is scoped to
+        # the newest workflow container so a pending turn cannot report the
+        # previous turn's reply.
+        "response_container": '[data-workflow-items="populated"]',
         "response_selectors": [
-            '[data-message-author-role="assistant"]',
-            ".assistant-message",
-            '[class*="assistant"]',
-            "article .markdown",
+            'div[data-renderer="lm"]',
+            ".prose[data-renderer=\"lm\"]",
+            ".prose",
         ],
         "thinking_selectors": [
-            '[class*="thinking"]',
-            '[class*="reasoning"]',
+            '[class*="step-header"]',
+            '[class*="research"]',
+        ],
+        "response_exclude_selectors": [
+            "button",
+            '[role="button"]',
+            "svg",
+            ".citation",
+            '[class*="citation"]',
         ],
         "login_wall_selectors": [
             'button[aria-label*="Log in" i]',

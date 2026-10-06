@@ -292,7 +292,6 @@ class TestInjectPrompt:
             "deepseek",
             "grok",
             "mistral",
-            "perplexity",
             "poe",
             "cohere",
             "meta",
@@ -439,12 +438,15 @@ class TestPostInjectSharedConstant:
     _POST_INJECT_CONTENTEDITABLE constant rather than duplicated custom blocks."""
 
     def test_all_non_custom_sites_use_shared_constant(self):
-        """Every site except google, zai, kimi and copilot must reference
-        the shared _POST_INJECT_CONTENTEDITABLE constant, preventing
-        re-introduction of duplicated contenteditable-sync IIFEs."""
+        """Every site except google, zai, kimi, copilot and perplexity must
+        reference the shared _POST_INJECT_CONTENTEDITABLE constant,
+        preventing re-introduction of duplicated contenteditable-sync
+        IIFEs. (perplexity's composer is a Tiptap/ProseMirror contenteditable
+        with its own document model, so it uses the shared composite-editor
+        clear instead of the plain contenteditable path.)"""
         from sbsllm.sites import _POST_INJECT_CONTENTEDITABLE, SITES
 
-        custom_sites = {"google", "zai", "kimi", "copilot"}
+        custom_sites = {"google", "zai", "kimi", "copilot", "perplexity"}
         for site_id, cfg in SITES.items():
             if site_id in custom_sites:
                 continue
@@ -455,10 +457,11 @@ class TestPostInjectSharedConstant:
                 f"got a custom block instead"
             )
 
-    def test_custom_post_inject_sites_exactly_google_zai_kimi_copilot(self):
-        """Only google, zai, kimi and copilot should have custom
+    def test_custom_post_inject_sites_exactly_google_zai_kimi_copilot_perplexity(self):
+        """Only google, zai, kimi, copilot and perplexity should have custom
         post_inject_js blocks (google: ms-autosize-textarea sync; zai: no-op;
-        kimi + copilot: shared composite-editor Lexical clear)."""
+        kimi + copilot: shared composite-editor Lexical clear; perplexity:
+        shared composite-editor Tiptap/ProseMirror clear)."""
         from sbsllm.sites import _POST_INJECT_CONTENTEDITABLE, SITES
 
         custom_sites = {
@@ -466,37 +469,52 @@ class TestPostInjectSharedConstant:
             for sid, cfg in SITES.items()
             if cfg.get("post_inject_js") != _POST_INJECT_CONTENTEDITABLE
         }
-        assert custom_sites == {"google", "zai", "kimi", "copilot"}, (
-            f"Expected custom sites {{google, zai, kimi, copilot}}, got {custom_sites}"
+        assert custom_sites == {
+            "google",
+            "zai",
+            "kimi",
+            "copilot",
+            "perplexity",
+        }, (
+            f"Expected custom sites {{google, zai, kimi, copilot, perplexity}}, "
+            f"got {custom_sites}"
         )
 
     def test_no_site_duplicated_contenteditable_logic(self):
         """No site should have a custom post_inject_js that duplicates the
         shared constant's execCommand/innerText/beforeinput pattern — only
-        google (ms-autosize-textarea), zai (no-op), kimi and copilot (shared
-        composite-editor Lexical clear) are allowed custom blocks."""
+        google (ms-autosize-textarea), zai (no-op), kimi, copilot and
+        perplexity (shared composite-editor clear) are allowed custom
+        blocks."""
         from sbsllm.sites import _POST_INJECT_CONTENTEDITABLE, SITES
 
         for site_id, cfg in SITES.items():
             post_inject = cfg.get("post_inject_js", "")
             if post_inject == _POST_INJECT_CONTENTEDITABLE:
                 continue
-            # Custom blocks are allowed only for google, zai, kimi and copilot.
-            assert site_id in {"google", "zai", "kimi", "copilot"}, (
+            # Custom blocks are allowed only for google, zai, kimi, copilot
+            # and perplexity.
+            assert site_id in {
+                "google",
+                "zai",
+                "kimi",
+                "copilot",
+                "perplexity",
+            }, (
                 f"{site_id} has a custom post_inject_js that should use "
                 f"the shared constant"
             )
             # google must sync data-value on ms-autosize-textarea.
             # zai must be a minimal no-op (no execCommand needed).
-            # kimi + copilot use the shared composite-editor handler: clear the
-            # Lexical document model via a synthetic Ctrl+A + Delete keydown
-            # before re-inserting the prompt.
+            # kimi, copilot and perplexity use the shared composite-editor
+            # handler: clear the editor's document model via a synthetic
+            # Ctrl+A + Delete keydown before re-inserting the prompt.
             if site_id == "google":
                 assert "data-value" in post_inject
                 assert "ms-autosize-textarea" in post_inject
             if site_id == "zai":
                 assert "execCommand" not in post_inject
-            if site_id in ("kimi", "copilot"):
+            if site_id in ("kimi", "copilot", "perplexity"):
                 assert "KeyA" in post_inject
                 assert "ctrlKey: true" in post_inject
                 assert "execCommand('insertText'" in post_inject

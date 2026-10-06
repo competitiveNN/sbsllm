@@ -1482,3 +1482,120 @@ class TestMistralExtraction:
         assert result["content"] == "New reply.", result["content"]
         assert "First reply." not in result["content"]
         assert "First reply." not in (result["thinking"] or "")
+# --- Perplexity (perplexity.ai) fixtures ---
+# Perplexity renders each turn as one
+# `div.flex.flex-col.flex-1.min-w-0.gap-4[data-workflow-items="populated"]`
+# containing a research/reasoning step header (`div.group/step-header`,
+# "Researched" + duration) and the answer prose
+# (`div.prose ... [data-renderer="lm"]`). Every turn stays in the DOM, so the
+# extraction is scoped to the newest workflow container.
+PERPLEXITY_MESSAGE = """
+<div class="flex flex-col flex-1 min-w-0 gap-4" data-workflow-items="populated">
+  <div class="contents">
+    <div class="group/step-header relative z-10 flex flex-wrap items-center gap-2">
+      <button aria-expanded="false" type="button" class="w-full cursor-pointer">
+        <div class="flex min-w-0 items-center gap-1">
+          <div class="min-w-0 truncate" title="Researched">Researched</div>
+          <div class="shrink-0"><span class="tabular-nums">8s</span></div>
+        </div>
+      </button>
+    </div>
+  </div>
+  <div class="contents">
+    <div class="break-words min-w-0 flex-1">
+      <div class="prose dark:prose-invert inline leading-relaxed break-words min-w-0" data-renderer="lm">
+        <p>Hello! You're really leaning into the six-hello greeting.</p>
+        <h2>What repeating "hello" usually means</h2>
+        <ul>
+          <li>Extra enthusiasm or friendliness</li>
+          <li>Attention-getting or emphasis</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>
+"""
+
+PERPLEXITY_THINKING_ONLY = """
+<div class="flex flex-col flex-1 min-w-0 gap-4" data-workflow-items="populated">
+  <div class="contents">
+    <div class="group/step-header relative z-10 flex flex-wrap items-center gap-2">
+      <button aria-expanded="true" type="button" class="w-full cursor-pointer">
+        <div class="flex min-w-0 items-center gap-1">
+          <div class="min-w-0 truncate" title="Researched">Researched</div>
+          <div class="shrink-0"><span class="tabular-nums">8s</span></div>
+        </div>
+      </button>
+    </div>
+  </div>
+  <div class="contents">
+    <div class="break-words min-w-0 flex-1">
+      <div class="prose dark:prose-invert inline leading-relaxed break-words min-w-0" data-renderer="lm"></div>
+    </div>
+  </div>
+  <button aria-label="Stop">Stop</button>
+</div>
+"""
+
+PERPLEXITY_TWO_TURNS = """
+<div class="flex flex-col flex-1 min-w-0 gap-4" data-workflow-items="populated">
+  <div class="contents">
+    <div class="break-words min-w-0 flex-1">
+      <div class="prose dark:prose-invert inline leading-relaxed break-words min-w-0" data-renderer="lm">
+        <p>First reply.</p>
+      </div>
+    </div>
+  </div>
+</div>
+<div class="flex flex-col flex-1 min-w-0 gap-4" data-workflow-items="populated">
+  <div class="contents">
+    <div class="break-words min-w-0 flex-1">
+      <div class="prose dark:prose-invert inline leading-relaxed break-words min-w-0" data-renderer="lm">
+        <p>New reply.</p>
+      </div>
+    </div>
+  </div>
+</div>
+"""
+
+
+class TestPerplexityExtraction:
+    """Site-specific extraction checks for https://www.perplexity.ai/.
+
+    Perplexity marks the answer prose with `data-renderer="lm"` inside the
+    per-turn workflow container
+    `div.flex.flex-col.flex-1.min-w-0.gap-4[data-workflow-items="populated"]`,
+    and the research/reasoning step as a `div.group/step-header`. The old
+    class-based selectors matched nothing on the current DOM, so every turn
+    returned found=false and no answer or reasoning ever reached the local
+    chat.
+    """
+
+    def test_answer_and_reasoning_separated(self, extract_page):
+        """The answer is read from the prose block and the reasoning from the
+        step header; the "Researched" label and duration never reach either
+        field."""
+        result = _extract(extract_page, PERPLEXITY_MESSAGE, "perplexity")
+        assert result["found"] is True
+        assert "You're really leaning into the six-hello greeting" in result["content"]
+        assert "What repeating" in result["content"]
+        assert "Researched" not in (result["thinking"] or "")
+        assert "Researched" not in result["content"]
+
+    def test_thinking_only_reports_empty_answer_and_busy(self, extract_page):
+        """While the newest turn is still researching, its prose block exists
+        but is empty: found=true, content="", thinking has the trace, and the
+        visible Stop control keeps busy=true so the poller keeps waiting."""
+        result = _extract(extract_page, PERPLEXITY_THINKING_ONLY, "perplexity")
+        assert result["found"] is True
+        assert result["content"] == "", result["content"]
+        assert result["busy"] is True
+        assert result["done"] is False
+
+    def test_newest_turn_wins_no_leak(self, extract_page):
+        """response_container scopes to the newest turn, so the previous
+        turn's prose never leaks in."""
+        result = _extract(extract_page, PERPLEXITY_TWO_TURNS, "perplexity")
+        assert result["content"] == "New reply.", result["content"]
+        assert "First reply." not in result["content"]
+        assert "First reply." not in (result["thinking"] or "")
