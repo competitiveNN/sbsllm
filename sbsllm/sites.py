@@ -615,6 +615,7 @@ _RESPONSE_TEMPLATE = """
         // only hold the collapsed label. Scoped to the response
         // container when the site has one, so the previous turns'
         // traces do not accumulate into this turn's capture.
+        const thinkingNodes = [];
         const thinkingParts = [];
         for (const node of matches(thinkingSelectors, responseRoot)) {
             if (!isVisible(node)) continue;
@@ -626,6 +627,7 @@ _RESPONSE_TEMPLATE = """
             }
             const text = normalize(blockTextOf(clone));
             if (isLabelOnly(text) || thinkingParts.indexOf(text) !== -1) continue;
+            thinkingNodes.push(node);
             thinkingParts.push(text);
         }
         const thinkingText = thinkingParts.join('\\n\\n').trim();
@@ -633,63 +635,66 @@ _RESPONSE_TEMPLATE = """
         // Answer: prune the reasoning subtree from a copy of the response
         // instead of string-replacing its text. z.ai nests the disclosure
         // inside the same container as the answer, so replacing text there
-        // either left the label behind or ate the answer.
+        // either left the label behind or ate the answer. The clone is also
+        // returned as `content_html` so a markdown converter (markdownify)
+        // can relay formatting (headers, bold, lists, code, links) instead
+        // of plain text.
         let content = textOf(response);
-        if (response && (thinkingSelectors.length || responseExcludeSelectors.length)) {
-            // A broad thinking selector can match a node that also wraps the
-            // answer. z.ai keeps the answer in a .markdown-prose block, so
-            // treat any candidate containing one as an answer host and leave
-            // it alone rather than deleting the answer with the reasoning.
-            const wrapsAnswer = (node) => {
-                try {
-                    return node.matches(ANSWER_HOST) ||
-                        node.querySelector(ANSWER_HOST) !== null;
-                } catch (_) {
-                    return false;
-                }
-            };
+        let content_html = null;
+        if (response) {
             const clone = response.cloneNode(true);
             let pruned = false;
-            for (const selector of thinkingSelectors) {
-                let nodes;
-                try {
-                    nodes = Array.from(clone.querySelectorAll(selector));
-                } catch (_) {
-                    continue;
-                }
-                for (const node of nodes) {
-                    if (!node.parentNode || wrapsAnswer(node)) continue;
-                    node.parentNode.removeChild(node);
-                    pruned = true;
-                }
-            }
-            // Turn chrome renders inside the same container as the
-            // answer on some sites (Google AI Studio's action icons,
-            // model/timestamp header and feedback buttons), so a
-            // whole-container text read forwards it as part of the
-            // reply. Chrome is never the answer itself, so unlike the
-            // reasoning prune there is no wrapsAnswer guard here.
-            for (const selector of responseExcludeSelectors) {
-                let excluded;
-                try {
-                    excluded = Array.from(clone.querySelectorAll(selector));
-                } catch (_) {
-                    continue;
-                }
-                for (const node of excluded) {
-                    if (node.parentNode) {
+            if (thinkingSelectors.length || responseExcludeSelectors.length) {
+                // A broad thinking selector can match a node that also wraps
+                // the answer. z.ai keeps the answer in a .markdown-prose
+                // block, so treat any candidate containing one as an answer
+                // host and leave it alone rather than deleting the answer
+                // with the reasoning.
+                const wrapsAnswer = (node) => {
+                    try {
+                        return node.matches(ANSWER_HOST) ||
+                            node.querySelector(ANSWER_HOST) !== null;
+                    } catch (_) {
+                        return false;
+                    }
+                };
+                for (const selector of thinkingSelectors) {
+                    let nodes;
+                    try {
+                        nodes = Array.from(clone.querySelectorAll(selector));
+                    } catch (_) {
+                        continue;
+                    }
+                    for (const node of nodes) {
+                        if (!node.parentNode || wrapsAnswer(node)) continue;
                         node.parentNode.removeChild(node);
                         pruned = true;
                     }
                 }
+                for (const selector of responseExcludeSelectors) {
+                    let excluded;
+                    try {
+                        excluded = Array.from(clone.querySelectorAll(selector));
+                    } catch (_) {
+                        continue;
+                    }
+                    for (const node of excluded) {
+                        if (node.parentNode) {
+                            node.parentNode.removeChild(node);
+                            pruned = true;
+                        }
+                    }
+                }
+                if (pruned) {
+                    // Use the pruned text even when empty. During the
+                    // thinking phase the answer is legitimately empty, and
+                    // falling back to the unpruned text there re-injected the
+                    // reasoning into the answer, so the local chat rendered
+                    // the thinking twice.
+                    content = blockTextOf(clone);
+                }
             }
-            if (pruned) {
-                // Use the pruned text even when empty. During the thinking
-                // phase the answer is legitimately empty, and falling back to
-                // the unpruned text there re-injected the reasoning into the
-                // answer, so the local chat rendered the thinking twice.
-                content = blockTextOf(clone);
-            }
+            content_html = clone.outerHTML;
         }
         // Safety net for sites that render the disclosure label outside any
         // element matched by thinking_selectors.
@@ -767,6 +772,12 @@ _RESPONSE_TEMPLATE = """
         if (!loginWall && loginWallSelectors.length) {
             loginWall = matches(loginWallSelectors).some(isVisible);
         }
+        // Thinking HTML: the same nodes used for the reasoning trace, so the
+        // pruned HTML mirrors what was relayed as thinking.
+        const thinking_html = thinkingNodes
+            .map((node) => node.outerHTML)
+            .join('\\n');
+
         return {
             found: response !== null,
             content: content,
@@ -784,6 +795,8 @@ _RESPONSE_TEMPLATE = """
             // that a logged-out home page (where `found` is legitimately
             // false) does not trigger a false positive.
             login_wall: loginWall,
+            content_html: content_html,
+            thinking_html: thinking_html,
         };
     })()
     """

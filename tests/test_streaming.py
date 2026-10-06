@@ -100,7 +100,7 @@ def _stream(handler, polls, browser_timeout=30.0, loop_cap=20000):
     clock = FakeClock()
     calls = {"n": 0}
 
-    def capture(page, js):
+    def capture(page, js, *args, **kwargs):
         calls["n"] += 1
         assert calls["n"] < loop_cap, "streaming loop never terminated"
         return dict(polls[min(calls["n"] - 1, len(polls) - 1)])
@@ -159,7 +159,7 @@ class TestStreamTerminates:
     def test_finish_reason_is_length_only_on_real_timeout(self):
         # Content keeps growing, so the idle window never opens and only the
         # hard browser_timeout can end the stream.
-        def capture(page, js):
+        def capture(page, js, *args, **kwargs):
             capture.n += 1
             return _result("x" * capture.n)
 
@@ -530,12 +530,12 @@ class TestStreamEndsOverRealHTTP:
         )
         polls = list(STABLE_ANSWER)
 
-        def capture(page, js):
+        def capture(page, js, *args, **kwargs):
             return dict(polls[min(capture.n, len(polls) - 1)])
 
         capture.n = 0
 
-        def counting_capture(page, js):
+        def counting_capture(page, js, *args, **kwargs):
             capture.n += 1
             return capture(page, js)
 
@@ -721,7 +721,7 @@ class TestNoSilentHang:
         with (
             patch(
                 "sbsllm.server.capture_response",
-                side_effect=lambda p, j: dict(polls[0]),
+                side_effect=lambda p, j, *a, **k: dict(polls[0]),
             ),
             patch("sbsllm.server.extract_js", return_value="EXTRACT"),
             patch("sbsllm.server.time") as fake_time,
@@ -752,7 +752,7 @@ class TestNoSilentHang:
     def test_budget_exhaustion_always_terminates(self):
         """Even content that keeps changing must stop at the budget."""
 
-        def capture(page, js):
+        def capture(page, js, *args, **kwargs):
             capture.n += 1
             return _generating("x" * capture.n)
 
@@ -846,7 +846,7 @@ class TestBothPollingPathsAgree:
             setattr(handler.server, name, value)
         captured = []
 
-        def capture(page, js):
+        def capture(page, js, *args, **kwargs):
             captured.append(1)
             return dict(polls[min(len(captured) - 1, len(polls) - 1)])
 
@@ -861,7 +861,7 @@ class TestBothPollingPathsAgree:
             fake_time.time.return_value = 1_700_000_000
             handler._send_sse = lambda data: None
             result = handler._stream_web_chat(
-                MagicMock(), "EXTRACT", None, "cid", 123, "gpt-4", 60.0
+                MagicMock(), "EXTRACT", None, "cid", 123, "gpt-4", "zai", 60.0
             )
         return result.get("stop_reason")
 
@@ -870,7 +870,7 @@ class TestBothPollingPathsAgree:
         clock = FakeClock()
         it = iter(polls)
 
-        def capture(page, js):
+        def capture(page, js, *args, **kwargs):
             try:
                 return dict(next(it))
             except StopIteration:

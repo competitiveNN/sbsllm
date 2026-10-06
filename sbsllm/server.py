@@ -39,6 +39,57 @@ from .sites import SITES, get_site
 
 # Logger for structured JSON state transition events in streaming.
 _stream_logger = logging.getLogger(__name__ + ".stream_state")
+# Module logger for server-wide diagnostics (markdownify conversion failures, etc.).
+logger = logging.getLogger(__name__)
+
+# HTML-to-markdown converter for relaying formatted answers. markdownify is a
+# dependency (pinned in pyproject.toml) that turns a pruned answer subtree
+# into clean Markdown (headers, bold/italic, lists, code fences, links,
+# tables) — the OpenAI-compatible client renders it, so formatting survives
+# the relay across all supported chats.
+_MARKDOWNIFY = None
+
+
+def _html_to_markdown(html: str) -> str:
+    """Convert a pruned answer/thinking HTML subtree to Markdown."""
+    global _MARKDOWNIFY
+    if _MARKDOWNIFY is None:
+        from markdownify import markdownify as _md
+        _MARKDOWNIFY = _md
+    try:
+        return _MARKDOWNIFY(html, heading_style="ATX", strip=["meta"]).strip()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("markdownify conversion failed: %s", exc)
+        return ""
+
+
+def _convert_response(site_id: str, response: dict) -> dict:
+    """Apply text_format to a capture result (default: markdown for sites
+    that produce pruned answer HTML). Sites may set "text_format": "plain"
+    to opt out of formatting preservation."""
+    content_html = response.get("content_html")
+    thinking_html = response.get("thinking_html")
+    if not content_html and not thinking_html:
+        return response
+    site = get_site(site_id)
+    if site.get("text_format") == "plain":
+        return response
+    # Markdown by default for sites that produce pruned answer HTML;
+    # otherwise keep the plain-text extraction path.
+    use_markdown = "response_selectors" in site
+    if not use_markdown:
+        return response
+    new = dict(response)
+    if content_html:
+        md = _html_to_markdown(content_html)
+        if md:
+            new["content"] = md
+    if thinking_html:
+        md_thinking = _html_to_markdown(thinking_html)
+        if md_thinking:
+            new["thinking"] = md_thinking
+    return new
+
 
 # Default server settings
 DEFAULT_HOST = "127.0.0.1"
@@ -810,6 +861,7 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         completion_id: str,
         created: int,
         model: str,
+        site_id: str,
         browser_timeout: float,
     ) -> dict:
         """Poll a web chat and stream its thinking + answer as they appear.
@@ -891,7 +943,9 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             if now > deadline:
                 return finish("budget_exhausted", done=bool(response.get("done")))
             try:
-                response = capture_response(page, extraction)
+                response = capture_response(
+                    page, extraction, convert=lambda r: _convert_response(site_id, r)
+                )
             except (BrowserError, BrowserOperationTimeout) as e:
                 # A wedged browser thread surfaces here; end the stream
                 # instead of holding the browser lock until the deadline.
@@ -1010,7 +1064,9 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                         "stream": True,
                     },
                 )
-                attach = capture_response(page, extraction)
+                attach = capture_response(
+                    page, extraction, convert=lambda r: _convert_response(site_id, r)
+                )
                 status = {
                     "tab": tab_index,
                     "inject": "OK (duplicate suppressed)",
@@ -1059,7 +1115,9 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                     return
                 baseline = attach
             else:
-                baseline = capture_response(page, extraction)
+                baseline = capture_response(
+                    page, extraction, convert=lambda r: _convert_response(site_id, r)
+                )
                 status, page = self._inject_and_submit_with_recovery(
                     page, model, site_id, prompt, tab_index
                 )
@@ -1187,6 +1245,7 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                 completion_id,
                 created,
                 model,
+                site_id,
                 browser_timeout,
             )
             content = response.get("content") or ""
@@ -1634,7 +1693,9 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                     "submit": "OK (duplicate suppressed)",
                 }
                 if extraction:
-                    attach = capture_response(page, extraction)
+                    attach = capture_response(
+                        page, extraction, convert=lambda r: _convert_response(site_id, r)
+                    )
                     if not attach.get("busy") and (attach.get("content") or "").strip():
                         response_result = attach
                     else:
@@ -1661,9 +1722,16 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                                 "first_token_timeout", DEFAULT_FIRST_TOKEN_TIMEOUT
                             ),
                             baseline=attach,
+                            convert=lambda r: _convert_response(site_id, r),
                         )
             else:
-                baseline = capture_response(page, extraction) if extraction else None
+                baseline = (
+                    capture_response(
+                        page, extraction, convert=lambda r: _convert_response(site_id, r)
+                    )
+                    if extraction
+                    else None
+                )
                 status, page = self._inject_and_submit_with_recovery(
                     page, model, site_id, prompt, tab_index
                 )
@@ -1699,6 +1767,7 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                             "first_token_timeout", DEFAULT_FIRST_TOKEN_TIMEOUT
                         ),
                         baseline=baseline,
+                        convert=lambda r: _convert_response(site_id, r),
                     )
         except BrowserError as e:
             elapsed = time.monotonic() - request_start
@@ -2361,7 +2430,9 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                 # An identical prompt was just submitted on this tab
                 # (a client retry train): attach to the turn already
                 # on screen instead of re-injecting.
-                attach = capture_response(page, extraction)
+                attach = capture_response(
+                    page, extraction, convert=lambda r: _convert_response(site_id, r)
+                )
                 if not attach.get("busy") and (attach.get("content") or "").strip():
                     response_result = attach
                 else:
@@ -2370,10 +2441,13 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                         extraction,
                         browser_timeout,
                         baseline=attach,
+                        convert=lambda r: _convert_response(site_id, r),
                         **self._response_wait_kwargs(),
                     )
             else:
-                baseline = capture_response(page, extraction)
+                baseline = capture_response(
+                    page, extraction, convert=lambda r: _convert_response(site_id, r)
+                )
                 status, page = self._inject_and_submit_with_recovery(
                     page, tab_model, site_id, prompt, tab_index
                 )
@@ -2415,6 +2489,7 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                     extraction,
                     browser_timeout,
                     baseline=baseline,
+                    convert=lambda r: _convert_response(site_id, r),
                     **self._response_wait_kwargs(),
                 )
         except BrowserError as e:

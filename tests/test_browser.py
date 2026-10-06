@@ -718,7 +718,7 @@ class TestWaitForResponse:
     def _polls(self, sequence):
         it = iter(sequence)
 
-        def capture(page, js):
+        def capture(page, js, *args, **kwargs):
             try:
                 return dict(next(it))
             except StopIteration:
@@ -775,7 +775,7 @@ class TestWaitForResponse:
     def test_growing_content_resets_idle(self):
         calls = {"n": 0}
 
-        def capture(page, js):
+        def capture(page, js, *args, **kwargs):
             calls["n"] += 1
             return self._result("x" * calls["n"])
 
@@ -789,8 +789,11 @@ class TestWaitForResponse:
             result = browser_module.wait_for_response(
                 MagicMock(), "JS", timeout=3, idle_timeout=100
             )
+        # Growing content resets idle, so no idle window completes; the
+        # overall timeout must fire, not the idle window.
         assert result["timed_out"] is True
         assert result["done"] is False
+        assert calls["n"] > 1
 
     def test_ignores_previous_answer_via_baseline(self):
         """The answer on screen before we sent anything must not be returned
@@ -2456,7 +2459,7 @@ class TestWaitForResponseSharedRules:
         )()
         it = iter(polls)
 
-        def capture(page, js):
+        def capture(page, js, *args, **kwargs):
             try:
                 return dict(next(it))
             except StopIteration:
@@ -2550,7 +2553,7 @@ class TestWaitForResponseDoneConfirm:
         )()
         it = iter(polls)
 
-        def capture(page, js):
+        def capture(page, js, *args, **kwargs):
             try:
                 return dict(next(it))
             except StopIteration:

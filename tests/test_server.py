@@ -2269,6 +2269,7 @@ class TestHandlerSSEHelpers:
                 "chatcmpl-test",
                 1234567890,
                 "gpt-4",
+                "zai",
                 60.0,
             )
 
@@ -2364,6 +2365,7 @@ class TestHandlerSSEHelpers:
                 "chatcmpl-test",
                 1234567890,
                 "gpt-4",
+                "zai",
                 60.0,
             )
 
@@ -2637,6 +2639,7 @@ class TestSSEConformance:
                 "chatcmpl-test",
                 1234567890,
                 "gpt-4",
+                "zai",
                 60.0,
             )
 

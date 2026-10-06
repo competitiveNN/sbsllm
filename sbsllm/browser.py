@@ -781,11 +781,17 @@ def _normalize_response(result: Any) -> dict:
         "busy": bool(result.get("busy")),
         "done": bool(result.get("done")),
         "count": int(result.get("count") or 0),
+        "content_html": result.get("content_html"),
+        "thinking_html": result.get("thinking_html"),
     }
 
 
 def capture_response(
-    page: Page, extract_js: str, retries: int = 2, base_delay: float = 0.15
+    page: Page,
+    extract_js: str,
+    retries: int = 2,
+    base_delay: float = 0.15,
+    convert: Callable[[dict], dict] | None = None,
 ) -> dict:
     """Capture the current assistant response from a page.
 
@@ -806,6 +812,9 @@ def capture_response(
         extract_js: The extraction script returned by ``extract_js``.
         retries: Number of additional attempts after the first failure.
         base_delay: Seconds between attempts (doubles each retry).
+        convert: Optional callable that transforms the normalized result
+            dict (e.g. HTML-to-markdown conversion). Applied once, after
+            normalization, to every capture including retries.
 
     Returns:
         Normalized extraction result dict.
@@ -813,7 +822,10 @@ def capture_response(
     last_error: BaseException | None = None
     for attempt in range(retries + 1):
         try:
-            return _normalize_response(run_js_value(page, extract_js))
+            result = _normalize_response(run_js_value(page, extract_js))
+            if convert is not None:
+                result = convert(result)
+            return result
         except BrowserOperationTimeout:
             # A wedged worker thread will not recover on retry; re-raise
             # immediately so the caller can end the request.
@@ -1073,6 +1085,7 @@ def wait_for_response(
     thinking_patience: float = 120.0,
     busy_patience: float = DEFAULT_BUSY_PATIENCE,
     first_token_timeout: float = DEFAULT_FIRST_TOKEN_TIMEOUT,
+    convert: Callable[[dict], dict] | None = None,
 ) -> dict:
     """Poll a page until a new assistant response is complete or timeout.
 
@@ -1090,6 +1103,13 @@ def wait_for_response(
     still reports generation, because web chats pause mid-answer
     (thinking, re-render, rate limiting) and stopping there
     truncates the reply.
+
+    Args:
+        convert: Optional callable that transforms the normalized
+            capture result (e.g. HTML-to-markdown conversion). Passed
+            through to ``capture_response`` on every poll so the
+            streamed deltas and the final answer use the same
+            transformed text.
     """
     started_at = time.monotonic()
     deadline = started_at + max(float(timeout), 0.0)
@@ -1112,7 +1132,7 @@ def wait_for_response(
     }
     seen_thinking = None
     while time.monotonic() <= deadline:
-        current = capture_response(page, extract_js)
+        current = capture_response(page, extract_js, convert=convert)
         stop = poller.observe(current, time.monotonic())
         if poller.is_new and current.get("thinking"):
             seen_thinking = current["thinking"]
