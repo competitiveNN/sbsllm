@@ -274,24 +274,15 @@ _POST_INJECT_CONTENTEDITABLE = """
     })()
     """
 
-# Kimi's composer is a Lexical editor. Lexical keeps its own
-# document model, so the shared contenteditable sync
-# (innerText clear + execCommand insertText) appends to the
-# model instead of replacing it -- the prompt ended up
-# duplicated six times -- and Lexical ignores synthetic
-# beforeinput insertText. The paste event that previously
-# replaced the model in one step does not work in headless
-# Chrome: ClipboardEvent('paste', { clipboardData }) is silently
-# ignored (the clipboard is empty), so the paste handler fired
-# but inserted nothing and the prompt still accumulated.
-#
-# The reliable clear is a synthetic Ctrl+A + Delete keydown on
-# the focused editor: Lexical's keymap handles the native
-# selection-clearing, so a subsequent execCommand('insertText')
-# writes exactly one copy. Verified against the live editor:
-# running the full inject+post_inject cycle five times in a row
-# leaves the composer holding the prompt exactly once.
-_KIMI_POST_INJECT_LEXICAL = """
+# Handler for composite editors with their own document model (Lexical,
+# ProseMirror, TipTap and similar): a plain value/contentText assignment
+# does not sync the editor's internal model. The reliable clear is a
+# synthetic Ctrl+A + Delete keydown on the focused editor: the editor's
+# keymap handles the native selection-clearing, so a subsequent
+# execCommand('insertText') writes exactly one copy. Both Kimi and
+# Copilot's composers are Lexical-based, so this is a shared constant to
+# avoid duplicating the clear logic across sites.
+_POST_INJECT_COMPOSITE_EDITOR = """
     (() => {
         let el = document.querySelector('[data-sbsllm-input="true"]');
         if (!el) {
@@ -1439,10 +1430,10 @@ SITES: dict[str, dict] = {
         ),
         # Lexical editor: clear the model via a synthetic Ctrl+A +
         # Delete keydown and re-insert exactly one copy (see
-        # _KIMI_POST_INJECT_LEXICAL) instead of the shared
+        # _POST_INJECT_COMPOSITE_EDITOR) instead of the shared
         # contenteditable constant, which appends to the model and
         # duplicates the prompt on every inject.
-        "post_inject_js": _KIMI_POST_INJECT_LEXICAL,
+        "post_inject_js": _POST_INJECT_COMPOSITE_EDITOR,
         # Scope the extraction to the newest turn. Without it, the last
         # answer .markdown in the document belongs to the PREVIOUS turn
         # while the current one is still thinking (it has a thinking
@@ -1769,58 +1760,76 @@ SITES: dict[str, dict] = {
         ],
     },
     "copilot": {
-        # https://copilot.com/ — Microsoft Copilot. The modern UI is a React
-        # app whose assistant turns carry a role marker. Research reports
-        # either `data-content="assistant"` or `data-message-author-role`
-        # (same family as chatgpt) on the message container. The marker
-        # cascade is ordered fallbacks: the first marker that matches any
-        # turn drives both `found` (count) and turn selection (last match),
-        # so the newest turn is always used and a thinking-only turn can be
-        # distinguished from the previous turn's prose.
+        # https://copilot.com/ — Microsoft Copilot (modern React/Fabric UI).
+        #
+        # Composer / input (repeat-input regression fix). The current Copilot
+        # composer is a Lexical-based contenteditable div, so the shared
+        # contenteditable sync (innerText clear + execCommand insertText)
+        # appends to the editor's document model instead of replacing it.
+        # Combined with retry_with_backoff (MAX_RETRIES=3), the prompt ended
+        # up duplicated six times: the template inject appends once,
+        # post_inject appends once more, and each retry adds another round.
+        # Copilot therefore uses the robust clear from _POST_INJECT_COMPOSITE_EDITOR
+        # (synthetic Ctrl+A + Delete keydown, which Lexical's keymap handles)
+        # plus a more specific selector cascade so the first match is the
+        # composer rather than some stray contenteditable div on the page.
         "url": "https://copilot.com/",
         "inject": _inject_js("""
-            document.querySelector('textarea[data-testid="composer-input"]')
-                || document.querySelector('textarea#userInput')
-                || document.querySelector('textarea[placeholder*="Ask anything"]')
-                || document.querySelector('textarea[placeholder*="Type your message"]')
-                || document.querySelector('textarea[placeholder*="Message"]')
-                || document.querySelector('textarea[placeholder*="Ask"]')
-                || document.querySelector('textarea')
+            document.querySelector('div[data-testid="composer-input"]')
+                || document.querySelector('div[contenteditable="true"][role="textbox"]')
+                || document.querySelector('div[contenteditable="true"][aria-label="Message"]')
+                || document.querySelector('div[contenteditable="true"][placeholder*="Message"]')
                 || document.querySelector('div[contenteditable="true"]')
                 || document.querySelector('[contenteditable]')
         """),
-        "post_inject_js": _POST_INJECT_CONTENTEDITABLE,
+        "post_inject_js": _POST_INJECT_COMPOSITE_EDITOR,
         "submit_js": _submit_js("""
             document.querySelector('button[data-testid="send-button"]')
                 || document.querySelector('button[aria-label*="Send"]')
                 || document.querySelector('button[aria-label*="Submit"]')
+                || document.querySelector('button[data-testid*="send"]')
                 || document.querySelector('button[class*="send"]:not([disabled])')
                 || document.querySelector('button[class*="send"]')
                 || document.querySelector('textarea')?.closest('form')?.querySelector('button:not([disabled])')
         """),
-        # Turn markers (multiple variants — different Copilot eras/sites use
-        # different role attributes). Turn-level matches are taken LAST, so
-        # they always point at the newest turn and can never return an older
-        # prose block as this turn's answer. Prose fallbacks are deliberately
-        # last: they only run if the turn markers matched nothing on the page,
-        # in which case extraction will report found=false until a turn marker
-        # selector is added for the current DOM.
+        # Turn structure (extraction regression fix). Every assistant turn is
+        # one message wrapper with a unique id="copilot-message-<uuid>" and
+        # class fai-CopilotMessage__content. The old role-marker selectors
+        # ([data-content="assistant"], [data-message-author-role="assistant"],
+        # [data-testid="response-message"]) never matched the current DOM, so
+        # extraction reported found=false and nothing was relayed. The answer
+        # is a prose-level element [data-testid="markdown-reply"] that only
+        # renders once the answer starts streaming; [data-testid="chat-response-
+        # message"] is the empty streaming placeholder and
+        # [data-testid="lastChatMessage"] is a legacy fallback.
+        "response_container": '[id^="copilot-message-"]',
         "response_selectors": [
+            # The live answer markdown (primary selector for the current DOM).
+            '[data-testid="markdown-reply"]',
+            # Empty streaming placeholder / legacy fallbacks.
+            '[data-testid="chat-response-message"]',
+            '[data-testid="lastChatMessage"]',
+            # Old Copilot eras / other Microsoft Copilot sites.
             '[data-content="assistant"]',
             '[data-message-author-role="assistant"]',
             '[data-testid="response-message"]',
-            '[data-role="assistant"]',
-            '[class*="assistant-message"]',
-            # prose-level fallbacks
             ".bot-turn",
             ".ac-textBlock",
-            '[class*="assistant"] .markdown',
-            "article .markdown",
         ],
-        # Copilot's "Thinking" / "Searching the web" status chips, citation
-        # sources, feedback buttons and suggested follow-ups render inside the
-        # turn; they are chrome, not the answer. Pruned from the response
-        # clone before the text is read.
+        # Copilot renders the thinking trace inside the same message wrapper
+        # (the message ids are scoped per message, and response_container
+        # scopes us there). The testid-based selector is the most robust:
+        # Copilot's thinking elements carry a testid containing "thinking".
+        "thinking_selectors": [
+            '[data-testid*="thinking"]',
+            '[class*="thinking"]',
+            '[class*="reasoning"]',
+            '[class*="searching"]',
+        ],
+        # Turn chrome: feedback buttons, citation sources, suggested follow-ups
+        # and status chips render inside the message wrapper; they are not
+        # part of the answer or the reasoning trace and are pruned from the
+        # answer clone before the text is read.
         "response_exclude_selectors": [
             "button, [role='button']",
             "[class*='citation'], [class*='source']",
@@ -1829,11 +1838,6 @@ SITES: dict[str, dict] = {
             "[class*='follow-up'], [class*='suggested']",
             "[class*='choices']",
             "[class*='message-header'], [class*='message-status']",
-        ],
-        "thinking_selectors": [
-            '[class*="thinking"]',
-            '[class*="reasoning"]',
-            '[class*="searching"]',
         ],
         "login_wall_selectors": [
             'button[aria-label*="Sign in" i]',

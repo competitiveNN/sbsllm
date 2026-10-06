@@ -1231,147 +1231,137 @@ class TestTencentExtraction:
 
 
 # --- Copilot (copilot.com) fixtures ---
-# Copilot marks each turn with data-message-author-role. Every turn stays in
-# the DOM, so the newest assistant turn must be the last match. The turn
-# header holds a "Thinking"/"Searching the web" status chip plus citation
-# sources and a feedback toolbar — none of that may leak into the answer.
+# The modern Copilot wraps each assistant turn in a message container with a
+# unique id="copilot-message-<uuid>" and class fai-CopilotMessage__content
+# (per-message scope used by response_container). The live answer markdown is
+# inside [data-testid="markdown-reply"], which only renders once the answer
+# starts streaming; [data-testid="chat-response-message"] is the empty
+# streaming placeholder. Every turn stays in the DOM, so scoping to the newest
+# message wrapper is what prevents the previous turn's prose from leaking.
 
-COPIL_TURN = """
-<div class="cib-conversation">
-  <div class="cib-message" data-message-author-role="user">
-    <div class="message-body">Explain 2 + 2 * 4.</div>
-  </div>
-  <div class="cib-message" data-message-author-role="assistant">
-    <div class="cib-message-header">
-      <span class="cib-message-status">Thinking</span>
-      <span class="cib-message-status">Searching the web</span>
-    </div>
-    <div class="cib-suggested-actions">
-      <span class="cib-suggested-action">Follow-up suggestion</span>
-    </div>
-    <div class="cib-choices">
-      <div class="choice-item">Sources</div>
-    </div>
-    <div class="cib-message-content markdown">
-      <p>2 + 2 * 4 = <strong>10</strong>.</p>
-      <p>Here is the reasoning: multiplication comes before addition, so we
-      compute 2 * 4 = 8, then 2 + 8 = 10.</p>
-    </div>
-    <div class="cib-message-actions">
-      <button>Copy</button>
-      <button>Copy code</button>
-      <button data-testid="thumb_up"></button>
-      <button data-testid="thumb_down"></button>
+COPIL_MESSAGE = """
+<div id="copilot-message-aaa1" class="fai-CopilotMessage__content">
+  <div dir="auto"><div data-testid="chat-response-message"></div>
+  <div>
+    <div data-testid="lastChatMessage">
+      <div id="response-id-aaa2" data-testid="markdown-reply" data-message-type="Chat">
+        <p>2 + 2 * 4 = <strong>10</strong>.</p>
+        <p>Here is the reasoning: multiplication comes before addition, so we
+        compute 2 * 4 = 8, then 2 + 8 = 10.</p>
+      </div>
     </div>
   </div>
 </div>
 """
 
-COPIL_THINKING_WITH_SOURCES = """
-<div class="cib-conversation">
-  <div class="cib-message" data-message-author-role="assistant">
-    <div class="cib-message-header">
-      <span class="cib-message-status">Thinking</span>
-      <span class="cib-message-status">Searching the web</span>
+COPIL_MESSAGE_WITH_THINKING = """
+<div id="copilot-message-bbb1" class="fai-CopilotMessage__content">
+  <div dir="auto"><div data-testid="chat-response-message"></div>
+  <div>
+    <div data-testid="lastChatMessage">
+      <div data-testid="chat-thinking-trace" data-message-type="Thinking">
+        <p>First I consider the order of operations, then I verify the arithmetic.</p>
+      </div>
     </div>
-    <div class="cib-thinking">
-      <div class="cib-reasoning">First I consider the order of operations, then I verify the arithmetic.</div>
-    </div>
-    <div class="cib-message-content markdown">
+    <div id="response-id-bbb2" data-testid="markdown-reply" data-message-type="Chat">
       <p>2 + 2 * 4 = <strong>10</strong>.</p>
     </div>
-    <div class="cib-message-actions">
-      <button>Copy</button>
-    </div>
   </div>
 </div>
 """
 
-COPIL_PENDING_THINKING = """
-<div class="cib-conversation">
-  <div class="cib-message" data-message-author-role="assistant">
-    <div class="cib-message-header">
-      <span class="cib-message-status">Thinking</span>
-      <span class="cib-message-status">Searching the web</span>
+COPIL_THINKING_ONLY = """
+<div id="copilot-message-ccc1" class="fai-CopilotMessage__content">
+  <div dir="auto"><div data-testid="chat-response-message"></div>
+  <div>
+    <div data-testid="lastChatMessage">
+      <div data-testid="chat-thinking-trace" data-message-type="Thinking">
+        <p>Computing 2 * 4 = 8...</p>
+      </div>
     </div>
-    <div class="cib-thinking">
-      <div class="cib-reasoning">Computing 2 * 4 = 8...</div>
-    </div>
-    <div class="cib-message-content markdown"></div>
-    <div class="cib-message-actions">
-      <button>Copy</button>
+    <div id="response-id-ccc2" data-testid="markdown-reply" data-message-type="Chat">
+      <p></p>
     </div>
   </div>
+  <button aria-label="Stop">Stop</button>
 </div>
 """
 
-COPIL_STOP_BUTTON_PRESENT = """
-<div class="cib-conversation">
-  <div class="cib-message" data-message-author-role="assistant">
-    <div class="cib-message-header">
-      <span class="cib-message-status">Thinking</span>
+COPIL_TWO_MESSAGES = """
+<div id="copilot-message-old1" class="fai-CopilotMessage__content">
+  <div dir="auto"><div data-testid="chat-response-message"></div>
+  <div>
+    <div data-testid="lastChatMessage">
+      <div data-testid="markdown-reply" data-message-type="Chat">
+        <p>First reply.</p>
+      </div>
     </div>
-    <div class="cib-message-content markdown">
-      <p>Answer streaming</p>
+  </div>
+</div>
+<div id="copilot-message-new1" class="fai-CopilotMessage__content">
+  <div dir="auto"><div data-testid="chat-response-message"></div>
+  <div>
+    <div data-testid="lastChatMessage">
+      <div data-testid="markdown-reply" data-message-type="Chat">
+        <p>New reply.</p>
+      </div>
     </div>
-    <button aria-label="Stop generating">Stop</button>
-    <button data-testid="thumb_up"></button>
   </div>
 </div>
 """
 
 
 class TestCopilotExtraction:
-    """Site-specific extraction checks for https://copilot.com/."""
+    """Site-specific extraction checks for https://copilot.com/.
 
-    def test_answer_and_thinking_are_separated(self, extract_page):
-        """Streaming regression: thinking must not leak into the answer."""
-        result = _extract(extract_page, COPIL_THINKING_WITH_SOURCES, "copilot")
-        assert result["found"] is True
-        # The answer is plain text: the extraction reads the answer block,
-        # the reasoning subtree and turn chrome are pruned before the text is
-        # read.
-        assert result["content"] == "2 + 2 * 4 = 10."
-        assert "First I consider the order of operations" in (result["thinking"] or "")
-        assert "Searching the web" not in result["content"]
-        assert "Copilot" not in result["content"]
-        assert "Copy" not in result["content"]
-        assert "thumb_up" not in result["content"]
-        assert "thumb_down" not in result["content"]
-        assert "source" not in result["content"]
+    The modern Copilot (copilot.com) uses a message-wrapper scope
+    (response_container=[id^="copilot-message-"]) and prose-level answer
+    selection ([data-testid="markdown-reply"]), so every check below verifies
+    the newest-turn scoping, thinking/answer separation, paragraph breaks, and
+    the busy signal from a visible Stop control.
+    """
 
-    def test_answer_has_paragraphs(self, extract_page):
-        """Multi-paragraph answers stay on separate lines."""
-        result = _extract(extract_page, COPIL_TURN, "copilot")
+    def test_answer_from_markdown_reply(self, extract_page):
+        """The live answer is inside [data-testid="markdown-reply"];
+        [data-testid="chat-response-message"] is only the empty streaming
+        placeholder."""
+        result = _extract(extract_page, COPIL_MESSAGE, "copilot")
         assert result["found"] is True
         # blockTextOf walks block boundaries: two <p> elements give two lines.
-        assert "2 + 2 * 4 = 10.\n\nHere is the reasoning" in result["content"]
-        # The status chips, suggested actions, choices/sources and feedback
-        # buttons are turn chrome; they are pruned from the answer clone.
-        assert "Thinking" not in result["content"]
-        assert "Searching the web" not in result["content"]
-        assert "Follow-up suggestion" not in result["content"]
-        assert "Copy" not in result["content"]
+        assert result["content"] == (
+            "2 + 2 * 4 = 10."
+            "\n\n"
+            "Here is the reasoning: multiplication comes before addition, so we "
+            "compute 2 * 4 = 8, then 2 + 8 = 10."
+        )
+        assert result["thinking"] is None
 
-    def test_pending_turn_reports_found_without_leak(self, extract_page):
-        """While the newest turn is thinking, the last match is still its
-        own (empty) answer — no old turn's text leaks in."""
-        result = _extract(extract_page, COPIL_PENDING_THINKING, "copilot")
+    def test_thinking_and_answer_separated(self, extract_page):
+        """Streaming regression: a thinking block inside the same message
+        wrapper must stream as thinking, not leak into the answer."""
+        result = _extract(extract_page, COPIL_MESSAGE_WITH_THINKING, "copilot")
         assert result["found"] is True
-        assert result["content"] == ""
-        assert "Computing 2 * 4 = 8" in (result["thinking"] or "")
+        assert "2 + 2 * 4 = 10." in result["content"]
+        assert "2 + 2 * 4 = 10." not in (result["thinking"] or "")
+        assert "First I consider the order of operations" in (result["thinking"] or "")
+        assert "verify the arithmetic" in (result["thinking"] or "")
 
-    def test_busy_stays_true_with_stop(self, extract_page):
-        """A stop control inside the turn pins busy=true mid-stream."""
-        result = _extract(extract_page, COPIL_STOP_BUTTON_PRESENT, "copilot")
+    def test_thinking_only_reports_found_empty_and_busy(self, extract_page):
+        """While the newest turn is still thinking, its answer block exists
+        but is empty: found=true, content="", thinking has the trace, and the
+        visible Stop control keeps busy=true so the poller keeps waiting."""
+        result = _extract(extract_page, COPIL_THINKING_ONLY, "copilot")
+        assert result["found"] is True
+        assert result["content"] == "", result["content"]
+        assert "Computing 2 * 4 = 8" in (result["thinking"] or "")
         assert result["busy"] is True
-        assert result["content"] == "Answer streaming"
         assert result["done"] is False
 
-    def test_thinking_label_not_relaid(self, extract_page):
-        """The "Thinking"/"Searching the web" status chips are status
-        indicators, not a reasoning trace; they must not be relayed as
-        thinking_content."""
-        result = _extract(extract_page, COPIL_TURN, "copilot")
-        assert "Thinking" not in (result["thinking"] or "")
-        assert "Searching the web" not in (result["thinking"] or "")
+    def test_newest_message_wins_no_leak(self, extract_page):
+        """response_container=[id^="copilot-message-"] scopes to the newest
+        message wrapper, so the previous turn's prose never leaks in. This is
+        the same regression qwen/kimi/tencent/huggingface already guard against."""
+        result = _extract(extract_page, COPIL_TWO_MESSAGES, "copilot")
+        assert result["content"] == "New reply.", result["content"]
+        assert "First reply." not in result["content"]
+        assert "First reply." not in (result["thinking"] or "")
