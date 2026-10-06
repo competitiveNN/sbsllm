@@ -981,10 +981,10 @@ SITES: dict[str, dict] = {
         # the answer markdown renders).
         "response_container": ".qwen-chat-message-assistant",
         "response_selectors": [
-            '.response-message-content.phase-answer .custom-qwen-markdown',
-            '.response-message-content .custom-qwen-markdown',
-            '.custom-qwen-markdown',
-            '.qwen-markdown',
+            ".response-message-content.phase-answer .custom-qwen-markdown",
+            ".response-message-content .custom-qwen-markdown",
+            ".custom-qwen-markdown",
+            ".qwen-markdown",
         ],
         # No thinking selector: the in-flow element is only a status card
         # whose titles and "Skip" button are chrome, not a reasoning trace.
@@ -998,7 +998,7 @@ SITES: dict[str, dict] = {
         ],
         "loading_selectors": [
             *_LOADING_SELECTORS,
-            '.response-loading',
+            ".response-loading",
         ],
     },
     "grok": {
@@ -1402,8 +1402,8 @@ SITES: dict[str, dict] = {
             # Logged-out visitors land on the /welcome marketing
             # page; its CTAs (nav__cta / hero__cta) only exist
             # there, so they mark the pre-login state.
-            'a.nav__cta',
-            'a.hero__cta',
+            "a.nav__cta",
+            "a.hero__cta",
         ],
         "loading_selectors": [
             *_LOADING_SELECTORS,
@@ -1425,7 +1425,8 @@ SITES: dict[str, dict] = {
         # shared submit template's button candidates never
         # matched and every request fell back to a synthetic
         # Enter key that the Lexical composer swallows.
-        "submit_js": _submit_js("""
+        "submit_js": _submit_js(
+            """
             document.querySelector('.send-button-container')
                 || document.querySelector('div[class*="send-button"]')
                 || document.querySelector('button[aria-label="Submit"]')
@@ -1832,7 +1833,7 @@ SITES: dict[str, dict] = {
             # when the block closes). The "Thinking" label span also
             # matches the catch-all, but the extraction JS filters
             # label-only text.
-            '.thinking-viewport',
+            ".thinking-viewport",
             '[class*="thinking"]',
             '[class*="reasoning"]',
         ],
@@ -1966,7 +1967,12 @@ SITES: dict[str, dict] = {
 _REQUIRED_KEYS = ("url", "inject", "submit_js", "response_selectors")
 # Keys whose value is a list of CSS selectors rather than a JS string.
 _SELECTOR_KEYS = frozenset(
-    {"response_selectors", "thinking_selectors", "loading_selectors", "login_wall_selectors"}
+    {
+        "response_selectors",
+        "thinking_selectors",
+        "loading_selectors",
+        "login_wall_selectors",
+    }
 )
 # Optional JS blocks that must be non-empty strings when present.
 _OPTIONAL_JS_KEYS = ("post_inject_js", "setup_js")

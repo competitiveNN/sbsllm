@@ -42,6 +42,7 @@ def _isolated_chrome_profile(monkeypatch, tmp_path_factory):
     monkeypatch.setenv("SBSLLM_USER_DATA_DIR", str(profile))
     yield
 
+
 _MOCK_PAGE_HTML = """<!doctype html>
 <html><head><meta charset="utf-8"><title>mock zai</title></head>
 <body>
@@ -1149,8 +1150,12 @@ class TestGoogleExtractionChrome:
     The extraction must relay the answer, not the chrome."""
 
     CHROME = (
-        "edit", "more_vert", "thumb_up", "thumb_down",
-        "Model", "1:32 PM",
+        "edit",
+        "more_vert",
+        "thumb_up",
+        "thumb_down",
+        "Model",
+        "1:32 PM",
     )
 
     def test_turn_content_selector_scopes_to_the_answer(
@@ -1214,12 +1219,9 @@ class TestGoogleExtractionChrome:
             try:
                 result = page.evaluate(extract_js("google"))
                 assert result["found"] is True
-                assert "A whisper of wind through the open door," in result[
-                    "content"
-                ]
+                assert "A whisper of wind through the open door," in result["content"]
                 assert "Thinking" not in result["content"], (
-                    f"thinking label leaked into the answer: "
-                    f"{result['content']!r}"
+                    f"thinking label leaked into the answer: {result['content']!r}"
                 )
                 assert not result["thinking"] or (
                     result["thinking"].strip() != "Thinking"
@@ -1267,9 +1269,9 @@ class TestGoogleExtractionChrome:
             try:
                 result = page.evaluate(extract_js("google"))
                 assert result["found"] is True
-                assert result["content"].startswith(
-                    "Thinking about the sun"
-                ), f"real answer truncated: {result['content']!r}"
+                assert result["content"].startswith("Thinking about the sun"), (
+                    f"real answer truncated: {result['content']!r}"
+                )
             finally:
                 browser.close()
 
@@ -1474,9 +1476,7 @@ class TestZaiPostInject:
                 assert inject_status == "OK", f"inject failed: {inject_status}"
 
                 # Verify the prompt was set.
-                val = page.evaluate(
-                    "document.getElementById('chat-input').value"
-                )
+                val = page.evaluate("document.getElementById('chat-input').value")
                 assert prompt in val, f"prompt not in input: {val!r}"
 
                 # Submit via the real z.ai submit template.
@@ -1685,9 +1685,7 @@ class TestShadowDomExtraction:
                     [],
                 )
                 result = page.evaluate(extraction)
-                assert result["found"] is True, (
-                    f"shadow fallback failed: {result}"
-                )
+                assert result["found"] is True, f"shadow fallback failed: {result}"
                 assert "shadow DOM" in result["content"]
             finally:
                 browser.close()
@@ -1977,9 +1975,9 @@ class TestMetaPromptPage:
             page = browser.new_page()
             page.goto(mock_meta_prompt_server, wait_until="networkidle")
             try:
-                assert page.evaluate(
-                    inject_prompt("meta", "second turn prompt")
-                ) == "OK"
+                assert (
+                    page.evaluate(inject_prompt("meta", "second turn prompt")) == "OK"
+                )
                 # The trap: the title input must stay empty.
                 title_value = page.evaluate(
                     "document.getElementById('conv-title').value"
@@ -2013,9 +2011,7 @@ class TestMetaPromptPage:
             page = browser.new_page()
             page.goto(mock_meta_prompt_server, wait_until="networkidle")
             try:
-                assert page.evaluate(
-                    inject_prompt("meta", "third turn prompt")
-                ) == "OK"
+                assert page.evaluate(inject_prompt("meta", "third turn prompt")) == "OK"
                 assert page.evaluate(submit_js("meta")) == "OK"
                 page.wait_for_function(
                     "(() => { const rows ="

@@ -3601,9 +3601,7 @@ class TestMultiModel:
             tab_map={},
         )
         assert server.model_map["multi"] == "multi"
-        single = create_server(
-            model_map={"chatgpt": "chatgpt"}, tab_map={}
-        )
+        single = create_server(model_map={"chatgpt": "chatgpt"}, tab_map={})
         assert "multi" not in single.model_map
 
     def test_multi_aggregates_every_answer(self):
@@ -3654,9 +3652,7 @@ class TestMultiModel:
         assert response["model"] == "multi"
         assert response["choices"][0]["finish_reason"] == "stop"
         content = response["choices"][0]["message"]["content"]
-        assert content == (
-            "### chatgpt\n\nGPT answer\n\n### claude\n\nClaude answer"
-        )
+        assert content == ("### chatgpt\n\nGPT answer\n\n### claude\n\nClaude answer")
         assert response["choices"][0]["message"]["reasoning_content"] == (
             "### claude\n\nClaude reasoning"
         )
@@ -3731,17 +3727,13 @@ class TestMultiModel:
             model_locks=_ModelLockRegistry(),
             browser_lock_timeout=10,
         )
-        locks, acquired, _timeout = handler._acquire_all_browser_locks(
-            ["a", "b"]
-        )
+        locks, acquired, _timeout = handler._acquire_all_browser_locks(["a", "b"])
         assert acquired is True
         assert len(locks) == 2
         # A second acquisition of the held locks fails and releases
         # nothing it does not hold.
         handler.server.browser_lock_timeout = 0.01
-        locks2, acquired2, _ = handler._acquire_all_browser_locks(
-            ["a", "b"]
-        )
+        locks2, acquired2, _ = handler._acquire_all_browser_locks(["a", "b"])
         assert acquired2 is False
         assert locks2 == []
         for browser_lock in locks:

@@ -257,9 +257,7 @@ class TestInjectPrompt:
         from sbsllm.sites import SITES
 
         selectors = SITES["grok"]["response_selectors"]
-        assert any(
-            "prose-chat" in s and "user-message" in s for s in selectors
-        )
+        assert any("prose-chat" in s and "user-message" in s for s in selectors)
 
     @pytest.mark.parametrize(
         "site_id",

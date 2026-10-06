@@ -44,6 +44,7 @@ def user_data_dir() -> str:
     """
     return os.environ.get("SBSLLM_USER_DATA_DIR") or USER_DATA_DIR
 
+
 # Timeout for page operations (seconds)
 PAGE_TIMEOUT = 30
 

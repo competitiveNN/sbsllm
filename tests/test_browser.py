@@ -1043,9 +1043,7 @@ class TestCaptureResponseRetry:
                 "count": 1,
             }
 
-        with patch(
-            "sbsllm.browser.run_js_value", side_effect=flaky_worker_stop
-        ):
+        with patch("sbsllm.browser.run_js_value", side_effect=flaky_worker_stop):
             result = browser_module.capture_response(
                 fake_page, extraction, retries=2, base_delay=0.01
             )
@@ -1527,9 +1525,7 @@ class TestWorkerLifecycle:
             # Poison the queue as a dead worker would.
             browser_module._browser_queue.put(None)
             orphan_event = threading.Event()
-            browser_module._browser_queue.put(
-                (_identity, (), {}, orphan_event, [])
-            )
+            browser_module._browser_queue.put((_identity, (), {}, orphan_event, []))
             # Simulate a worker reference that died without draining (the
             # original bug state), plus a stale thread id to clear.
             dead = MagicMock(spec=threading.Thread)
@@ -1561,6 +1557,7 @@ class TestWorkerLifecycle:
         # Patch the worker loop to a no-op so the worker thread exits before
         # processing its queued item -- simulating a crash/stop.
         with patch.object(browser_module, "_browser_worker_loop") as mock_loop:
+
             def fake_worker():
                 pass
 
@@ -2395,7 +2392,9 @@ class TestResponsePoller:
     def test_thinking_timeout_endures_longer_than_busy(self):
         """A thinking-only stall uses the larger thinking_patience, not the
         busier answer patience."""
-        poller = self._poller(busy_patience=1.0, thinking_patience=99.0, idle_timeout=99)
+        poller = self._poller(
+            busy_patience=1.0, thinking_patience=99.0, idle_timeout=99
+        )
         poller.observe(self._poll(thinking="still...", busy=True), 0.0)
         stop = poller.observe(self._poll(thinking="still...", busy=True), 2.0)
         assert stop is None
@@ -2433,11 +2432,28 @@ class TestWaitForResponseSharedRules:
     """wait_for_response must surface the same stop reasons the poller
     produces, including the ones the old non-streaming copy lacked."""
 
-    def _run(self, polls, *, busy_patience=1.0, thinking_patience=99.0,
-             idle_timeout=0.05, first_token_timeout=DEFAULT_FIRST_TOKEN_TIMEOUT,
-             done_confirm=0.75, timeout=10.0, poll_interval=0.01, baseline=None):
-        clock = type("C", (), {"t": 0.0, "monotonic": lambda self: self.t,
-                                "sleep": lambda self, s: setattr(self, "t", self.t + max(s, 0.01))})()
+    def _run(
+        self,
+        polls,
+        *,
+        busy_patience=1.0,
+        thinking_patience=99.0,
+        idle_timeout=0.05,
+        first_token_timeout=DEFAULT_FIRST_TOKEN_TIMEOUT,
+        done_confirm=0.75,
+        timeout=10.0,
+        poll_interval=0.01,
+        baseline=None,
+    ):
+        clock = type(
+            "C",
+            (),
+            {
+                "t": 0.0,
+                "monotonic": lambda self: self.t,
+                "sleep": lambda self, s: setattr(self, "t", self.t + max(s, 0.01)),
+            },
+        )()
         it = iter(polls)
 
         def capture(page, js):
@@ -2452,16 +2468,30 @@ class TestWaitForResponseSharedRules:
             patch.object(browser_module.time, "monotonic", side_effect=clock.monotonic),
         ):
             result = browser_module.wait_for_response(
-                MagicMock(), "JS", timeout, poll_interval=poll_interval,
-                idle_timeout=idle_timeout, baseline=baseline,
-                done_confirm=done_confirm, thinking_patience=thinking_patience,
-                busy_patience=busy_patience, first_token_timeout=first_token_timeout,
+                MagicMock(),
+                "JS",
+                timeout,
+                poll_interval=poll_interval,
+                idle_timeout=idle_timeout,
+                baseline=baseline,
+                done_confirm=done_confirm,
+                thinking_patience=thinking_patience,
+                busy_patience=busy_patience,
+                first_token_timeout=first_token_timeout,
             )
         return result
 
     def test_no_output_flag_when_nothing_appears(self):
-        polls = [{"found": False, "content": "", "thinking": None,
-                  "busy": False, "done": False, "count": 0}]
+        polls = [
+            {
+                "found": False,
+                "content": "",
+                "thinking": None,
+                "busy": False,
+                "done": False,
+                "count": 0,
+            }
+        ]
         result = self._run(polls, first_token_timeout=0.5, idle_timeout=0.0)
         assert result.get("no_output") is True
         assert result["done"] is False
@@ -2469,13 +2499,30 @@ class TestWaitForResponseSharedRules:
 
     def test_busy_timeout_flag_for_answer_stall(self):
         polls = [
-            {"found": False, "content": "", "thinking": None,
-             "busy": False, "done": False, "count": 0},
-            {"found": True, "content": "partial", "thinking": None,
-             "busy": True, "done": False, "count": 1},
+            {
+                "found": False,
+                "content": "",
+                "thinking": None,
+                "busy": False,
+                "done": False,
+                "count": 0,
+            },
+            {
+                "found": True,
+                "content": "partial",
+                "thinking": None,
+                "busy": True,
+                "done": False,
+                "count": 1,
+            },
         ]
-        result = self._run(polls, busy_patience=0.5, thinking_patience=99,
-                           idle_timeout=0.0, first_token_timeout=99)
+        result = self._run(
+            polls,
+            busy_patience=0.5,
+            thinking_patience=99,
+            idle_timeout=0.0,
+            first_token_timeout=99,
+        )
         assert result.get("busy_timeout") is True
         assert result["content"] == "partial"
 
@@ -2489,8 +2536,9 @@ class TestWaitForResponseDoneConfirm:
     changed behaviour only in one direction.
     """
 
-    def _run(self, polls, *, done_confirm=0.75, poll_interval=0.01,
-             timeout=30.0, **kwargs):
+    def _run(
+        self, polls, *, done_confirm=0.75, poll_interval=0.01, timeout=30.0, **kwargs
+    ):
         clock = type(
             "C",
             (),
@@ -2527,25 +2575,45 @@ class TestWaitForResponseDoneConfirm:
         almost immediately, whereas the 0.75s default would wait longer."""
         # Site was seen generating, then stops. Text is stable across polls.
         polls = [
-            {"found": True, "content": "answer", "thinking": None,
-             "busy": True, "done": False, "count": 1},
-            {"found": True, "content": "answer", "thinking": None,
-             "busy": False, "done": True, "count": 1},
-            {"found": True, "content": "answer", "thinking": None,
-             "busy": False, "done": True, "count": 1},
+            {
+                "found": True,
+                "content": "answer",
+                "thinking": None,
+                "busy": True,
+                "done": False,
+                "count": 1,
+            },
+            {
+                "found": True,
+                "content": "answer",
+                "thinking": None,
+                "busy": False,
+                "done": True,
+                "count": 1,
+            },
+            {
+                "found": True,
+                "content": "answer",
+                "thinking": None,
+                "busy": False,
+                "done": True,
+                "count": 1,
+            },
         ]
         # Poll 0 records the change at t=0; poll 1 lands at t=0.01, poll 2 at
         # t=0.02 -- both past the 0.05s window? No: 0.01 < 0.05. So poll 3
         # (t=0.03) still under. We need enough polls to exceed 0.05s.
         polls = polls * 4
         result = self._run(
-            polls, done_confirm=0.05, poll_interval=0.01,
-            idle_timeout=0.0, busy_patience=99,
-            thinking_patience=99, first_token_timeout=99,
+            polls,
+            done_confirm=0.05,
+            poll_interval=0.01,
+            idle_timeout=0.0,
+            busy_patience=99,
+            thinking_patience=99,
+            first_token_timeout=99,
         )
-        assert result.get("done") is True, (
-            f"should finish, not time out: {result}"
-        )
+        assert result.get("done") is True, f"should finish, not time out: {result}"
 
     def test_long_done_confirm_keeps_waiting(self):
         """A 5s done_confirm must not return before the confirm window elapses.
@@ -2554,15 +2622,32 @@ class TestWaitForResponseDoneConfirm:
         window, proving the long confirm is actually being honored.
         """
         polls = [
-            {"found": True, "content": "answer", "thinking": None,
-             "busy": True, "done": False, "count": 1},
-            {"found": True, "content": "answer", "thinking": None,
-             "busy": False, "done": True, "count": 1},
+            {
+                "found": True,
+                "content": "answer",
+                "thinking": None,
+                "busy": True,
+                "done": False,
+                "count": 1,
+            },
+            {
+                "found": True,
+                "content": "answer",
+                "thinking": None,
+                "busy": False,
+                "done": True,
+                "count": 1,
+            },
         ]
         result = self._run(
-            polls, done_confirm=5.0, poll_interval=0.01,
-            idle_timeout=0.0, busy_patience=99,
-            thinking_patience=99, first_token_timeout=99, timeout=0.5,
+            polls,
+            done_confirm=5.0,
+            poll_interval=0.01,
+            idle_timeout=0.0,
+            busy_patience=99,
+            thinking_patience=99,
+            first_token_timeout=99,
+            timeout=0.5,
         )
         assert result.get("timed_out") is True, (
             f"should time out, not finish early: {result}"

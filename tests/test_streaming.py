@@ -813,8 +813,9 @@ class TestBothPollingPathsAgree:
     (non-streaming) over identical capture sequences.
     """
 
-    def _poll(self, content="", *, thinking=None, busy=False, done=False,
-              found=True, count=1):
+    def _poll(
+        self, content="", *, thinking=None, busy=False, done=False, found=True, count=1
+    ):
         return {
             "found": found,
             "content": content,
@@ -881,7 +882,10 @@ class TestBothPollingPathsAgree:
             patch("sbsllm.browser.time.monotonic", side_effect=clock.monotonic),
         ):
             result = wait_for_response(
-                MagicMock(), "JS", 60.0, poll_interval=0.01,
+                MagicMock(),
+                "JS",
+                60.0,
+                poll_interval=0.01,
                 idle_timeout=kw.pop("idle_timeout", 3.0),
                 done_confirm=kw.pop("done_confirm", 0.75),
                 thinking_patience=kw.pop("thinking_patience", 120.0),
@@ -926,19 +930,101 @@ class TestBothPollingPathsAgree:
             self._poll("partial", busy=True, count=1),
             self._poll("partial", busy=True, count=2),
         ]
-        assert self._agree(polls, busy_patience=0.5, idle_timeout=99.0,
-                           thinking_patience=99.0, done_confirm=99.0) == "busy_timeout"
+        assert (
+            self._agree(
+                polls,
+                busy_patience=0.5,
+                idle_timeout=99.0,
+                thinking_patience=99.0,
+                done_confirm=99.0,
+            )
+            == "busy_timeout"
+        )
 
     def test_thinking_timeout_agrees(self):
         polls = [
             self._poll(thinking="still...", busy=True, count=1),
             self._poll(thinking="still...", busy=True, count=2),
         ]
-        assert self._agree(polls, busy_patience=1.0, thinking_patience=0.5,
-                           idle_timeout=99.0, done_confirm=99.0,
-                           first_token_timeout=99.0) == "thinking_timeout"
+        assert (
+            self._agree(
+                polls,
+                busy_patience=1.0,
+                thinking_patience=0.5,
+                idle_timeout=99.0,
+                done_confirm=99.0,
+                first_token_timeout=99.0,
+            )
+            == "thinking_timeout"
+        )
 
     def test_no_output_agrees(self):
         polls = [self._poll(found=False, count=0)] * 3
-        assert self._agree(polls, first_token_timeout=0.5, idle_timeout=0.0,
-                           busy_patience=99.0, thinking_patience=99.0) == "no_output"
+        assert (
+            self._agree(
+                polls,
+                first_token_timeout=0.5,
+                idle_timeout=0.0,
+                busy_patience=99.0,
+                thinking_patience=99.0,
+            )
+            == "no_output"
+        )
+
+
+class TestLastThinking:
+    """Regression guard for the non-streaming thinking-preservation path.
+
+    Tencent AI Studio collapses its reasoning disclosure when the answer
+    completes, so the final capture reports ``thinking=None`` even though a
+    full trace streamed earlier; ``wait_for_response`` must re-attach the
+    last seen trace so the non-streaming caller still returns it.
+    """
+
+    def test_reattaches_thinking_that_the_site_dropped(self):
+        from sbsllm.browser import _with_last_thinking
+
+        seen = "I counted to four, then added."
+        final = {
+            "found": True,
+            "content": "4",
+            "thinking": None,
+            "busy": False,
+            "done": True,
+            "count": 1,
+        }
+        result = _with_last_thinking(final, seen)
+        assert result["thinking"] == seen, "must re-attach the dropped trace"
+        # The caller's other fields must survive intact.
+        assert result["content"] == "4" and result["done"] is True
+
+    def test_does_not_reattach_on_timeout_paths(self):
+        from sbsllm.browser import _with_last_thinking
+
+        seen = "some trace"
+        for reason in ("thinking_timeout", "busy_timeout", "no_output", "timed_out"):
+            final = {
+                "found": False,
+                "content": "",
+                "thinking": None,
+                "busy": True,
+                reason: True,
+                "count": 0,
+            }
+            result = _with_last_thinking(final, seen)
+            assert result["thinking"] is None, (
+                f"must NOT re-attach when {reason} is set"
+            )
+
+    def test_does_not_reattach_when_trace_already_present(self):
+        from sbsllm.browser import _with_last_thinking
+
+        seen = "seen"
+        final = {"thinking": "live", "found": True, "done": True}
+        assert _with_last_thinking(final, seen)["thinking"] == "live"
+
+    def test_does_not_reattach_when_seen_is_None(self):
+        from sbsllm.browser import _with_last_thinking
+
+        final = {"thinking": None, "found": True}
+        assert _with_last_thinking(final, None) is final

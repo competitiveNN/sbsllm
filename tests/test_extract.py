@@ -717,12 +717,16 @@ class TestHuggingFaceExtraction:
         renders before the answer prose does."""
         thinking = ""
         if reasoning is not None:
-            thinking = """
+            thinking = (
+                """
               <div class="thinking-viewport mt-2 flex max-h-56 flex-col justify-end overflow-hidden md:max-h-80">
                 <div class="prose prose-sm max-w-none text-sm leading-relaxed">
-                  <p>""" + reasoning + """</p>
+                  <p>"""
+                + reasoning
+                + """</p>
                 </div>
               </div>"""
+            )
         return f"""
         <div data-message-id="m2" data-message-role="assistant" role="presentation"
              class="group relative -mb-4 flex w-fit max-w-full items-start justify-start gap-4 pb-4 leading-relaxed">
@@ -748,10 +752,9 @@ class TestHuggingFaceExtraction:
     def test_pending_turn_thinking_scoped_to_newest(self, extract_page):
         """The previous turn's reasoning block stays in the DOM; only
         the newest turn's trace may stream as thinking."""
-        html = (
-            self._message("First answer.", reasoning="Old reasoning.")
-            + self._pending_message(reasoning="New reasoning.")
-        )
+        html = self._message(
+            "First answer.", reasoning="Old reasoning."
+        ) + self._pending_message(reasoning="New reasoning.")
         result = _extract(extract_page, html, site_id="huggingface")
         assert result["found"] is False, result
         assert result["content"] == "", result
@@ -904,7 +907,8 @@ class TestQwenExtraction:
         open while the answer is still arriving."""
         result = _extract(
             extract_page,
-            self._message("") + """
+            self._message("")
+            + """
             <div class="response-loading"><div class="qwen-lottie-web"></div></div>
             <button aria-label="Stop">Stop</button>
             """,
@@ -1092,7 +1096,7 @@ TENCENT_TURN_LOADING = """
 _TENCENT_TURN_ITEM = (
     TENCENT_TURN.strip()
     .removeprefix('<div class="agent-chat__list">')
-    .removesuffix('</div>')
+    .removesuffix("</div>")
     .strip()
 )
 TENCENT_TWO_TURNS = (
@@ -1104,15 +1108,16 @@ TENCENT_TWO_TURNS = (
     + '\n          <div class="agent-chat__conv--ai__speech_show">'
     + '\n            <div class="hyc-content-md">'
     + '\n              <div class="hyc-common-markdown hyc-common-markdown-style">'
-    + '\n                <p>First reply.</p>'
-    + '\n              </div>'
-    + '\n            </div>'
-    + '\n          </div>'
-    + '\n        </div>'
-    + '\n      </div>'
-    + '\n    </div>'
-    + '\n  </div>'
-    + _TENCENT_TURN_ITEM + '\n</div>'
+    + "\n                <p>First reply.</p>"
+    + "\n              </div>"
+    + "\n            </div>"
+    + "\n          </div>"
+    + "\n        </div>"
+    + "\n      </div>"
+    + "\n    </div>"
+    + "\n  </div>"
+    + _TENCENT_TURN_ITEM
+    + "\n</div>"
 )
 
 TENCENT_MODEL_DETAILS = """
@@ -1223,6 +1228,3 @@ class TestTencentExtraction:
         informative rather than chrome."""
         result = _extract(extract_page, TENCENT_TURN, "tencent")
         assert "Deep thinking completed" in (result["thinking"] or "")
-
-
-

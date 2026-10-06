@@ -2212,9 +2212,7 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         # Grab every tab's lock before submitting anything, so a
         # concurrent request cannot interleave into any of the tabs
         # mid-fan-out.
-        locks, lock_acquired, lock_timeout = self._acquire_all_browser_locks(
-            tab_models
-        )
+        locks, lock_acquired, lock_timeout = self._acquire_all_browser_locks(tab_models)
         if not lock_acquired:
             logger.warning(
                 "chat_completion tab_busy",
@@ -2243,9 +2241,7 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         failures = [result for result in results if result.get("error_type")]
         if failures:
             first = failures[0]
-            failed_models = ", ".join(
-                result["model"] for result in failures
-            )
+            failed_models = ", ".join(result["model"] for result in failures)
             elapsed = time.monotonic() - request_start
             logger.warning(
                 "chat_completion multi_failed",
@@ -2268,8 +2264,7 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             return
 
         content = "\n\n".join(
-            f"### {result['model']}\n\n{result['content']}"
-            for result in results
+            f"### {result['model']}\n\n{result['content']}" for result in results
         )
         thinking = "\n\n".join(
             f"### {result['model']}\n\n{result['thinking']}"
@@ -2357,8 +2352,7 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                     "error_type": "extraction_unsupported",
                     "status_code": 502,
                     "message": (
-                        f"Response extraction is not supported for "
-                        f"site: {site_id}."
+                        f"Response extraction is not supported for site: {site_id}."
                     ),
                 }
 
@@ -2368,9 +2362,7 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                 # (a client retry train): attach to the turn already
                 # on screen instead of re-injecting.
                 attach = capture_response(page, extraction)
-                if not attach.get("busy") and (
-                    attach.get("content") or ""
-                ).strip():
+                if not attach.get("busy") and (attach.get("content") or "").strip():
                     response_result = attach
                 else:
                     response_result = wait_for_response(
@@ -2399,16 +2391,13 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                         "model": tab_model,
                         "error_type": "browser_error",
                         "status_code": 502,
-                        "message": (
-                            f"Browser error from {site_id}: "
-                            f"{browser_error}."
-                        ),
+                        "message": (f"Browser error from {site_id}: {browser_error}."),
                     }
-                if (
-                    status.get("inject") != "OK"
-                    or status.get("submit")
-                    not in {"OK", "ENTER_SENT", "ENTER_SENT_UNVERIFIED"}
-                ):
+                if status.get("inject") != "OK" or status.get("submit") not in {
+                    "OK",
+                    "ENTER_SENT",
+                    "ENTER_SENT_UNVERIFIED",
+                }:
                     if status.get("inject") != "OK":
                         detail = f"Failed to inject prompt: {status['inject']}"
                     else:
@@ -2468,9 +2457,7 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         # Validate the turn the same way the single-model path does:
         # a truncated, empty or login-walled capture is a failure,
         # not a partial answer.
-        if response_result.get("timed_out") or response_result.get(
-            "busy_timeout"
-        ):
+        if response_result.get("timed_out") or response_result.get("busy_timeout"):
             return {
                 "model": tab_model,
                 "error_type": "timeout",
@@ -2496,9 +2483,7 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                     "model": tab_model,
                     "error_type": "login_required",
                     "status_code": 502,
-                    "message": (
-                        f"The {site_id} chat requires a signed-in session."
-                    ),
+                    "message": (f"The {site_id} chat requires a signed-in session."),
                 }
             return {
                 "model": tab_model,
