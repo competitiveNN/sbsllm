@@ -51,11 +51,28 @@ _MARKDOWNIFY = None
 
 
 def _html_to_markdown(html: str) -> str:
-    """Convert a pruned answer/thinking HTML subtree to Markdown."""
+    """Convert a pruned answer/thinking HTML subtree to Markdown.
+
+    Falls back to plain text when markdownify is unavailable rather than
+    raising: a missing dependency used to abort every capture (the
+    conversion runs on every response, so the exception propagated out of
+    ``capture_response`` and the client received nothing — the same symptom
+    as a broken extraction selector, with a far less obvious cause).
+    """
     global _MARKDOWNIFY
     if _MARKDOWNIFY is None:
-        from markdownify import markdownify as _md
-        _MARKDOWNIFY = _md
+        try:
+            from markdownify import markdownify as _md
+        except ImportError as exc:  # noqa: BLE001
+            logger.warning(
+                "markdownify unavailable; relaying plain-text answers: %s",
+                exc,
+            )
+            _MARKDOWNIFY = False
+        else:
+            _MARKDOWNIFY = _md
+    if _MARKDOWNIFY is False:
+        return ""
     try:
         return _MARKDOWNIFY(html, heading_style="ATX", strip=["meta"]).strip()
     except Exception as exc:  # noqa: BLE001
