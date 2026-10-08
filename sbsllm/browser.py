@@ -79,6 +79,22 @@ DEFAULT_THINKING_PATIENCE = 120.0
 # and the local chat simply spun forever.
 DEFAULT_FIRST_TOKEN_TIMEOUT = 60.0
 
+# Chromium flags that keep the browser off the GPU entirely. The chat
+# tabs only render text, images and video, all of which Chromium
+# rasterizes and decodes in software, so nothing is allocated on the
+# graphics card: no GL context, no hardware video decode, no VRAM.
+# SwiftShader (the CPU software renderer) remains enabled -- disabling
+# it too would leave pages unable to paint at all.
+NO_GPU_ARGS = [
+    "--disable-gpu",
+    "--disable-gpu-compositing",
+    "--disable-gpu-rasterization",
+    "--disable-accelerated-2d-canvas",
+    "--disable-accelerated-video-decode",
+    "--disable-features=VaapiVideoDecoder,VaapiVideoEncoder",
+    "--use-gl=swiftshader",
+]
+
 # Global browser state
 _context: BrowserContext | None = None
 _playwright_instance: Any = None
@@ -493,6 +509,21 @@ def is_headless() -> bool:
     return headless_env in ("1", "true", "yes", "on")
 
 
+def is_gpu_disabled() -> bool:
+    """Return True when Chromium must launch without GPU acceleration.
+
+    Defaults to True: the chat tabs only render text and images, so the
+    browser runs fully on the CPU (SwiftShader) and allocates no VRAM.
+    Set ``SBSLLM_GPU=1`` (or ``true``/``yes``/``on``) to restore
+    hardware acceleration.
+
+    Returns:
+        True if GPU acceleration must stay off, False otherwise.
+    """
+    gpu_env = os.environ.get("SBSLLM_GPU", "").strip().lower()
+    return gpu_env not in ("1", "true", "yes", "on")
+
+
 def _find_system_chromium() -> str | None:
     """Return path to a system Chromium binary if available, else None."""
     import shutil
@@ -540,14 +571,18 @@ def ensure_browser(chrome_bin: str | None = None) -> BrowserContext:
             # the user can log in to chat sites interactively.
             headless = is_headless()
 
+            args = [
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-blink-features=AutomationControlled",
+            ]
+            if is_gpu_disabled():
+                args.extend(NO_GPU_ARGS)
+
             launch_args: dict[str, Any] = {
                 "headless": headless,
                 "java_script_enabled": True,
-                "args": [
-                    "--no-first-run",
-                    "--no-default-browser-check",
-                    "--disable-blink-features=AutomationControlled",
-                ],
+                "args": args,
             }
             if chrome_bin:
                 launch_args["executable_path"] = chrome_bin

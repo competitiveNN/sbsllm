@@ -167,6 +167,53 @@ class TestEnsureBrowser:
             call_kwargs = mock_instance.chromium.launch_persistent_context.call_args[1]
             assert call_kwargs["headless"] is False
 
+    def test_gpu_disabled_by_default(self):
+        """The browser must launch with no GPU acceleration by default."""
+        mock_context, _ = self._mock_context()
+        with (
+            patch("sbsllm.browser.sync_playwright") as mock_pw,
+            patch("sbsllm.browser._find_system_chromium", return_value=False),
+        ):
+            os.environ.pop("SBSLLM_GPU", None)
+            mock_instance = MagicMock()
+            mock_pw.return_value.start.return_value = mock_instance
+            mock_instance.chromium.launch_persistent_context.return_value = mock_context
+
+            ensure_browser()
+
+            call_kwargs = mock_instance.chromium.launch_persistent_context.call_args[1]
+            args = call_kwargs["args"]
+            for flag in browser_module.NO_GPU_ARGS:
+                assert flag in args
+            assert "--disable-gpu" in args
+
+    def test_gpu_env_var_restores_hardware_acceleration(self):
+        """SBSLLM_GPU=1 opts back into GPU acceleration."""
+        mock_context, _ = self._mock_context()
+        with (
+            patch("sbsllm.browser.sync_playwright") as mock_pw,
+            patch.dict(os.environ, {"SBSLLM_GPU": "1"}),
+            patch("sbsllm.browser._find_system_chromium", return_value=False),
+        ):
+            mock_instance = MagicMock()
+            mock_pw.return_value.start.return_value = mock_instance
+            mock_instance.chromium.launch_persistent_context.return_value = mock_context
+
+            ensure_browser()
+
+            call_kwargs = mock_instance.chromium.launch_persistent_context.call_args[1]
+            args = call_kwargs["args"]
+            for flag in browser_module.NO_GPU_ARGS:
+                assert flag not in args
+            assert "--no-first-run" in args  # base args still present
+
+    def test_is_gpu_disabled_helper(self):
+        assert browser_module.is_gpu_disabled() is True
+        with patch.dict(os.environ, {"SBSLLM_GPU": "true"}):
+            assert browser_module.is_gpu_disabled() is False
+        with patch.dict(os.environ, {"SBSLLM_GPU": "0"}):
+            assert browser_module.is_gpu_disabled() is True
+
     def test_reuses_existing_browser(self):
         mock_context, _ = self._mock_context()
         with patch("sbsllm.browser.sync_playwright") as mock_pw:

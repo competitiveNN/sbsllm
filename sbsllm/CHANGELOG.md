@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### Changed
+
+- **Chromium now launches with GPU acceleration disabled (no VRAM).**
+  The chat tabs only render text, images and video, so the browser
+  runs fully on the CPU: `--disable-gpu`,
+  `--disable-gpu-compositing`, `--disable-gpu-rasterization`,
+  `--disable-accelerated-2d-canvas`,
+  `--disable-accelerated-video-decode`,
+  `--disable-features=VaapiVideoDecoder,VaapiVideoEncoder` and
+  `--use-gl=swiftshader` are passed on every launch. WebGL then
+  reports the SwiftShader software device and WebGPU is unavailable,
+  so nothing is allocated on the graphics card. SwiftShader itself
+  stays enabled (disabling the software rasterizer too would leave
+  pages unpaintable). Set `SBSLLM_GPU=1` to restore hardware
+  acceleration. Verified by launching Chromium with the flags and
+  reading the unmasked WebGL renderer, plus launch-arg tests.
+
 ### Fixed
 
 - **meta.ai stopped forwarding prompts after the first message.**
