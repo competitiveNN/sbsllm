@@ -1598,4 +1598,125 @@ class TestPerplexityExtraction:
         result = _extract(extract_page, PERPLEXITY_TWO_TURNS, "perplexity")
         assert result["content"] == "New reply.", result["content"]
         assert "First reply." not in result["content"]
+        assert "First reply." not in (result["thinking"] or "")# --- Claude (claude.ai) fixtures ---
+# Claude renders each turn as one `div[data-testid="transcript-row"]`
+# (`data-perf-row="human"|"assistant"`). The assistant answer lives in
+# `div[data-testid="assistant-message"]` (with `data-is-streaming="true"`
+# while it is still generating) and the prose in
+# `div[data-cds="Prose"] .prose`. Every turn stays in the DOM, so the
+# extraction is scoped to the newest transcript row.
+CLAUDE_MESSAGE = """
+<div data-testid="transcript-row" data-perf-row="assistant" data-last-message="true" data-perf-row-streaming="false">
+  <div role="article">
+    <div data-testid="assistant-message" data-is-streaming="false">
+      <h2 class="sr-only select-none">Claude responded: Hi Fra!</h2>
+      <div class="font-claude-response relative leading-[1.65rem]">
+        <div data-cds="Prose" class="prose">
+          <div class="standard-markdown grid-cols-1 grid">
+            <p dir="ltr">Hi Fra! Your test message came through fine. What can I help you with?</p>
+          </div>
+        </div>
+      </div>
+      <div data-testid="message-actions" role="toolbar" aria-label="Message actions">
+        <button aria-label="Copy">Copy</button>
+        <button aria-label="Read aloud">Read aloud</button>
+        <button aria-label="Good response">Good</button>
+        <button aria-label="Bad response">Bad</button>
+        <button aria-label="Retry">Retry</button>
+        <time>just now</time>
+      </div>
+    </div>
+  </div>
+</div>
+"""
+
+CLAUDE_THINKING_ONLY = """
+<div data-testid="transcript-row" data-perf-row="assistant" data-last-message="true" data-perf-row-streaming="true">
+  <div role="article">
+    <div data-testid="assistant-message" data-is-streaming="true">
+      <h2 class="sr-only select-none">Claude is thinking</h2>
+      <div class="font-claude-response relative leading-[1.65rem]">
+        <div data-cds="Prose" class="prose">
+          <div class="standard-markdown grid-cols-1 grid"></div>
+        </div>
+      </div>
+      <div data-testid="message-actions" role="toolbar" aria-label="Message actions">
+        <button aria-label="Stop">Stop</button>
+      </div>
+    </div>
+  </div>
+</div>
+"""
+
+CLAUDE_TWO_TURNS = """
+<div data-testid="transcript-row" data-perf-row="assistant" data-last-message="false">
+  <div role="article">
+    <div data-testid="assistant-message" data-is-streaming="false">
+      <div class="font-claude-response relative leading-[1.65rem]">
+        <div data-cds="Prose" class="prose">
+          <div class="standard-markdown grid-cols-1 grid"><p dir="ltr">First reply.</p></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+<div data-testid="transcript-row" data-perf-row="assistant" data-last-message="true">
+  <div role="article">
+    <div data-testid="assistant-message" data-is-streaming="false">
+      <div class="font-claude-response relative leading-[1.65rem]">
+        <div data-cds="Prose" class="prose">
+          <div class="standard-markdown grid-cols-1 grid"><p dir="ltr">New reply.</p></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+"""
+
+
+class TestClaudeExtraction:
+    """Site-specific extraction checks for https://claude.ai/.
+
+    Claude marks the assistant turn with `data-testid="transcript-row"`
+    and the answer with `data-testid="assistant-message"` (with
+    `data-is-streaming="true"` while it is still generating). The old
+    selectors (`[data-message-author-role="assistant"]`,
+    `.assistant-message`, `[class*="assistant"] .message`) matched
+    nothing on the current DOM, so every turn returned found=false and no
+    answer or reasoning ever reached the local chat. The action bar
+    (copy / read aloud / thumbs up / thumbs down / retry), the timestamp
+    and the screen-reader "Claude responded:" heading render inside the
+    assistant-message div, so they are pruned from the answer clone.
+    """
+
+    def test_answer_relayed_without_action_bar(self, extract_page):
+        """The answer prose is read from `data-testid="assistant-message"`
+        and the action bar chrome never reaches the local chat."""
+        result = _extract(extract_page, CLAUDE_MESSAGE, "claude")
+        assert result["found"] is True
+        assert result["content"] == (
+            "Hi Fra! Your test message came through fine. "
+            "What can I help you with?"
+        ), result["content"]
+        assert "Copy" not in result["content"]
+        assert "Good response" not in result["content"]
+        assert "just now" not in result["content"]
+        assert "Claude responded" not in result["content"]
+
+    def test_thinking_only_reports_empty_answer_and_busy(self, extract_page):
+        """While the newest turn is still generating, its prose block is
+        empty: found=true, content="", and the visible Stop control keeps
+        busy=true so the poller keeps waiting."""
+        result = _extract(extract_page, CLAUDE_THINKING_ONLY, "claude")
+        assert result["found"] is True
+        assert result["content"] == "", result["content"]
+        assert result["busy"] is True
+        assert result["done"] is False
+
+    def test_newest_turn_wins_no_leak(self, extract_page):
+        """response_container scopes to the newest transcript row, so the
+        previous turn's prose never leaks in."""
+        result = _extract(extract_page, CLAUDE_TWO_TURNS, "claude")
+        assert result["content"] == "New reply.", result["content"]
+        assert "First reply." not in result["content"]
         assert "First reply." not in (result["thinking"] or "")

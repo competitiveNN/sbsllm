@@ -876,6 +876,14 @@ SITES: dict[str, dict] = {
     },
     "claude": {
         "url": "https://claude.ai/",
+        # Claude's composer is a ProseMirror contenteditable (the inject
+        # list falls back to `.ProseMirror`), which keeps its own document
+        # model. The shared _POST_INJECT_CONTENTEDITABLE path
+        # (innerText='' + execCommand('insertText')) appends to the model
+        # instead of replacing it, so the prompt accumulated on every
+        # inject and was re-sent after the first response. Use the shared
+        # composite-editor clear (synthetic Ctrl+A + Delete keydown, which
+        # the editor's keymap handles) and write exactly one copy.
         "inject": _inject_js("""
             document.querySelector('[contenteditable="true"]')
                 || document.querySelector('.ProseMirror')
@@ -887,23 +895,50 @@ SITES: dict[str, dict] = {
                 || document.querySelector('button[class*="send"]')
                 || document.querySelector('[contenteditable="true"]')?.closest('form')?.querySelector('button')
         """),
+        "post_inject_js": _POST_INJECT_COMPOSITE_EDITOR,
+        # Claude renders each turn as one `div[data-testid="transcript-row"]`
+        # (`data-perf-row="human"|"assistant"`). The assistant answer lives
+        # in `div[data-testid="assistant-message"]` (with
+        # `data-is-streaming="true"` while it is still generating) and the
+        # prose in `div[data-cds="Prose"] .prose`. The old selectors
+        # (`[data-message-author-role="assistant"]`, `.assistant-message`,
+        # `[class*="assistant"] .message`) matched nothing on the current
+        # DOM, so every turn returned found=false and no answer or reasoning
+        # ever reached the local chat. The action bar (copy / read aloud /
+        # thumbs up / thumbs down / retry), the timestamp and the
+        # screen-reader "Claude responded:" heading render inside the
+        # assistant-message div, so they are pruned from the answer clone.
+        "response_container": '[data-testid="transcript-row"]',
         "response_selectors": [
-            '[data-message-author-role="assistant"]',
-            ".assistant-message",
-            '[class*="assistant"] .message',
+            '[data-testid="assistant-message"]',
+            'div[data-cds="Prose"]',
+            ".prose",
         ],
-        "post_inject_js": _POST_INJECT_CONTENTEDITABLE,
         "thinking_selectors": [
+            '[data-testid*="thinking"]',
             '[class*="thinking"]',
             '[class*="reasoning"]',
+        ],
+        "response_exclude_selectors": [
+            "button",
+            '[role="button"]',
+            '[role="toolbar"]',
+            '[data-testid="message-actions"]',
+            '[data-testid*="action-bar"]',
+            "time",
+            "svg",
+            ".sr-only",
+            "[data-find-omitted]",
+            '[role="status"]',
+        ],
+        "loading_selectors": [
+            *_LOADING_SELECTORS,
+            '[data-testid="assistant-message"][data-is-streaming="true"]',
         ],
         "login_wall_selectors": [
             'div[data-testid="signin-button"]',
             'button[data-testid*="signin" i]',
             'a[href*="login" i]',
-        ],
-        "loading_selectors": [
-            *_LOADING_SELECTORS,
         ],
     },
     "deepseek": {
