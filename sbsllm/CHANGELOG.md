@@ -21,6 +21,32 @@
 
 ### Fixed
 
+- **Copilot sometimes never spawned a new chat.** copilot.com
+  intermittently raises a bot check: a modal
+  `role="dialog" aria-modal="true" aria-label="Security check
+  required"` ("Verification required"). While it is up, the
+  composer `div[data-testid="composer-input"]` and the send
+  button are absent from the DOM (the editor that remains is a
+  `span.fai-EditorInput__input`), so inject and submit still
+  reported `OK` against unrelated elements and no turn ever
+  started -- the request hung until the timeout and returned a
+  bare 504. Two fixes: (1) the dialog is now reported as a
+  login wall, so the server fails fast with the actionable 502
+  ("complete any security check") instead. The dialog keeps
+  computed `visibility: hidden` (its enter transition never
+  completes under automation), so the new
+  `login_wall_modal_selectors` site key matches it WITHOUT the
+  visibility gate -- only a dialog whose mere presence blocks
+  the page may be listed there. (2) The inject cascade now
+  targets the live editor (`span.fai-EditorInput__input`, then
+  the tag-agnostic `[contenteditable="true"][role="textbox"]`)
+  before the generic `[contenteditable]` fallback, which could
+  otherwise grab whatever contenteditable comes first in
+  document order (sidebar search, a "new chat" title input)
+  depending on page state. Verified against the live page
+  (extraction reports `login_wall: true` while the check is
+  up, inject marks the editor span) plus extraction and
+  inject-cascade regression tests.
 - **meta.ai stopped forwarding prompts after the first message.**
   After the first send, meta.ai navigates to `/prompt/<uuid>`, which
   renders a "Conversation title" input (`input[type="text"]`) next to

@@ -359,6 +359,7 @@ _RESPONSE_TEMPLATE = """
         const thinkingSelectors = __THINKING_SELECTORS__;
         const loadingSelectors = __LOADING_SELECTORS__;
         const loginWallSelectors = __LOGIN_WALL_SELECTORS__;
+        const loginWallModalSelectors = __LOGIN_WALL_MODAL_SELECTORS__;
         const isVisible = (element) => {
             if (!element) return false;
             const style = window.getComputedStyle(element);
@@ -772,6 +773,17 @@ _RESPONSE_TEMPLATE = """
         if (!loginWall && loginWallSelectors.length) {
             loginWall = matches(loginWallSelectors).some(isVisible);
         }
+        // Modal dialogs block the page by construction, so their
+        // presence alone is the signal -- no visibility gate. Some
+        // (copilot.com's intermittent "Security check required" bot
+        // check) keep computed visibility "hidden" because their
+        // enter transition never completes under automation, while
+        // the composer and send button are absent from the DOM and
+        // no chat can spawn. Sites opt in per selector; a merely
+        // mounted-but-hidden dialog must never be listed here.
+        if (!loginWall && loginWallModalSelectors.length) {
+            loginWall = matches(loginWallModalSelectors).length > 0;
+        }
         // Thinking HTML: the same nodes used for the reasoning trace, so the
         // pruned HTML mirrors what was relayed as thinking.
         const thinking_html = thinkingNodes
@@ -809,6 +821,7 @@ def _response_js(
     login_wall_selectors: list[str] | tuple[str, ...] | None = None,
     response_container: str | None = None,
     response_exclude_selectors: list[str] | tuple[str, ...] | None = None,
+    login_wall_modal_selectors: list[str] | tuple[str, ...] | None = None,
 ) -> str:
     """Build JS that extracts the newest assistant response from a page.
 
@@ -822,6 +835,12 @@ def _response_js(
     headers, feedback bars) from a copy of the response before its
     text is read, for sites that render that chrome inside the same
     container as the answer.
+
+    ``login_wall_modal_selectors`` match blocking modal dialogs
+    WITHOUT the visibility gate, for dialogs that keep computed
+    ``visibility: hidden`` while still blocking the composer
+    (copilot.com's security check). Only dialogs whose mere
+    presence blocks the page may be listed.
     """
     return (
         _RESPONSE_TEMPLATE.replace(
@@ -835,6 +854,10 @@ def _response_js(
         .replace("__LOADING_SELECTORS__", json.dumps(list(loading_selectors or [])))
         .replace(
             "__LOGIN_WALL_SELECTORS__", json.dumps(list(login_wall_selectors or []))
+        )
+        .replace(
+            "__LOGIN_WALL_MODAL_SELECTORS__",
+            json.dumps(list(login_wall_modal_selectors or [])),
         )
         .replace("__RESPONSE_CONTAINER__", json.dumps(response_container))
     )
@@ -1849,20 +1872,24 @@ SITES: dict[str, dict] = {
         # https://copilot.com/ — Microsoft Copilot (modern React/Fabric UI).
         #
         # Composer / input (repeat-input regression fix). The current Copilot
-        # composer is a Lexical-based contenteditable div, so the shared
+        # composer is a Lexical-based contenteditable -- on the live page it
+        # is a span.fai-EditorInput__input (role="textbox"), with no
+        # div[data-testid="composer-input"] in the DOM at all. The cascade
+        # therefore targets the editor span and the tag-agnostic
+        # [contenteditable="true"][role="textbox"] before the generic
+        # [contenteditable] fallback, which could otherwise grab whatever
+        # contenteditable comes first in document order (sidebar search,
+        # a "new chat" title input) depending on page state. The shared
         # contenteditable sync (innerText clear + execCommand insertText)
-        # appends to the editor's document model instead of replacing it.
-        # Combined with retry_with_backoff (MAX_RETRIES=3), the prompt ended
-        # up duplicated six times: the template inject appends once,
-        # post_inject appends once more, and each retry adds another round.
-        # Copilot therefore uses the robust clear from _POST_INJECT_COMPOSITE_EDITOR
-        # (synthetic Ctrl+A + Delete keydown, which Lexical's keymap handles)
-        # plus a more specific selector cascade so the first match is the
-        # composer rather than some stray contenteditable div on the page.
+        # would append to the editor's document model instead of replacing
+        # it, so the clear is delegated to _POST_INJECT_COMPOSITE_EDITOR
+        # (synthetic Ctrl+A + Delete keydown, which Lexical's keymap
+        # handles).
         "url": "https://copilot.com/",
         "inject": _inject_js("""
             document.querySelector('div[data-testid="composer-input"]')
-                || document.querySelector('div[contenteditable="true"][role="textbox"]')
+                || document.querySelector('span.fai-EditorInput__input')
+                || document.querySelector('[contenteditable="true"][role="textbox"]')
                 || document.querySelector('div[contenteditable="true"][aria-label="Message"]')
                 || document.querySelector('div[contenteditable="true"][placeholder*="Message"]')
                 || document.querySelector('div[contenteditable="true"]')
@@ -1932,6 +1959,22 @@ SITES: dict[str, dict] = {
             'a[href*="signin" i]',
             '[class*="signin"]',
             '[class*="login-modal"]',
+        ],
+        # Intermittent bot check: copilot.com sometimes raises a
+        # modal "Security check required" / "Verification required"
+        # dialog (role="dialog" aria-modal="true"). While it is up
+        # the composer div and the send button are absent from the
+        # DOM, so inject+submit report OK against unrelated elements
+        # and no new chat ever spawns -- the request just hangs
+        # until the timeout. The dialog keeps computed
+        # visibility "hidden" (its enter transition never completes
+        # under automation), so it is matched WITHOUT the visibility
+        # gate: its mere presence means the tab is blocked. Surfacing
+        # it as a login wall fails fast with the actionable 502
+        # instead of a bare 504.
+        "login_wall_modal_selectors": [
+            '[role="dialog"][aria-label*="Security check" i]',
+            '[role="dialog"][aria-label*="Verification required" i]',
         ],
         "loading_selectors": [
             *_LOADING_SELECTORS,

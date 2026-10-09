@@ -67,6 +67,27 @@ browser tab on a specific chat website (configured via `model_map`).
 
 ### Known fixes
 
+- **Copilot chat**: sometimes no new chat spawned. copilot.com
+  intermittently raises a bot check — a modal
+  `role="dialog" aria-modal="true" aria-label="Security check
+  required"` ("Verification required"). While it is up the
+  composer `div[data-testid="composer-input"]` and the send
+  button are absent from the DOM, so inject+submit reported
+  `OK` against unrelated elements and the request hung until
+  the timeout (bare 504). The dialog now surfaces as a login
+  wall (immediate, actionable 502) via the new
+  `login_wall_modal_selectors` site key, which matches WITHOUT
+  the visibility gate — the dialog keeps computed
+  `visibility: hidden` because its enter transition never
+  completes under automation, while the composer is
+  unreachable either way. Only dialogs whose mere presence
+  blocks the page may be listed there. The inject cascade
+  also now targets the live editor (`span.fai-EditorInput__input`,
+  then tag-agnostic `[contenteditable="true"][role="textbox"]`)
+  before the generic `[contenteditable]` fallback, which could
+  otherwise match whatever contenteditable comes first in
+  document order (sidebar search, a "new chat" title input)
+  depending on page state.
 - **Meta chat**: response selection prefers `data-testid="assistant-message"`.
   The `[class*="assistant-message"]` catch-all also matched the action bar
   (`group/assistant-message-actions`) and, being the last match, won — so

@@ -120,6 +120,7 @@ def _extract(page, html, site_id="zai"):
         site.get("login_wall_selectors", []),
         site.get("response_container"),
         site.get("response_exclude_selectors", []),
+        site.get("login_wall_modal_selectors", []),
     )
     return page.evaluate(js)
 
@@ -1310,6 +1311,31 @@ COPIL_TWO_MESSAGES = """
 </div>
 """
 
+# Intermittent bot check on copilot.com: a modal
+# role="dialog" aria-modal="true" aria-label="Security check required"
+# (body text "Verification required"). While it is up the composer div
+# and the send button are absent from the DOM, so inject+submit report
+# OK against unrelated elements and no new chat spawns -- the request
+# hangs until the response timeout. The dialog must therefore be
+# reported as a login wall so the server fails fast with the
+# actionable 502 instead.
+COPIL_SECURITY_CHECK = """
+<div id="copilot-message-old1" class="fai-CopilotMessage__content">
+  <div dir="auto"><div data-testid="chat-response-message"></div>
+  <div>
+    <div data-testid="lastChatMessage">
+      <div data-testid="markdown-reply" data-message-type="Chat">
+        <p>Previous answer.</p>
+      </div>
+    </div>
+  </div>
+</div>
+<div role="dialog" aria-modal="true" aria-label="Security check required">
+  <div><span>Verification required</span></div>
+  <div></div>
+</div>
+"""
+
 
 class TestCopilotExtraction:
     """Site-specific extraction checks for https://copilot.com/.
@@ -1365,6 +1391,22 @@ class TestCopilotExtraction:
         assert result["content"] == "New reply.", result["content"]
         assert "First reply." not in result["content"]
         assert "First reply." not in (result["thinking"] or "")
+
+    def test_security_check_dialog_flags_login_wall(self, extract_page):
+        """The intermittent "Security check required" modal blocks the
+        composer: while it is up the send button is absent, so no new
+        chat spawns and the request would hang until the response
+        timeout. The dialog must be reported as a login wall so the
+        server fails fast with the actionable error instead."""
+        result = _extract(extract_page, COPIL_SECURITY_CHECK, "copilot")
+        assert result["login_wall"] is True
+
+    def test_no_login_wall_on_healthy_page(self, extract_page):
+        """The security-check selectors must not false-positive on a
+        normal conversation page (the modal is the only login-wall
+        signal added, and it is absent here)."""
+        result = _extract(extract_page, COPIL_MESSAGE, "copilot")
+        assert result["login_wall"] is False
 
 
 # --- Mistral (chat.mistral.ai) fixtures ---

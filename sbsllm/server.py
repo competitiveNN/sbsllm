@@ -1291,7 +1291,8 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                 if response.get("login_wall"):
                     detail = (
                         f"The {site_id} chat requires a signed-in session. "
-                        f"Please log in to {site_id} in the browser tab, then retry."
+                        f"Please log in to {site_id} in the browser tab "
+                        f"(and complete any security check), then retry."
                     )
                 else:
                     detail = {
@@ -2117,7 +2118,8 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                     self._send_error(
                         502,
                         f"The {site_id} chat requires a signed-in session. "
-                        f"Please log in to {site_id} in the browser tab, then retry.",
+                        f"Please log in to {site_id} in the browser tab "
+                        f"(and complete any security check), then retry.",
                         "server_error",
                         request_id,
                         model=model,
@@ -2575,7 +2577,10 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                     "model": tab_model,
                     "error_type": "login_required",
                     "status_code": 502,
-                    "message": (f"The {site_id} chat requires a signed-in session."),
+                    "message": (
+                        f"The {site_id} chat requires a signed-in session "
+                        f"(complete any security check shown in the tab)."
+                    ),
                 }
             return {
                 "model": tab_model,

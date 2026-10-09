@@ -100,6 +100,21 @@ class TestInjectPrompt:
         result = inject_prompt("zai", "test")
         assert "NO_MARKED_INPUT" in result  # zai post_inject checks for marked input
 
+    def test_copilot_inject_targets_editor_span(self):
+        """The live copilot.com composer is a span.fai-EditorInput__input
+        (role="textbox") -- div[data-testid="composer-input"] is absent
+        from the current DOM. The cascade must target the editor span and
+        the tag-agnostic role-textbox selector, both BEFORE the generic
+        [contenteditable] fallback, or the prompt can land in whatever
+        contenteditable comes first in document order (sidebar search,
+        a "new chat" title input) depending on page state."""
+        result = inject_prompt("copilot", "test")
+        assert "span.fai-EditorInput__input" in result
+        assert '[contenteditable="true"][role="textbox"]' in result
+        assert result.index("span.fai-EditorInput__input") < result.index(
+            "'[contenteditable]'"
+        )
+
     def test_post_inject_separated_by_semicolon(self):
         """post_inject_js must be separated from the main IIFE by a semicolon."""
         result = inject_prompt("grok", "test")
