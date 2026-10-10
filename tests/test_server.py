@@ -1074,6 +1074,109 @@ class TestOpenAIHandlerChatCompletions:
         assert "signed-in session" in call_args[1]
         assert call_args[3] == "test-request-id"
 
+    def test_non_streaming_popup_returns_503(self):
+        """A blocking popup detected while polling must surface as
+        503 'temporarily unavailable', not a generic timeout."""
+        body = json.dumps(
+            {"model": "gpt-4", "messages": [{"role": "user", "content": "Hello!"}]}
+        ).encode()
+        handler = self._make_handler(body)
+
+        patches = self._patch_success(
+            {
+                "found": False,
+                "content": "",
+                "thinking": None,
+                "popup": True,
+                "popup_text": "Verification required",
+                "done": False,
+            }
+        )
+        with (
+            patches[0],
+            patches[1],
+            patches[2],
+            patches[3],
+            patches[4],
+            patches[5],
+            patches[6],
+            patches[7],
+        ):
+            OpenAIHandler._handle_chat_completions(handler)
+
+        handler._send_error.assert_called_once()
+        call_args = handler._send_error.call_args[0]
+        assert call_args[0] == 503
+        assert "temporarily unavailable" in call_args[1]
+        assert "Verification required" in call_args[1]
+
+    def test_non_streaming_popup_over_completed_answer_returns_200(self):
+        """A popup over a COMPLETED turn blocks nothing: the
+        answer already on screen is returned, not a 503."""
+        body = json.dumps(
+            {"model": "gpt-4", "messages": [{"role": "user", "content": "Hello!"}]}
+        ).encode()
+        handler = self._make_handler(body)
+
+        patches = self._patch_success(
+            {
+                "found": True,
+                "content": "the answer",
+                "thinking": None,
+                "popup": True,
+                "popup_text": "Cookie consent",
+                "done": True,
+            }
+        )
+        with (
+            patches[0],
+            patches[1],
+            patches[2],
+            patches[3],
+            patches[4],
+            patches[5],
+            patches[6],
+            patches[7],
+        ):
+            OpenAIHandler._handle_chat_completions(handler)
+
+        handler._send_json.assert_called_once()
+        data = handler._send_json.call_args[0][1]
+        assert data["choices"][0]["message"]["content"] == "the answer"
+        handler._send_error.assert_not_called()
+
+    def test_pre_submit_popup_returns_503(self):
+        """A popup already up before the submit fails fast with
+        503 instead of injecting into a page the user cannot
+        see and hanging until the timeout."""
+        body = json.dumps(
+            {"model": "gpt-4", "messages": [{"role": "user", "content": "Hello!"}]}
+        ).encode()
+        handler = self._make_handler(body)
+
+        with (
+            patch("sbsllm.server.inject_prompt", return_value="inject_js"),
+            patch("sbsllm.server.submit_js", return_value="submit_js"),
+            patch("sbsllm.server.extract_js", return_value="EXTRACT_JS"),
+            patch("sbsllm.server.check_page_health", return_value=True),
+            patch("sbsllm.server.popup_check_js", return_value="POPUP_JS"),
+            patch(
+                "sbsllm.server.check_popup",
+                return_value={"popup": True, "popup_text": "Security check required"},
+            ),
+            patch(
+                "sbsllm.server.capture_response",
+                return_value={"found": False, "count": 0},
+            ),
+        ):
+            OpenAIHandler._handle_chat_completions(handler)
+
+        handler._send_error.assert_called_once()
+        call_args = handler._send_error.call_args[0]
+        assert call_args[0] == 503
+        assert "temporarily unavailable" in call_args[1]
+        assert "Security check required" in call_args[1]
+
 
 class TestRequestParsingEdgeCases:
     """Test request parsing edge cases."""
@@ -2530,6 +2633,65 @@ class TestSSEConformance:
         for call in chunk_calls[:-1]:
             assert "usage" not in call[1]
             assert call[1].get("finish_reason") is None
+
+    def test_streaming_pre_submit_popup_returns_503(self):
+        """A popup blocking the page before the submit surfaces
+        as a real 503: the SSE headers are not sent yet."""
+        handler = self._make_handler()
+        handler._inject_and_submit_with_recovery = MagicMock(
+            return_value=(
+                {
+                    "tab": 1,
+                    "inject": None,
+                    "submit": None,
+                    "popup": "Security check required",
+                },
+                MagicMock(),
+            )
+        )
+        self._run_success(handler)
+
+        handler._send_error.assert_called_once()
+        call_args = handler._send_error.call_args[0]
+        assert call_args[0] == 503
+        assert "temporarily unavailable" in call_args[1]
+        assert "Security check required" in call_args[1]
+        # The stream never started.
+        handler._send_sse_headers.assert_not_called()
+        handler._sse_chunk.assert_not_called()
+
+    def test_streaming_mid_generation_popup_sends_sse_error(self):
+        """A popup appearing once the stream is running cannot
+        change the HTTP status, so the error rides the SSE
+        channel as the payload."""
+        handler = self._make_handler()
+
+        def fake_stream(*_args, **_kwargs):
+            return {
+                "content": "",
+                "thinking": None,
+                "done": False,
+                "stop_reason": "popup",
+                "popup_text": "Session expired",
+            }
+
+        handler._stream_web_chat = MagicMock(side_effect=fake_stream)
+        self._run_success(handler)
+
+        # Headers were already committed: no HTTP error status.
+        handler._send_error.assert_not_called()
+        handler._send_sse_headers.assert_called_once()
+        chunk_calls = handler._sse_chunk.call_args_list
+        assert chunk_calls
+        payloads = [c.args[3] for c in chunk_calls if len(c.args) > 3]
+        assert any(
+            "temporarily unavailable" in (p.get("content") or "")
+            for p in payloads
+        )
+        # The terminal chunk signals truncation, not a clean stop.
+        terminal = chunk_calls[-1]
+        assert terminal[1]["finish_reason"] == "length"
+        handler._send_sse.assert_called_once_with("[DONE]")
 
     def test_terminal_chunk_precedes_done_sentinel(self):
         """Wire order: delta chunks, then the terminal chunk

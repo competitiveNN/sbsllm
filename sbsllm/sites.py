@@ -352,6 +352,17 @@ _LOADING_SELECTORS = [
     '[aria-busy="true"]',
 ]
 
+# Generic blocking-popup selectors, applied to every service unless a
+# site overrides "popup_selectors". A visible modal dialog (or alert
+# dialog) blocks the composer, so the chat is unusable while one is
+# up: the request fails fast with a "temporarily unavailable" error
+# instead of hanging until the timeout. Sites may extend the list
+# (their own modal chrome) or set "popup_selectors": [] to opt out.
+_POPUP_SELECTORS = [
+    '[role="dialog"][aria-modal="true"]',
+    '[role="alertdialog"]',
+]
+
 _RESPONSE_TEMPLATE = """
     (() => {
         const responseSelectors = __RESPONSE_SELECTORS__;
@@ -360,6 +371,7 @@ _RESPONSE_TEMPLATE = """
         const loadingSelectors = __LOADING_SELECTORS__;
         const loginWallSelectors = __LOGIN_WALL_SELECTORS__;
         const loginWallModalSelectors = __LOGIN_WALL_MODAL_SELECTORS__;
+        const popupSelectors = __POPUP_SELECTORS__;
         const isVisible = (element) => {
             if (!element) return false;
             const style = window.getComputedStyle(element);
@@ -784,6 +796,21 @@ _RESPONSE_TEMPLATE = """
         if (!loginWall && loginWallModalSelectors.length) {
             loginWall = matches(loginWallModalSelectors).length > 0;
         }
+        // A blocking popup anywhere on the page — deliberately NOT
+        // scoped to the turn container: a modal dialog overlays the
+        // whole chat, and any answer still on screen belongs to an
+        // earlier turn. Only VISIBLE dialogs count; sites keep their
+        // hidden-but-blocking dialogs in loginWallModalSelectors
+        // instead (copilot's security check never completes its
+        // enter transition under automation, so it stays invisible).
+        const popupNodes = popupSelectors.length
+            ? matches(popupSelectors).filter(isVisible)
+            : [];
+        const popupText = popupNodes
+            .map((node) => squash(textOf(node)))
+            .filter(Boolean)
+            .slice(0, 3)
+            .join(' | ');
         // Thinking HTML: the same nodes used for the reasoning trace, so the
         // pruned HTML mirrors what was relayed as thinking.
         const thinking_html = thinkingNodes
@@ -807,6 +834,8 @@ _RESPONSE_TEMPLATE = """
             // that a logged-out home page (where `found` is legitimately
             // false) does not trigger a false positive.
             login_wall: loginWall,
+            popup: popupNodes.length > 0,
+            popup_text: popupText,
             content_html: content_html,
             thinking_html: thinking_html,
         };
@@ -822,6 +851,7 @@ def _response_js(
     response_container: str | None = None,
     response_exclude_selectors: list[str] | tuple[str, ...] | None = None,
     login_wall_modal_selectors: list[str] | tuple[str, ...] | None = None,
+    popup_selectors: list[str] | tuple[str, ...] | None = None,
 ) -> str:
     """Build JS that extracts the newest assistant response from a page.
 
@@ -841,6 +871,12 @@ def _response_js(
     ``visibility: hidden`` while still blocking the composer
     (copilot.com's security check). Only dialogs whose mere
     presence blocks the page may be listed.
+
+    ``popup_selectors`` match VISIBLE blocking popups (modal dialogs)
+    on the page. It defaults to the shared ``_POPUP_SELECTORS``
+    (``role="dialog"[aria-modal]`` / ``role="alertdialog"``) so every
+    service detects blocking popups; a site overrides it to extend or
+    disable (``[]``) the detection.
     """
     return (
         _RESPONSE_TEMPLATE.replace(
@@ -858,6 +894,16 @@ def _response_js(
         .replace(
             "__LOGIN_WALL_MODAL_SELECTORS__",
             json.dumps(list(login_wall_modal_selectors or [])),
+        )
+        .replace(
+            "__POPUP_SELECTORS__",
+            json.dumps(
+                list(
+                    popup_selectors
+                    if popup_selectors is not None
+                    else _POPUP_SELECTORS
+                )
+            ),
         )
         .replace("__RESPONSE_CONTAINER__", json.dumps(response_container))
     )

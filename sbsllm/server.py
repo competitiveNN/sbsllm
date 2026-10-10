@@ -29,12 +29,13 @@ from .browser import (
     ResponsePoller,
     capture_response,
     check_page_health,
+    check_popup,
     get_page_snapshot,
     inject_and_submit,
     is_new_response,
     wait_for_response,
 )
-from .inject import extract_js, inject_prompt, submit_js
+from .inject import extract_js, inject_prompt, popup_check_js, submit_js
 from .sites import SITES, get_site
 
 # Logger for structured JSON state transition events in streaming.
@@ -106,6 +107,20 @@ def _convert_response(site_id: str, response: dict) -> dict:
         if md_thinking:
             new["thinking"] = md_thinking
     return new
+
+
+def _popup_error_message(site_id: str, popup_text: str) -> str:
+    """Client-facing error for a request blocked by a popup."""
+    detail = (
+        f"The {site_id} chat is temporarily unavailable: a popup or "
+        "dialog is blocking the page"
+    )
+    if popup_text:
+        detail += f' ("{popup_text[:120]}")'
+    return detail + (
+        ". Close it in the browser tab (or complete any security "
+        "check or sign-in it asks for), then retry."
+    )
 
 
 # Default server settings
@@ -668,6 +683,29 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                 "submit": None,
             }
 
+        # A blocking popup makes the chat unusable: fail fast with
+        # an actionable error instead of injecting into a page the
+        # user cannot see and hanging until the timeout. This runs
+        # on every inject path (single, streaming, multi), so one
+        # check covers them all.
+        popup = check_popup(page, popup_check_js(site_id))
+        if popup.get("popup"):
+            logger = logging.getLogger(__name__)
+            logger.warning(
+                "chat_completion popup_blocked",
+                extra={
+                    "site_id": site_id,
+                    "tab_index": tab_index,
+                    "popup_text": popup.get("popup_text", ""),
+                },
+            )
+            return {
+                "tab": tab_index,
+                "inject": None,
+                "submit": None,
+                "popup": popup.get("popup_text", ""),
+            }
+
         return inject_and_submit(page, inject_js, submit_js_val, tab_index)
 
     def _inject_and_submit_with_recovery(
@@ -894,6 +932,7 @@ class OpenAIHandler(BaseHTTPRequestHandler):
           * a reasoning-only stall outlasting the thinking patience
             (`thinking_timeout`),
           * no output at all after the prompt (`no_output`),
+          * a blocking popup appearing on the page (`popup`),
           * the overall budget elapsing (`budget_exhausted`).
 
         The termination rules themselves live in ResponsePoller, shared with
@@ -1197,6 +1236,38 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                     error_type="browser_error",
                 )
                 return
+            if isinstance(status, dict) and status.get("popup") is not None:
+                # The pre-submit popup check fired: the chat is
+                # blocked by a modal dialog. Headers are not sent
+                # yet, so a real 503 reaches the client.
+                popup_text = str(status.get("popup") or "")
+                logger.warning(
+                    "chat_completion popup_blocked",
+                    extra={
+                        "model": model,
+                        "site_id": site_id,
+                        "tab_index": tab_index,
+                        "request_id": request_id,
+                        "stream": True,
+                        "popup_text": popup_text,
+                    },
+                )
+                self._send_error(
+                    503,
+                    _popup_error_message(site_id, popup_text),
+                    "server_error",
+                    request_id,
+                    model=model,
+                    site_id=site_id,
+                    tab_index=tab_index,
+                    code="popup_blocked",
+                )
+                _update_metrics(
+                    time.monotonic() - request_start,
+                    error=True,
+                    error_type="popup_blocked",
+                )
+                return
             if not duplicate and (
                 status.get("inject") != "OK"
                 or status.get("submit")
@@ -1269,6 +1340,44 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             thinking = response.get("thinking")
             stop_reason = response.get("stop_reason", "unknown")
             stopped_cleanly = bool(response.get("done"))
+            if stop_reason == "popup":
+                # A blocking popup appeared mid-generation (or
+                # before the first token). The SSE headers are
+                # already committed, so the error is relayed as
+                # the stream payload instead of an HTTP status.
+                popup_text = str(response.get("popup_text") or "")
+                logger.warning(
+                    "chat_completion popup_blocked",
+                    extra={
+                        "model": model,
+                        "site_id": site_id,
+                        "tab_index": tab_index,
+                        "request_id": request_id,
+                        "stream": True,
+                        "popup_text": popup_text,
+                    },
+                )
+                _update_metrics(
+                    time.monotonic() - request_start,
+                    error=True,
+                    error_type="popup_blocked",
+                )
+                self._sse_chunk(
+                    completion_id,
+                    created,
+                    model,
+                    {"content": f"[sbsllm] {_popup_error_message(site_id, popup_text)}"},
+                )
+                self._sse_chunk(
+                    completion_id,
+                    created,
+                    model,
+                    {},
+                    finish_reason="length",
+                    usage=_usage_fields(prompt, "", None),
+                )
+                self._send_sse("[DONE]")
+                return
             elapsed = time.monotonic() - request_start
             logger.info(
                 "chat_completion stream_end",
@@ -1941,6 +2050,39 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                 time.monotonic() - request_start, error=True, error_type="browser_error"
             )
             return
+        if status.get("popup") is not None:
+            # The pre-submit popup check fired: a modal dialog
+            # blocks the chat. Say so with the temporary-
+            # unavailable error instead of a misleading
+            # "failed to inject" (nothing was injected on
+            # purpose).
+            popup_text = str(status.get("popup") or "")
+            logger.warning(
+                "chat_completion popup_blocked",
+                extra={
+                    "model": model,
+                    "site_id": site_id,
+                    "tab_index": tab_index,
+                    "request_id": request_id,
+                    "popup_text": popup_text,
+                },
+            )
+            self._send_error(
+                503,
+                _popup_error_message(site_id, popup_text),
+                "server_error",
+                request_id,
+                model=model,
+                site_id=site_id,
+                tab_index=tab_index,
+                code="popup_blocked",
+            )
+            _update_metrics(
+                time.monotonic() - request_start,
+                error=True,
+                error_type="popup_blocked",
+            )
+            return
         if not duplicate and (
             status.get("inject") != "OK"
             or status.get("submit")
@@ -2057,6 +2199,41 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                 )
                 _update_metrics(
                     time.monotonic() - request_start, error=True, error_type="timeout"
+                )
+                return
+            if response_result.get("popup") and not response_result.get(
+                "done"
+            ):
+                # A blocking popup was up before the submit or
+                # appeared mid-generation: the chat is unusable.
+                # A popup over a COMPLETED turn (done=True) does
+                # not block the answer already on screen, so that
+                # capture is returned instead.
+                popup_text = str(response_result.get("popup_text") or "")
+                logger.warning(
+                    "chat_completion popup_blocked",
+                    extra={
+                        "model": model,
+                        "site_id": site_id,
+                        "tab_index": tab_index,
+                        "request_id": request_id,
+                        "popup_text": popup_text,
+                    },
+                )
+                self._send_error(
+                    503,
+                    _popup_error_message(site_id, popup_text),
+                    "server_error",
+                    request_id,
+                    model=model,
+                    site_id=site_id,
+                    tab_index=tab_index,
+                    code="popup_blocked",
+                )
+                _update_metrics(
+                    time.monotonic() - request_start,
+                    error=True,
+                    error_type="popup_blocked",
                 )
                 return
             if response_result.get("no_output"):
@@ -2486,6 +2663,17 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                         "status_code": 502,
                         "message": (f"Browser error from {site_id}: {browser_error}."),
                     }
+                if status.get("popup") is not None:
+                    # Pre-submit popup check fired on this tab:
+                    # the chat is blocked by a modal dialog.
+                    return {
+                        "model": tab_model,
+                        "error_type": "popup_blocked",
+                        "status_code": 503,
+                        "message": _popup_error_message(
+                            site_id, str(status.get("popup") or "")
+                        ),
+                    }
                 if status.get("inject") != "OK" or status.get("submit") not in {
                     "OK",
                     "ENTER_SENT",
@@ -2511,6 +2699,22 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                     convert=lambda r: _convert_response(site_id, r),
                     **self._response_wait_kwargs(),
                 )
+                if response_result.get("popup") and not response_result.get(
+                    "done"
+                ):
+                    # A blocking popup appeared mid-generation on
+                    # this tab: strict failure semantics, like
+                    # every other per-tab error. A popup over a
+                    # completed turn does not block its answer.
+                    return {
+                        "model": tab_model,
+                        "error_type": "popup_blocked",
+                        "status_code": 503,
+                        "message": _popup_error_message(
+                            site_id,
+                            str(response_result.get("popup_text") or ""),
+                        ),
+                    }
         except BrowserError as e:
             return {
                 "model": tab_model,

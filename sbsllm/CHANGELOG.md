@@ -4,6 +4,30 @@
 
 ### Changed
 
+- **Blocking popups now fail fast with a "temporarily
+  unavailable" error (all services).** A visible modal dialog
+  (`role="dialog"[aria-modal="true"]` or `role="alertdialog"`)
+  blocks the composer, so a request that arrives while one is
+  up used to inject into a page the user cannot see and hang
+  until the timeout. Every service now carries the shared
+  `popup_selectors` default (extend it per-site, or set
+  `"popup_selectors": []` to opt out), checked twice:
+  (1) before inject+submit — the request ends immediately
+  with a 503 naming the popup's text; (2) on every poll —
+  the shared `ResponsePoller` stops with a `popup` stop
+  reason the moment a dialog appears mid-generation (a
+  503 on the non-streaming path; an SSE error payload on
+  the streaming path, whose HTTP status is already
+  committed; a per-tab 503 that fails the whole `multi`
+  request, matching the strict fan-out failure semantics).
+  A popup that arrives after the turn completed (a cookie
+  banner popping up once the answer is on screen) blocks
+  nothing, so that answer is returned rather than failed.
+  Hidden-but-blocking dialogs (copilot's security check,
+  whose enter transition never completes under automation)
+  stay in `login_wall_modal_selectors` and keep the 502
+  login-wall error.
+
 - **Chromium now launches with GPU acceleration disabled (no VRAM).**
   The chat tabs only render text, images and video, so the browser
   runs fully on the CPU: `--disable-gpu`,
@@ -20,6 +44,25 @@
   reading the unmasked WebGL renderer, plus launch-arg tests.
 
 ### Fixed
+
+- **Every request force-switched the visible browser tab.**
+  `_do_inject_and_submit` called `page.bring_to_front()`
+  before injecting, so with several chats open each request
+  yanked its own tab to the front — the "copilot steals
+  focus" report was our own code, not the site (copilot.com
+  never calls `window.focus()`). Playwright drives
+  background pages fine (the inject JS already focuses the
+  composer element itself), so the call and its settle
+  sleep are gone; tabs are now driven in the background.
+
+- **The login-wall 502 could never fire.** The extraction
+  JS reports `login_wall`, but `_normalize_response`
+  whitelisted fields and dropped it, so the server's
+  `response.get("login_wall")` was always false and a
+  logged-out chat degraded to a generic 504 instead of
+  the actionable "requires a signed-in session" error.
+  `login_wall` (and the new `popup`/`popup_text`) are
+  now passed through normalization.
 
 - **Copilot sometimes never spawned a new chat.** copilot.com
   intermittently raises a bot check: a modal

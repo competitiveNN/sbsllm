@@ -1,8 +1,10 @@
 """Tests for inject.py."""
 
+import json
+
 import pytest
 
-from sbsllm.inject import escape_prompt, inject_prompt, submit_js
+from sbsllm.inject import escape_prompt, inject_prompt, popup_check_js, submit_js
 
 
 class TestEscapePrompt:
@@ -397,6 +399,64 @@ class TestInjectPrompt:
             assert "[]" in result
         finally:
             inject_module.get_site = original
+
+
+class TestPopupCheckJs:
+    def test_default_selectors_embedded(self):
+        """The shared blocking-popup selectors are the default."""
+        result = popup_check_js("chatgpt")
+        # Selectors are JSON-encoded into the JS, so compare
+        # against their json.dumps form.
+        assert json.dumps('[role="dialog"][aria-modal="true"]') in result
+        assert json.dumps('[role="alertdialog"]') in result
+        assert "(() => {" in result
+        assert "popup: nodes.length > 0" in result
+
+    def test_returns_dict_shape(self):
+        """The check JS evaluates to a {popup, popup_text} object."""
+        result = popup_check_js("chatgpt")
+        assert "popup: nodes.length > 0" in result
+        assert "popup_text" in result
+
+    def test_site_override_respected(self):
+        """A site's popup_selectors replace the default set."""
+        import sbsllm.inject as inject_module
+
+        original = inject_module.get_site
+        try:
+            inject_module.get_site = lambda sid: {
+                "url": "https://example.com/",
+                "popup_selectors": ["#maintenance-wall"],
+            }
+            result = popup_check_js("fake")
+            assert "#maintenance-wall" in result
+            assert json.dumps('[role="dialog"][aria-modal="true"]') not in result
+        finally:
+            inject_module.get_site = original
+
+    def test_empty_override_disables_check(self):
+        """popup_selectors: [] disables popup detection."""
+        import sbsllm.inject as inject_module
+
+        original = inject_module.get_site
+        try:
+            inject_module.get_site = lambda sid: {
+                "url": "https://example.com/",
+                "popup_selectors": [],
+            }
+            result = popup_check_js("fake")
+            assert "selectors = []" in result
+        finally:
+            inject_module.get_site = original
+
+    def test_extract_js_embeds_default_popup_selectors(self):
+        """The extraction JS carries the popup selectors so the
+        poller can detect a popup that appears mid-generation."""
+        from sbsllm.inject import extract_js
+
+        result = extract_js("chatgpt")
+        assert "popupSelectors" in result
+        assert json.dumps('[role="dialog"][aria-modal="true"]') in result
 
 
 class TestSubmitJs:

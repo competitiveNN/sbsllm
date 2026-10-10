@@ -1409,6 +1409,121 @@ class TestCopilotExtraction:
         assert result["login_wall"] is False
 
 
+# --- Blocking popup detection (all services) ---
+# A visible modal dialog blocks the composer, so the chat is
+# unusable while one is up. The generic selectors match any
+# aria-modal dialog or alertdialog; sites extend or disable them
+# via "popup_selectors".
+POPUP_VISIBLE = """
+<div id="response-content-container"><div class="markdown-prose">
+  <p>an answer from an earlier turn</p>
+</div></div>
+<div role="dialog" aria-modal="true" aria-label="Session expired">
+  <p>Your session has expired. Please sign in again.</p>
+</div>
+"""
+
+POPUP_HIDDEN = """
+<div id="response-content-container"><div class="markdown-prose">
+  <p>answer</p>
+</div></div>
+<div role="dialog" aria-modal="true" style="visibility: hidden">
+  <p>still entering…</p>
+</div>
+"""
+
+POPUP_ALERTDIALOG = """
+<div id="response-content-container"><div class="markdown-prose">
+  <p>answer</p>
+</div></div>
+<div role="alertdialog"><p>You have been logged out.</p></div>
+"""
+
+POPUP_NONMODAL = """
+<div id="response-content-container"><div class="markdown-prose">
+  <p>answer</p>
+</div></div>
+<div role="dialog">
+  <p>a non-modal popover must not block the chat</p>
+</div>
+"""
+
+
+class TestPopupDetection:
+    def test_visible_modal_flags_popup(self, extract_page):
+        """A visible aria-modal dialog is a blocking popup."""
+        result = _extract(extract_page, POPUP_VISIBLE)
+        assert result["popup"] is True
+        assert "session has expired" in (result["popup_text"] or "").lower()
+
+    def test_alertdialog_flags_popup(self, extract_page):
+        result = _extract(extract_page, POPUP_ALERTDIALOG)
+        assert result["popup"] is True
+        assert "logged out" in (result["popup_text"] or "").lower()
+
+    def test_hidden_modal_is_not_a_popup(self, extract_page):
+        """Hidden-but-blocking dialogs stay in the site's
+        login_wall_modal_selectors (copilot's security check);
+        the generic popup detection only sees visible ones."""
+        result = _extract(extract_page, POPUP_HIDDEN)
+        assert result["popup"] is False
+
+    def test_non_modal_dialog_is_not_a_popup(self, extract_page):
+        """A plain role="dialog" without aria-modal does not
+        block the page (popovers, menus) and must not fail
+        the request."""
+        result = _extract(extract_page, POPUP_NONMODAL)
+        assert result["popup"] is False
+
+    def test_no_popup_on_clean_page(self, extract_page):
+        result = _extract(extract_page, ZAI_COLLAPSED_THINKING)
+        assert result["popup"] is False
+        assert result["popup_text"] == ""
+
+    def test_custom_popup_selectors(self, extract_page):
+        """A site's own popup_selectors override the default set."""
+        extract_page.set_content(
+            "<html><body>"
+            '<div id="response-content-container"><div class="markdown-prose">'
+            "<p>answer</p></div></div>"
+            '<div id="custom-wall"><p>Maintenance window</p></div>'
+            "</body></html>"
+        )
+        js = _response_js(
+            SITES["zai"]["response_selectors"],
+            SITES["zai"]["thinking_selectors"],
+            SITES["zai"]["loading_selectors"],
+            SITES["zai"].get("login_wall_selectors", []),
+            SITES["zai"].get("response_container"),
+            SITES["zai"].get("response_exclude_selectors", []),
+            SITES["zai"].get("login_wall_modal_selectors", []),
+            ["#custom-wall"],
+        )
+        result = extract_page.evaluate(js)
+        assert result["popup"] is True
+        assert "maintenance window" in (result["popup_text"] or "").lower()
+
+    def test_empty_popup_selectors_disable_detection(self, extract_page):
+        """popup_selectors: [] opts a site out of popup detection."""
+        extract_page.set_content(
+            "<html><body>"
+            '<div role="dialog" aria-modal="true"><p>Blocked</p></div>'
+            "</body></html>"
+        )
+        js = _response_js(
+            SITES["zai"]["response_selectors"],
+            SITES["zai"]["thinking_selectors"],
+            SITES["zai"]["loading_selectors"],
+            SITES["zai"].get("login_wall_selectors", []),
+            SITES["zai"].get("response_container"),
+            SITES["zai"].get("response_exclude_selectors", []),
+            SITES["zai"].get("login_wall_modal_selectors", []),
+            [],
+        )
+        result = extract_page.evaluate(js)
+        assert result["popup"] is False
+
+
 # --- Mistral (chat.mistral.ai) fixtures ---
 # Mistral renders each turn as one `div.flex.w-full.flex-col.gap-1.break-words`
 # containing two `data-message-part` subtrees: the reasoning disclosure

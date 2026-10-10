@@ -818,6 +818,13 @@ def _normalize_response(result: Any) -> dict:
         "count": int(result.get("count") or 0),
         "content_html": result.get("content_html"),
         "thinking_html": result.get("thinking_html"),
+        # Pass the auth/popup signals through: the server turns a
+        # login wall into a 502 and a blocking popup into a 503,
+        # so dropping them here silently downgrades both to a
+        # generic timeout.
+        "login_wall": bool(result.get("login_wall")),
+        "popup": bool(result.get("popup")),
+        "popup_text": result.get("popup_text") or "",
     }
 
 
@@ -936,12 +943,12 @@ class ResponsePoller:
     ``idle_timeout`` of 0 as "finished immediately". Every
     termination rule lives here now, so both paths agree by
     construction -- change a rule in this class only.
-
     ``observe`` records one captured payload and returns a stop
     reason (``site_done``, ``idle``, ``busy_timeout``,
-    ``thinking_timeout``, ``no_output``) or ``None`` to keep
-    polling. ``is_new`` and ``changed`` are exposed for callers
-    that react to payload movement (the streaming loop emits SSE
+    ``thinking_timeout``, ``no_output``, ``popup``) or ``None``
+    to keep polling. ``is_new`` and ``changed`` are exposed for
+    callers that react to payload movement (the streaming loop
+    emits SSE
     deltas from them).
     """
 
@@ -976,7 +983,26 @@ class ResponsePoller:
         self.last_thinking = ""
 
     def observe(self, current: dict, now: float) -> str | None:
-        """Record one captured payload; return a stop reason or None."""
+        """Record one captured payload; return a stop reason or None.
+
+        Stop reasons: ``site_done``, ``idle``, ``busy_timeout``,
+        ``thinking_timeout``, ``no_output``, ``popup``.
+        """
+        # A blocking popup makes the chat unusable no matter what the
+        # payload says: stop polling immediately. Checked before the
+        # is_new gate so a popup that appears with no other payload
+        # movement still ends the wait. A popup that arrives AFTER the
+        # turn completed (a cookie banner or session-expiry modal
+        # popping up once the answer is on screen) does not block
+        # anything: the answer is returned, not failed.
+        if current.get("popup") and not (
+            current.get("done") and not current.get("busy")
+        ):
+            self._log.debug(
+                "response_state: popup",
+                extra={**self._context, "popup_text": current.get("popup_text")},
+            )
+            return "popup"
         busy = bool(current.get("busy"))
         content = current.get("content") or ""
         thinking = current.get("thinking") or ""
@@ -1185,6 +1211,11 @@ def wait_for_response(
         if stop == "no_output":
             current["no_output"] = True
             return _with_last_thinking(current, seen_thinking)
+        if stop == "popup":
+            # A blocking popup appeared mid-generation: the answer,
+            # if any, is unreachable. Return the capture as-is; the
+            # popup/popup_text fields travel with it.
+            return _with_last_thinking(current, seen_thinking)
         last = current
         time.sleep(max(float(poll_interval), 0.01))
     _state_logger.debug(
@@ -1204,10 +1235,6 @@ def _do_inject_and_submit(
     status = {"tab": tab_index, "inject": None, "submit": None}
 
     try:
-        # Bring page to front
-        page.bring_to_front()
-        time.sleep(0.3)
-
         # Check if page is still valid (not closed)
         if page.is_closed():
             logger.warning(f"Page {tab_index} is closed")
@@ -1256,6 +1283,29 @@ def inject_and_submit(
     return run_in_browser_thread(
         _do_inject_and_submit, page, inject_js, submit_js, tab_index
     )
+
+
+def check_popup(page: Page, js: str) -> dict:
+    """Report whether a blocking popup/dialog is up on the page.
+
+    Runs the popup-check JS built by ``inject.popup_check_js``.
+    A failed check never blocks the request: it reports no popup,
+    so a flaky evaluation cannot turn a healthy request into a 503.
+    """
+
+    def _do_check() -> dict:
+        result = page.evaluate(js)
+        if isinstance(result, dict):
+            return {
+                "popup": bool(result.get("popup")),
+                "popup_text": str(result.get("popup_text") or ""),
+            }
+        return {"popup": False, "popup_text": ""}
+
+    try:
+        return run_in_browser_thread(_do_check)
+    except (PlaywrightError, RuntimeError, BrowserError, BrowserOperationTimeout):
+        return {"popup": False, "popup_text": ""}
 
 
 def check_page_health(page: Page) -> bool:

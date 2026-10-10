@@ -17,6 +17,7 @@ from sbsllm.browser import (
     BrowserError,
     ResponsePoller,
     check_page_health,
+    check_popup,
     close_browser,
     ensure_browser,
     inject_and_submit,
@@ -448,7 +449,10 @@ class TestInjectAndSubmit:
         assert result["tab"] == 1
         assert result["inject"] == "OK"
         assert result["submit"] == "OK"
-        mock_page.bring_to_front.assert_called_once()
+        # The tab is driven in the background: bringing it to the
+        # front stole focus from whichever tab the user was watching
+        # (and force-switched the visible tab on every request).
+        mock_page.bring_to_front.assert_not_called()
 
     def test_inject_fails(self):
         mock_page = MagicMock()
@@ -484,17 +488,41 @@ class TestInjectAndSubmit:
 
         assert "BROWSER_ERROR" in result["inject"]
 
-    def test_bring_to_front_error(self):
+
+class TestCheckPopup:
+    """The pre-submit popup check reports blocking dialogs."""
+
+    def test_reports_popup(self):
+        page = MagicMock()
+        page.evaluate.return_value = {
+            "popup": True,
+            "popup_text": "Verification required",
+        }
+        result = check_popup(page, "popup_js")
+        assert result == {"popup": True, "popup_text": "Verification required"}
+        page.evaluate.assert_called_once_with("popup_js")
+
+    def test_no_popup(self):
+        page = MagicMock()
+        page.evaluate.return_value = {"popup": False, "popup_text": ""}
+        result = check_popup(page, "popup_js")
+        assert result["popup"] is False
+
+    def test_evaluate_failure_never_blocks(self):
+        """A flaky evaluation must not turn a healthy request
+        into a 503."""
         from playwright.sync_api import Error as PlaywrightError
 
-        mock_page = MagicMock()
-        mock_page.is_closed.return_value = False
-        mock_page.bring_to_front.side_effect = PlaywrightError("page lost")
+        page = MagicMock()
+        page.evaluate.side_effect = PlaywrightError("stalled")
+        result = check_popup(page, "popup_js")
+        assert result == {"popup": False, "popup_text": ""}
 
-        result = inject_and_submit(mock_page, "inject_js", "submit_js", 1)
-
-        assert result["inject"] == "BROWSER_ERROR: page lost"
-        assert result["submit"] is None
+    def test_non_dict_result_reports_no_popup(self):
+        page = MagicMock()
+        page.evaluate.return_value = None
+        result = check_popup(page, "popup_js")
+        assert result["popup"] is False
 
 
 class TestCloseBrowser:
@@ -921,6 +949,35 @@ class TestNormalizeResponse:
             is True
         )
         assert browser_module._normalize_response({"content": "x"})["busy"] is False
+
+    def test_login_wall_is_preserved(self):
+        """The login-wall signal must reach the server: dropping it
+        here silently downgraded the 502 login error to a generic
+        timeout."""
+        out = browser_module._normalize_response(
+            {"found": False, "content": "", "login_wall": True}
+        )
+        assert out["login_wall"] is True
+        assert browser_module._normalize_response({"content": "x"})[
+            "login_wall"
+        ] is False
+
+    def test_popup_is_preserved(self):
+        """The popup signal and its text travel to the server,
+        which turns them into a 503."""
+        out = browser_module._normalize_response(
+            {
+                "found": False,
+                "content": "",
+                "popup": True,
+                "popup_text": "Verification required",
+            }
+        )
+        assert out["popup"] is True
+        assert out["popup_text"] == "Verification required"
+        missing = browser_module._normalize_response({"content": "x"})
+        assert missing["popup"] is False
+        assert missing["popup_text"] == ""
 
 
 class TestBrowserOperationTimeout:
@@ -2154,7 +2211,6 @@ class TestDoInjectAndSubmit:
         """_do_inject_and_submit returns status when page is closed before inject."""
         page = MagicMock()
         page.is_closed.return_value = True
-        page.bring_to_front = MagicMock()
         with patch("sbsllm.browser.time.sleep"):
             status = browser_module._do_inject_and_submit(
                 page, "inject_js", "submit_js", 0
@@ -2165,7 +2221,6 @@ class TestDoInjectAndSubmit:
         """_do_inject_and_submit returns status when page is closed before submit."""
         page = MagicMock()
         page.is_closed.return_value = False
-        page.bring_to_front = MagicMock()
         with (
             patch("sbsllm.browser.time.sleep"),
             patch.object(browser_module, "run_js", return_value="OK"),
@@ -2175,25 +2230,24 @@ class TestDoInjectAndSubmit:
             )
         assert status["inject"] == "OK"
 
-    def test_brings_to_front_error(self):
-        """_do_inject_and_submit handles bring_to_front errors."""
+    def test_runs_without_bringing_to_front(self):
+        """The tab is driven in the background, never brought to front."""
         page = MagicMock()
         page.is_closed.return_value = False
-        page.bring_to_front = MagicMock(
-            side_effect=browser_module.PlaywrightError("front failed")
-        )
-        with patch("sbsllm.browser.time.sleep"):
+        with (
+            patch("sbsllm.browser.time.sleep"),
+            patch.object(browser_module, "run_js", return_value="OK"),
+        ):
             status = browser_module._do_inject_and_submit(
                 page, "inject_js", "submit_js", 0
             )
-        assert "BROWSER_ERROR" in status["inject"]
-        assert "front failed" in status["inject"]
+        assert status["inject"] == "OK"
+        page.bring_to_front.assert_not_called()
 
     def test_inject_playwright_error(self):
         """_do_inject_and_submit handles PlaywrightError during inject."""
         page = MagicMock()
         page.is_closed.return_value = False
-        page.bring_to_front = MagicMock()
         with (
             patch("sbsllm.browser.time.sleep"),
             patch("sbsllm.browser.run_js", return_value="BROWSER_ERROR: timeout"),
@@ -2207,7 +2261,6 @@ class TestDoInjectAndSubmit:
         """_do_inject_and_submit handles PlaywrightError during submit."""
         page = MagicMock()
         page.is_closed.return_value = False
-        page.bring_to_front = MagicMock()
         call_count = [0]
 
         def mock_run_js(page, js):
@@ -2423,6 +2476,50 @@ class TestResponsePoller:
         assert stop is None
         stop = poller.observe(self._poll(content="ans"), 1.0 + 0.1)
         assert stop == "idle"
+
+    def test_popup_stops_polling_immediately(self):
+        """A blocking popup ends the wait on the first poll that
+        reports it, before any other termination rule."""
+        poller = self._poller()
+        stop = poller.observe(
+            {**self._poll(), "popup": True, "popup_text": "Session expired"},
+            1.0,
+        )
+        assert stop == "popup"
+
+    def test_popup_stops_even_without_payload_movement(self):
+        """The popup check runs before the is_new gate: a popup
+        that appears with no other change still ends the wait."""
+        poller = self._poller(idle_timeout=99.0, busy_patience=99)
+        # First poll establishes the baseline.
+        assert poller.observe(self._poll(content="ans"), 1.0) is None
+        # Same payload plus a popup: still must stop.
+        stop = poller.observe(
+            {**self._poll(content="ans"), "popup": True}, 1.0
+        )
+        assert stop == "popup"
+
+    def test_no_popup_flag_keeps_polling(self):
+        poller = self._poller(idle_timeout=0.1, done_confirm=99.0, busy_patience=99)
+        stop = poller.observe(
+            {**self._poll(content="ans"), "popup": False}, 1.0
+        )
+        assert stop is None
+
+    def test_popup_over_completed_turn_does_not_stop(self):
+        """A popup arriving AFTER the answer is on screen
+        (cookie banner, session-expiry modal) blocks nothing:
+        the completed answer is returned, not failed."""
+        poller = self._poller(done_confirm=99.0, busy_patience=99)
+        stop = poller.observe(
+            {
+                **self._poll(content="the answer", done=True),
+                "popup": True,
+                "popup_text": "Cookie consent",
+            },
+            1.0,
+        )
+        assert stop is None
 
     def test_idle_timeout_zero_does_not_finish_immediately(self):
         """Idle_timeout of 0 disables the idle rule instead of cutting on the

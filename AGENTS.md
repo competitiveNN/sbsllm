@@ -350,6 +350,55 @@ browser tab on a specific chat website (configured via `model_map`).
   `/welcome` marketing page; its CTAs (`a.nav__cta`, `a.hero__cta`)
   only exist there and now mark the pre-login state in
   `login_wall_selectors`.
+- **Tab focus**: `_do_inject_and_submit` no longer calls
+  `page.bring_to_front()`. With several chats open, every
+  request force-switched the visible tab to its own tab
+  (the "copilot steals focus" report — copilot.com itself
+  never calls `window.focus()`). Playwright drives background
+  pages fine; the inject JS already focuses the composer
+  element itself.
+- **`_normalize_response` field whitelist**: it used to drop
+  `login_wall`, so the server's login-wall 502 could never
+  fire (logged-out chats degraded to a generic 504).
+  `login_wall`, `popup` and `popup_text` are now passed
+  through — any new per-capture signal must be added to the
+  normalized dict or it will not reach `server.py`.
+
+### Blocking popup detection
+
+A visible blocking popup makes a chat unusable, so requests
+fail fast with a "service is temporarily unavailable" error
+instead of hanging until the timeout. The mechanism is
+generic across all services:
+
+- `popup_selectors` site key, defaulting to the shared
+  `_POPUP_SELECTORS` (`[role="dialog"][aria-modal="true"]`,
+  `[role="alertdialog"]`). A site overrides the list to add
+  its own modal chrome, or sets `[]` to opt out. Only
+  VISIBLE dialogs count; hidden-but-blocking dialogs (whose
+  mere presence blocks the page) belong in
+  `login_wall_modal_selectors` (copilot's security check)
+  and keep the 502 login-wall error.
+- Checked twice: (1) pre-submit — `_inject_and_submit`
+  runs `popup_check_js` (built by `inject.popup_check_js`,
+  executed by `browser.check_popup`) and returns a status
+  dict carrying `popup`/`popup_text`; every handler maps
+  that to a 503 before the SSE headers are committed.
+  (2) per-poll — the extraction JS reports `popup` /
+  `popup_text`, and `ResponsePoller.observe` returns a
+  `popup` stop reason the moment one appears, ending both
+  polling paths immediately. A popup over a COMPLETED
+  turn (`done` set, not busy) blocks nothing — the
+  answer on screen is returned, not failed (cookie
+  banners, session modals that pop up after the answer).
+- Error mapping: non-streaming and pre-submit streaming
+  requests get a 503 via `_send_error` (message from
+  `_popup_error_message`, which quotes the popup's text);
+  a popup that appears after the SSE headers are sent is
+  relayed as an `[sbsllm] …` SSE payload with
+  `finish_reason="length"`; on `multi`, a popup on any tab
+  fails the whole request with 503 (strict fan-out
+  semantics, no partial aggregates).
 
 ### Duplicate prompt guard
 
