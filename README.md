@@ -15,7 +15,6 @@ python -m playwright install chromium
 
 ```yaml
 chats:
-  - chatgpt
   - claude
   - deepseek
 
