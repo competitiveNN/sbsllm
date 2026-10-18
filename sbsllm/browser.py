@@ -593,6 +593,22 @@ def ensure_browser(chrome_bin: str | None = None) -> BrowserContext:
                 else:
                     launch_args["channel"] = "chromium"
 
+            # The default above is a VISIBLE browser specifically so the user
+            # can log in to chat sites interactively, but Playwright does not
+            # forward this process' environment to the browser child. Without
+            # the display variables Chromium silently falls back to headless on
+            # a machine that has a display, so no window ever appears and no
+            # interactive challenge (e.g. copilot's Cloudflare Turnstile) can
+            # be solved by hand. Forward only the display-related keys so a
+            # fully headless host is unaffected.
+            _display_env = {
+                k: v for k, v in os.environ.items()
+                if k in ("DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY",
+                         "XDG_RUNTIME_DIR", "XDG_SESSION_TYPE")
+            }
+            if _display_env and not headless:
+                launch_args["env"] = _display_env
+
             context = playwright_instance.chromium.launch_persistent_context(
                 user_data_dir(), **launch_args
             )
