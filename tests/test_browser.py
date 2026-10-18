@@ -2108,7 +2108,7 @@ class TestOpenPageBrowserThread:
             patch.object(browser_module, "_do_open_page") as mock_do,
         ):
             browser_module.open_page("https://example.com", setup_js="js")
-            mock_do.assert_called_once_with("https://example.com", None, "js")
+            mock_do.assert_called_once_with("https://example.com", None, "js", None)
 
 
 class TestCloseBrowserThread:
@@ -2812,8 +2812,11 @@ class TestUserDataDirEnvOverride:
     """
 
     def test_default_path_is_well_known(self, monkeypatch):
+        import os
+
         monkeypatch.delenv("SBSLLM_USER_DATA_DIR", raising=False)
-        assert browser_module.user_data_dir() == "/tmp/sbsllm-chrome"
+        expected = os.path.expanduser("~/.local/share/sbsllm/chrome")
+        assert browser_module.user_data_dir() == expected
 
     def test_env_override_changes_path(self, monkeypatch, tmp_path):
         custom = str(tmp_path / "sbsllm-profile")

@@ -43,7 +43,39 @@
   acceleration. Verified by launching Chromium with the flags and
   reading the unmasked WebGL renderer, plus launch-arg tests.
 
+- **The Chromium profile now lives on a persistent disk path
+  (`~/.local/share/sbsllm/chrome`) instead of `/tmp/sbsllm-chrome`.**
+  The old default sat on a volatile tmpfs, so login sessions and the
+  browser cache were wiped on every container/boot restart — the
+  "logins don't persist" symptom. The new default is under `$HOME` and
+  survives reboots. Override with `user_data_dir` in `config.yaml`, the
+  `SBSLLM_USER_DATA_DIR` env var, or the `--user-data-dir` CLI flag.
+  `ensure_browser` / `open_page` / `_open_tabs` / `run` /
+  `run_server` all accept a `user_data_dir` argument; the config field
+  is read at call time so tests can still switch profiles mid-process.
+
 ### Fixed
+
+- **A crashed Chromium no longer degrades into a bare 502.** The
+  browser is launched once and outlives the individual requests,
+  but it can exit on its own (renderer crash, tube reset, OOM, an
+  operator `pkill`). Every Playwright call on the then-zombie tab
+  fails with `TargetClosedError`, which `browser.py` wraps as a
+  `BrowserError` ("JS execution failed: Target page, context or
+  browser has been closed") — and `_handle_chat_completions`
+  immediately returned a 502 for it, which itself died with
+  `BrokenPipeError` when the caller's socket was already gone.
+  The non-streaming handler now catches `BrowserError` anywhere in
+  its capture / inject / wait phase, relaunches Chromium and
+  reopens the tab for that model via `_recover_page`, and retries
+  the request once on the fresh page (log marker
+  `chat_completion browser_error_recovering`), so a dead browser
+  self-heals. A second failure — or an unrecoverable page — still
+  returns 502, now with an actionable "restart sbsllm" message.
+  The streaming path and the `multi` fan-out keep their graceful
+  failures without a mid-request restart: an SSE body already sent
+  cannot be re-streamed, and `_run_multi_tab` writes `tab_map`
+  from worker threads without a lock.
 
 - **Every request force-switched the visible browser tab.**
   `_do_inject_and_submit` called `page.bring_to_front()`

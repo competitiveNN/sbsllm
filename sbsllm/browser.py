@@ -26,22 +26,34 @@ _state_logger = logging.getLogger(__name__ + ".response_state")
 # operators can trace queue state without sifting through per-poll noise.
 _worker_logger = logging.getLogger(__name__ + ".worker_lifecycle")
 
-# Isolated user data directory for Chromium profile
-# The persistent user-data directory holds login sessions between runs, so
-# it must be stable across invocations. But in CI and parallel test suites
-# every process needs its own copy: two Chromium instances locking the same
-# profile is the classic "could not connect to browser" hang. SBSLLM_USER_DATA_DIR
-# lets callers (and tests) point at a private directory; the default is the
-# well-known path used by the CLI.
-USER_DATA_DIR = "/tmp/sbsllm-chrome"
+# Persistent user-data directory for the Chromium profile.
+#
+# The profile holds login sessions and the browser cache between runs, so it
+# MUST live on a filesystem that survives reboots. The original default
+# (/tmp/sbsllm-chrome) sat on a volatile tmpfs and was wiped on every
+# container/boot restart — exactly the "logins don't persist" symptom. This
+# default is under $HOME so it persists across restarts.
+#
+# In CI and parallel test suites every process still needs its own copy:
+# two Chromium instances locking the same profile is the classic "could not
+# connect to browser" hang. SBSLLM_USER_DATA_DIR lets callers (and tests)
+# point at a private directory; the config-level user_data_dir field lets
+# users pick a persistent path of their own. Precedence is explicit argument
+# > env var > this default, all read at call time so tests can switch
+# profiles mid-process without reloading the module.
+USER_DATA_DIR = os.path.expanduser("~/.local/share/sbsllm/chrome")
 
 
-def user_data_dir() -> str:
-    """Return the active user-data directory, honoring SBSLLM_USER_DATA_DIR.
+def user_data_dir(user_data_dir: str | None = None) -> str:
+    """Return the active user-data directory.
+
+    Precedence: explicit argument > SBSLLM_USER_DATA_DIR env > USER_DATA_DIR.
 
     Read at call time rather than import time so tests can switch profiles
     mid-process without reloading the module.
     """
+    if user_data_dir:
+        return user_data_dir
     return os.environ.get("SBSLLM_USER_DATA_DIR") or USER_DATA_DIR
 
 
@@ -540,7 +552,9 @@ def _find_system_chromium() -> str | None:
     return None
 
 
-def ensure_browser(chrome_bin: str | None = None) -> BrowserContext:
+def ensure_browser(
+    chrome_bin: str | None = None, profile_dir: str | None = None
+) -> BrowserContext:
     """Ensure Chromium is running. Launch if not.
 
     Returns the persistent browser context, which is created with an isolated
@@ -610,7 +624,7 @@ def ensure_browser(chrome_bin: str | None = None) -> BrowserContext:
                 launch_args["env"] = _display_env
 
             context = playwright_instance.chromium.launch_persistent_context(
-                user_data_dir(), **launch_args
+                user_data_dir(profile_dir), **launch_args
             )
             _context = context
             return context
@@ -664,10 +678,13 @@ def _close_blank_pages(browser: BrowserContext, keep_page: Page | None = None) -
 
 
 def _do_open_page(
-    url: str, chrome_bin: str | None = None, setup_js: str | None = None
+    url: str,
+    chrome_bin: str | None = None,
+    setup_js: str | None = None,
+    user_data_dir: str | None = None,
 ) -> Page:
     """Open a URL on the Playwright browser thread."""
-    browser = ensure_browser(chrome_bin)
+    browser = ensure_browser(chrome_bin, user_data_dir)
     page = _find_blank_page(browser)
 
     if page is None:
@@ -676,7 +693,7 @@ def _do_open_page(
         except PlaywrightError as e:
             logger.warning(f"Opening a new tab failed; recreating browser context: {e}")
             close_browser()
-            browser = ensure_browser(chrome_bin)
+            browser = ensure_browser(chrome_bin, user_data_dir)
             try:
                 page = browser.new_page()
             except PlaywrightError as retry_error:
@@ -710,12 +727,15 @@ def _do_open_page(
 
 
 def open_page(
-    url: str, chrome_bin: str | None = None, setup_js: str | None = None
+    url: str,
+    chrome_bin: str | None = None,
+    setup_js: str | None = None,
+    user_data_dir: str | None = None,
 ) -> Page:
     """Open a URL in a new page/tab. Returns the page."""
     if _is_browser_thread():
-        return _do_open_page(url, chrome_bin, setup_js)
-    return run_in_browser_thread(_do_open_page, url, chrome_bin, setup_js)
+        return _do_open_page(url, chrome_bin, setup_js, user_data_dir)
+    return run_in_browser_thread(_do_open_page, url, chrome_bin, setup_js, user_data_dir)
 
 
 def close_browser() -> None:

@@ -94,6 +94,15 @@ class Config(BaseModel):
             "would otherwise re-post the prompt in a loop. 0 disables the guard."
         ),
     )
+    user_data_dir: str | None = Field(
+        default=None,
+        description=(
+            "Chromium profile directory. Holds login sessions and the browser "
+            "cache between runs, so it must live on a filesystem that survives "
+            "reboots. Defaults to ~/.local/share/sbsllm/chrome; override with "
+            "SBSLLM_USER_DATA_DIR or this field."
+        ),
+    )
 
     @field_validator("chats")
     @classmethod

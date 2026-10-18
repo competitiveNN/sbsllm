@@ -119,6 +119,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to Chrome/Chromium binary (auto-detected if omitted)",
     )
     parser.add_argument(
+        "--user-data-dir",
+        type=str,
+        default=None,
+        help=(
+            "Chromium profile directory (holds logins + cache between runs). "
+            "Defaults to ~/.local/share/sbsllm/chrome; override with "
+            "SBSLLM_USER_DATA_DIR or config.user_data_dir."
+        ),
+    )
+    parser.add_argument(
         "--json-log",
         action="store_true",
         help="Output logs in JSON format for structured logging",
@@ -191,7 +201,12 @@ def wait_for_login(wait: int) -> None:
         remaining -= chunk
 
 
-def _open_tabs(chats: list[str], urls: list[str], browser_bin: str | None) -> list:
+def _open_tabs(
+    chats: list[str],
+    urls: list[str],
+    browser_bin: str | None,
+    user_data_dir: str | None = None,
+) -> list:
     """Open all tabs sequentially, running site-specific setup_js after load."""
     from .sites import SITES
 
@@ -201,7 +216,7 @@ def _open_tabs(chats: list[str], urls: list[str], browser_bin: str | None) -> li
         if chat in SITES:
             setup_js = SITES[chat].get("setup_js")
         try:
-            page = open_page(url, browser_bin, setup_js=setup_js)
+            page = open_page(url, browser_bin, setup_js=setup_js, user_data_dir=user_data_dir)
             pages[i] = page
             print(f"  [OK] {chat}: {url}", flush=True)
         except Exception as e:  # noqa: BLE001
@@ -258,6 +273,7 @@ def run(
     port: int = 8080,
     json_log: bool = False,
     browser_timeout: int | None = None,
+    user_data_dir: str | None = None,
 ) -> int:
     """Main orchestration. Returns exit code."""
     # Setup logging
@@ -270,6 +286,7 @@ def run(
     chats = config.chats
     wait = login_wait if login_wait is not None else config.login_wait
     browser_bin = chrome_bin or config.chrome_bin
+    user_data_dir = user_data_dir or config.user_data_dir
 
     server = None
     server_thread = None
@@ -277,7 +294,7 @@ def run(
     try:
         # Step 1: Ensure browser is running
         try:
-            ensure_browser(browser_bin)
+            ensure_browser(browser_bin, user_data_dir)
         except BrowserError as e:
             print(f"Error: {e}", file=sys.stderr)
             return 1
@@ -286,7 +303,7 @@ def run(
         urls = [get_site(chat)["url"] for chat in chats]
         print(f"Opening {len(urls)} tabs...")
 
-        pages = _open_tabs(chats, urls, browser_bin)
+        pages = _open_tabs(chats, urls, browser_bin, user_data_dir)
 
         if any(p is None for p in pages):
             print("\nSome tabs failed to open. Continue anyway? [y/N]", end=" ")
@@ -390,17 +407,19 @@ def run_server(
     chrome_bin: str | None = None,
     json_log: bool = False,
     browser_timeout: int | None = None,
+    user_data_dir: str | None = None,
 ) -> int:
     """Run the OpenAI-compatible server."""
     chats = config.chats
     browser_bin = chrome_bin or config.chrome_bin
+    user_data_dir = user_data_dir or config.user_data_dir
     server = None
     server_thread = None
 
     try:
         # Ensure browser is running
         try:
-            ensure_browser(browser_bin)
+            ensure_browser(browser_bin, user_data_dir)
         except BrowserError as e:
             print(f"Error: {e}", file=sys.stderr)
             return 1
@@ -409,7 +428,7 @@ def run_server(
         urls = [get_site(chat)["url"] for chat in chats]
         print(f"Opening {len(urls)} tabs...", flush=True)
 
-        pages = _open_tabs(chats, urls, browser_bin)
+        pages = _open_tabs(chats, urls, browser_bin, user_data_dir)
         successful_tabs = {
             chat: page for chat, page in zip(chats, pages) if page is not None
         }
@@ -487,7 +506,12 @@ def main() -> None:
 
     if args.server:
         exit_code = run_server(
-            config, args.host, args.port, args.chrome_bin, args.json_log
+            config,
+            args.host,
+            args.port,
+            args.chrome_bin,
+            args.json_log,
+            user_data_dir=args.user_data_dir,
         )
     else:
         exit_code = run(
@@ -498,6 +522,7 @@ def main() -> None:
             args.host,
             args.port,
             args.json_log,
+            user_data_dir=args.user_data_dir,
         )
 
     sys.exit(exit_code)

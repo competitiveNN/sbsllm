@@ -52,6 +52,23 @@ sbsllm --list-sites                        # List available chats
 | `chrome_bin` | Playwright Chromium | Path to Chrome/Chromium binary (auto-detected if omitted) |
 | `log_level` | `INFO` | Logging level: DEBUG, INFO, WARNING, ERROR, CRITICAL |
 | `log_file` | stdout | Path to log file (optional) |
+| `user_data_dir` | `~/.local/share/sbsllm/chrome` | Chromium profile directory. Holds login sessions and the browser cache between runs, so it must live on a filesystem that survives reboots. Override with `SBSLLM_USER_DATA_DIR` or `--user-data-dir`. |
+
+## Persistent logins
+
+The Chromium profile is stored under `~/.local/share/sbsllm/chrome` so that
+login sessions and the browser cache survive restarts. The original default
+(`/tmp/sbsllm-chrome`) sat on a volatile tmpfs and was wiped on every
+container/boot restart, which is why logins never persisted. Point it
+elsewhere with:
+
+```bash
+SBSLLM_USER_DATA_DIR=$HOME/.local/share/sbsllm/chrome sbsllm --server
+# or
+sbsllm --user-data-dir $HOME/.local/share/sbsllm/chrome --server
+# or in config.yaml:
+# user_data_dir: ~/.local/share/sbsllm/chrome
+```
 
 ## OpenAI-Compatible Server
 
@@ -97,7 +114,10 @@ The server runs until interrupted. Stopping it also closes the Chromium pages.
 
 ## How It Works
 
-sbsllm launches an isolated Chromium profile via Playwright,
+sbsllm launches an isolated Chromium profile via Playwright, so login
+sessions persist between runs. The profile lives at
+`~/.local/share/sbsllm/chrome` (overridable via `user_data_dir` /
+`SBSLLM_USER_DATA_DIR` / `--user-data-dir`) so it survives reboots.
 opens each chat in a separate page/tab, waits for you to log in, then uses
 JavaScript injection to type and send your prompt into each chat's input field.
 

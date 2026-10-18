@@ -1811,119 +1811,176 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                     "stream": False,
                 },
             )
+
+        # One-shot recovery: if the page/browser dies mid-request (e.g.
+        # Chromium exited while sbsllm stayed up), recover the tab and retry
+        # the full submit+wait sequence once instead of returning a bare 502.
+        recovery_attempted = False
         try:
-            extraction = extract_js(site_id)
-            if duplicate:
-                status = {
-                    "tab": tab_index,
-                    "inject": "OK (duplicate suppressed)",
-                    "submit": "OK (duplicate suppressed)",
-                }
-                if extraction:
-                    attach = capture_response(
-                        page, extraction, convert=lambda r: _convert_response(site_id, r)
-                    )
-                    if not attach.get("busy") and (attach.get("content") or "").strip():
-                        response_result = attach
+            while True:
+                try:
+                    extraction = extract_js(site_id)
+                    if duplicate:
+                        status = {
+                            "tab": tab_index,
+                            "inject": "OK (duplicate suppressed)",
+                            "submit": "OK (duplicate suppressed)",
+                        }
+                        if extraction:
+                            attach = capture_response(
+                                page,
+                                extraction,
+                                convert=lambda r: _convert_response(site_id, r),
+                            )
+                            if not attach.get("busy") and (
+                                attach.get("content") or ""
+                            ).strip():
+                                response_result = attach
+                            else:
+                                response_result = wait_for_response(
+                                    page,
+                                    extraction,
+                                    browser_timeout,
+                                    idle_timeout=self._server_setting(
+                                        "response_idle_timeout",
+                                        DEFAULT_RESPONSE_IDLE_TIMEOUT,
+                                    ),
+                                    poll_interval=self._server_setting(
+                                        "poll_interval", DEFAULT_POLL_INTERVAL
+                                    ),
+                                    done_confirm=self._server_setting(
+                                        "response_done_confirm",
+                                        DEFAULT_RESPONSE_DONE_CONFIRM,
+                                    ),
+                                    thinking_patience=self._server_setting(
+                                        "thinking_patience", DEFAULT_THINKING_PATIENCE
+                                    ),
+                                    busy_patience=self._server_setting(
+                                        "busy_patience", DEFAULT_BUSY_PATIENCE
+                                    ),
+                                    first_token_timeout=self._server_setting(
+                                        "first_token_timeout",
+                                        DEFAULT_FIRST_TOKEN_TIMEOUT,
+                                    ),
+                                    baseline=attach,
+                                    convert=lambda r: _convert_response(
+                                        site_id, r
+                                    ),
+                                )
                     else:
-                        response_result = wait_for_response(
-                            page,
-                            extraction,
-                            browser_timeout,
-                            idle_timeout=self._server_setting(
-                                "response_idle_timeout", DEFAULT_RESPONSE_IDLE_TIMEOUT
-                            ),
-                            poll_interval=self._server_setting(
-                                "poll_interval", DEFAULT_POLL_INTERVAL
-                            ),
-                            done_confirm=self._server_setting(
-                                "response_done_confirm", DEFAULT_RESPONSE_DONE_CONFIRM
-                            ),
-                            thinking_patience=self._server_setting(
-                                "thinking_patience", DEFAULT_THINKING_PATIENCE
-                            ),
-                            busy_patience=self._server_setting(
-                                "busy_patience", DEFAULT_BUSY_PATIENCE
-                            ),
-                            first_token_timeout=self._server_setting(
-                                "first_token_timeout", DEFAULT_FIRST_TOKEN_TIMEOUT
-                            ),
-                            baseline=attach,
-                            convert=lambda r: _convert_response(site_id, r),
+                        baseline = (
+                            capture_response(
+                                page,
+                                extraction,
+                                convert=lambda r: _convert_response(site_id, r),
+                            )
+                            if extraction
+                            else None
                         )
-            else:
-                baseline = (
-                    capture_response(
-                        page, extraction, convert=lambda r: _convert_response(site_id, r)
+                        status, page = self._inject_and_submit_with_recovery(
+                            page, model, site_id, prompt, tab_index
+                        )
+                        if (
+                            isinstance(status, dict)
+                            and status.get("inject") == "OK"
+                            and status.get("submit")
+                            in {"OK", "ENTER_SENT", "ENTER_SENT_UNVERIFIED"}
+                            and extraction
+                        ):
+                            # Only a real submission arms the duplicate-submit guard.
+                            self._record_turn(model, prompt)
+                            response_result = wait_for_response(
+                                page,
+                                extraction,
+                                browser_timeout,
+                                idle_timeout=self._server_setting(
+                                    "response_idle_timeout",
+                                    DEFAULT_RESPONSE_IDLE_TIMEOUT,
+                                ),
+                                poll_interval=self._server_setting(
+                                    "poll_interval", DEFAULT_POLL_INTERVAL
+                                ),
+                                done_confirm=self._server_setting(
+                                    "response_done_confirm",
+                                    DEFAULT_RESPONSE_DONE_CONFIRM,
+                                ),
+                                thinking_patience=self._server_setting(
+                                    "thinking_patience", DEFAULT_THINKING_PATIENCE
+                                ),
+                                busy_patience=self._server_setting(
+                                    "busy_patience", DEFAULT_BUSY_PATIENCE
+                                ),
+                                first_token_timeout=self._server_setting(
+                                    "first_token_timeout",
+                                    DEFAULT_FIRST_TOKEN_TIMEOUT,
+                                ),
+                                baseline=baseline,
+                                convert=lambda r: _convert_response(site_id, r),
+                            )
+                    break
+                except BrowserError as e:
+                    if recovery_attempted:
+                        # Already recovered once; give up and surface the error.
+                        elapsed = time.monotonic() - request_start
+                        snapshot = get_page_snapshot(page)
+                        logger.warning(
+                            "chat_completion request_end",
+                            extra={
+                                "model": model,
+                                "tab_index": tab_index,
+                                "status_code": 502,
+                                "duration_ms": int(elapsed * 1000),
+                                "error": str(e),
+                                "error_type": "browser_error",
+                                "request_id": request_id,
+                                "page_url": snapshot.get("url"),
+                                "page_title": snapshot.get("title"),
+                            },
+                        )
+                        _update_metrics(
+                            elapsed, error=True, error_type="browser_error"
+                        )
+                        self._send_error(
+                            502,
+                            f"Browser error from {site_id}: {e}. Try restarting "
+                            "the browser.",
+                            "server_error",
+                            request_id,
+                            model=model,
+                            site_id=site_id,
+                            tab_index=tab_index,
+                        )
+                        return
+                    # Recover the dead tab and retry once. `page` is reassigned
+                    # to the fresh page so subsequent calls use it.
+                    elapsed = time.monotonic() - request_start
+                    logger.warning(
+                        "chat_completion browser_error_recovering",
+                        extra={
+                            "model": model,
+                            "tab_index": tab_index,
+                            "duration_ms": int(elapsed * 1000),
+                            "error": str(e),
+                            "error_type": "browser_error",
+                            "request_id": request_id,
+                        },
                     )
-                    if extraction
-                    else None
-                )
-                status, page = self._inject_and_submit_with_recovery(
-                    page, model, site_id, prompt, tab_index
-                )
-                if (
-                    isinstance(status, dict)
-                    and status.get("inject") == "OK"
-                    and status.get("submit")
-                    in {"OK", "ENTER_SENT", "ENTER_SENT_UNVERIFIED"}
-                    and extraction
-                ):
-                    # Only a real submission arms the duplicate-submit guard.
-                    self._record_turn(model, prompt)
-                    response_result = wait_for_response(
-                        page,
-                        extraction,
-                        browser_timeout,
-                        idle_timeout=self._server_setting(
-                            "response_idle_timeout", DEFAULT_RESPONSE_IDLE_TIMEOUT
-                        ),
-                        poll_interval=self._server_setting(
-                            "poll_interval", DEFAULT_POLL_INTERVAL
-                        ),
-                        done_confirm=self._server_setting(
-                            "response_done_confirm", DEFAULT_RESPONSE_DONE_CONFIRM
-                        ),
-                        thinking_patience=self._server_setting(
-                            "thinking_patience", DEFAULT_THINKING_PATIENCE
-                        ),
-                        busy_patience=self._server_setting(
-                            "busy_patience", DEFAULT_BUSY_PATIENCE
-                        ),
-                        first_token_timeout=self._server_setting(
-                            "first_token_timeout", DEFAULT_FIRST_TOKEN_TIMEOUT
-                        ),
-                        baseline=baseline,
-                        convert=lambda r: _convert_response(site_id, r),
-                    )
-        except BrowserError as e:
-            elapsed = time.monotonic() - request_start
-            snapshot = get_page_snapshot(page)
-            logger.warning(
-                "chat_completion request_end",
-                extra={
-                    "model": model,
-                    "tab_index": tab_index,
-                    "status_code": 502,
-                    "duration_ms": int(elapsed * 1000),
-                    "error": str(e),
-                    "error_type": "browser_error",
-                    "request_id": request_id,
-                    "page_url": snapshot.get("url"),
-                    "page_title": snapshot.get("title"),
-                },
-            )
-            _update_metrics(elapsed, error=True, error_type="browser_error")
-            self._send_error(
-                502,
-                f"Browser error from {site_id}: {e}. Try restarting the browser.",
-                "server_error",
-                request_id,
-                model=model,
-                site_id=site_id,
-                tab_index=tab_index,
-            )
-            return
+                    new_page = self._recover_page(model, site_id)
+                    if new_page is None:
+                        self._send_error(
+                            502,
+                            f"Browser error from {site_id}: {e}. Could not recover "
+                            "the browser tab — restart sbsllm.",
+                            "server_error",
+                            request_id,
+                            model=model,
+                            site_id=site_id,
+                            tab_index=tab_index,
+                        )
+                        return
+                    page = new_page
+                    recovery_attempted = True
+                    continue
         except BrowserOperationTimeout as e:
             # A browser operation that never completed means the Playwright
             # worker thread is wedged (e.g. a page.evaluate() on a stalled

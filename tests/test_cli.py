@@ -670,6 +670,7 @@ class TestMain:
                 host="0.0.0.0",
                 port=9000,
                 chrome_bin=None,
+                user_data_dir=None,
                 json_log=False,
             )
             with patch("sbsllm.cli.load_config") as mock_load:
@@ -689,6 +690,7 @@ class TestMain:
                 "0.0.0.0",
                 9000,
                 False,  # json_log
+                user_data_dir=None,
             )
 
     def test_run_returns_error_code(self):

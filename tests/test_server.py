@@ -9,6 +9,7 @@ import types
 from typing import ClassVar
 from unittest.mock import MagicMock, patch
 
+from sbsllm.browser import BrowserError
 from sbsllm.server import (
     DEFAULT_HOST,
     DEFAULT_PORT,
@@ -639,6 +640,78 @@ class TestOpenAIHandlerChatCompletions:
         call_args = handler._send_json.call_args[0]
         data = call_args[1]
         assert data["thinking"] == "2+2=4"
+
+    def test_browser_error_recovers_and_retries_once(self):
+        """A dead Chromium mid-request is recovered, not failed with a bare 502."""
+        body = json.dumps(
+            {"model": "gpt-4", "messages": [{"role": "user", "content": "Hello!"}]}
+        ).encode()
+        handler = self._make_handler(body)
+        good = {"found": True, "content": "4", "thinking": None, "done": True}
+
+        patches = list(self._patch_success(good))
+        # The first wait_for_response dies with the closed browser; the retry
+        # against the recovered tab returns the answer.
+        patches[6] = patch(
+            "sbsllm.server.wait_for_response",
+            side_effect=[
+                BrowserError(
+                    "JS execution failed: Page.evaluate: Target page, context "
+                    "or browser has been closed"
+                ),
+                good,
+            ],
+        )
+        with (
+            patches[0],
+            patches[1],
+            patches[2],
+            patches[3],
+            patches[4],
+            patches[5],
+            patches[6],
+            patches[7],
+        ):
+            handler._recover_page = MagicMock(return_value=handler.tab_map["gpt-4"])
+            OpenAIHandler._handle_chat_completions(handler)
+
+        handler._recover_page.assert_called_once()
+        handler._send_error.assert_not_called()
+        handler._send_json.assert_called_once()
+        call_args = handler._send_json.call_args[0]
+        assert call_args[0] == 200
+        assert call_args[1]["choices"][0]["message"]["content"] == "4"
+
+    def test_browser_error_gives_up_after_one_recovery(self):
+        """A browser that stays dead fails with 502 after a single recovery."""
+        body = json.dumps(
+            {"model": "gpt-4", "messages": [{"role": "user", "content": "Hello!"}]}
+        ).encode()
+        handler = self._make_handler(body)
+
+        patches = list(self._patch_success({"found": False, "content": ""}))
+        patches[6] = patch(
+            "sbsllm.server.wait_for_response",
+            side_effect=BrowserError("Target page persists closed"),
+        )
+        with (
+            patches[0],
+            patches[1],
+            patches[2],
+            patches[3],
+            patches[4],
+            patches[5],
+            patches[6],
+            patches[7],
+        ):
+            handler._recover_page = MagicMock(return_value=handler.tab_map["gpt-4"])
+            OpenAIHandler._handle_chat_completions(handler)
+
+        handler._recover_page.assert_called_once()
+        handler._send_json.assert_not_called()
+        handler._send_error.assert_called_once()
+        assert handler._send_error.call_args[0][0] == 502
+        assert "restarting" in handler._send_error.call_args[0][1]
 
     def test_non_streaming_exposes_reasoning_content_in_message(self):
         """Thinking must also appear in choices[0].message.reasoning_content
