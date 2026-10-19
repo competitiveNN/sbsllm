@@ -549,6 +549,7 @@ class TestRunServer:
                 response_idle_timeout=3.0,
                 thinking_patience=120.0,
                 duplicate_prompt_cooldown=60.0,
+                debug_endpoints=False,
             )
             mock_server.start.assert_called_once()
 
@@ -576,6 +577,7 @@ class TestRunServer:
                 response_idle_timeout=3.0,
                 thinking_patience=120.0,
                 duplicate_prompt_cooldown=60.0,
+                debug_endpoints=False,
             )
             mock_server.start.assert_called_once()
             url_calls = [
@@ -672,6 +674,7 @@ class TestMain:
                 chrome_bin=None,
                 user_data_dir=None,
                 json_log=False,
+                debug_endpoints=False,
             )
             with patch("sbsllm.cli.load_config") as mock_load:
                 mock_load.return_value = Config(
@@ -691,6 +694,7 @@ class TestMain:
                 9000,
                 False,  # json_log
                 user_data_dir=None,
+                debug_endpoints=False,
             )
 
     def test_run_returns_error_code(self):

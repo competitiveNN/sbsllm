@@ -1802,21 +1802,25 @@ SITES: dict[str, dict] = {
             })()
         """,
         "response_selectors": [
+            '[data-message-author-role="assistant"]',
+            '[data-message-role="assistant"]',
             "#response-content-container .markdown-prose",
             "#response-content-container",
-            '[data-message-author-role="assistant"]',
-            ".message.assistant .markdown",
-            ".chat-assistant .markdown",
-            ".assistant-message .markdown",
-            "article .markdown",
-            # Fallbacks from external automation scripts
-            'div[class*="prose"]',
-            'div[class*="markdown"]',
-            'div[class*="chat-assistant"]',
-            'div[class*="response"]',
-            '[data-message-role="assistant"]',
-            "div.chat-message",
-            'div[id*="message"]',
+        ],
+        # z.ai scopes each assistant turn with data-message-author-role; reading
+        # only inside the NEWEST assistant container keeps the user's own
+        # (submitted) question bubble out of the extracted answer. Without this
+        # the broad prose/markdown fallbacks below matched the user turn and the
+        # benchmark captured the question text as the "answer".
+        "response_container": '[data-message-author-role="assistant"]',
+        # Turn chrome that renders inside the answer container.
+        "response_exclude_selectors": [
+            "button, [role='button']",
+            "[class*='action'], [class*='toolbar']",
+            "[class*='feedback'], [class*='thumb']",
+            "[class*='copy']",
+            "[class*='message-header'], [class*='message-status']",
+            "[class*='follow-up'], [class*='suggested']",
         ],
         "thinking_selectors": [
             ".thinking-block",

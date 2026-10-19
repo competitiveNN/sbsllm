@@ -13,6 +13,7 @@ from sbsllm.browser import BrowserError
 from sbsllm.server import (
     DEFAULT_HOST,
     DEFAULT_PORT,
+    _DEBUG_JS_MAX_BYTES,
     OpenAIHandler,
     Server,
     _ModelLockRegistry,
@@ -1567,6 +1568,302 @@ class TestHTTPMethods:
         handler._send_error.assert_called_once_with(
             404, "Not found: /unknown", "not_found", "test-request-id"
         )
+
+
+class TestDebugEndpoints:
+    """Test the /debug/* operator diagnostics routes."""
+
+    RID = "test-request-id"
+
+    def _handler(self, path, *, debug=True, tab_pages=None, model_map=None):
+        handler = OpenAIHandler.__new__(OpenAIHandler)
+        handler.path = path
+        handler.headers = {"x-request-id": self.RID}
+        handler._send_json = MagicMock()
+        handler._send_error = MagicMock()
+        server = MagicMock()
+        # Set it explicitly either way: an unset MagicMock attribute is
+        # truthy, which would leave the gate on for the "disabled" tests.
+        server.debug_endpoints = bool(debug)
+        server.tab_map = {model: page for model, page in (tab_pages or {}).items()}
+        server.model_map = model_map or {}
+        server.model_locks = _ModelLockRegistry()
+        handler.server = server
+        return handler
+
+    def test_do_get_routes_debug_when_enabled(self):
+        """do_GET dispatches /debug/ to _handle_debug when enabled."""
+        handler = self._handler("/debug/js?model=gpt-4&js=1+1")
+        handler._handle_debug = MagicMock()
+        OpenAIHandler.do_GET(handler)
+        handler._handle_debug.assert_called_once_with(self.RID)
+
+    def test_do_get_404_when_disabled(self):
+        """With debug_endpoints off, /debug/* is indistinguishable from a 404."""
+        import os
+
+        handler = self._handler("/debug/js?model=gpt-4&js=1+1", debug=False)
+        with patch.dict(os.environ, {"SBSLLM_DEBUG_ENDPOINTS": ""}):
+            handler._handle_debug = MagicMock()
+            OpenAIHandler.do_GET(handler)
+            handler._handle_debug.assert_not_called()
+            handler._send_error.assert_called_once_with(
+                404, "Not found: /debug/js?model=gpt-4&js=1+1", "not_found", self.RID
+            )
+
+    def test_env_var_enables_routes(self):
+        """SBSLLM_DEBUG_ENDPOINTS alone enables the routes (browser-style env)."""
+        import os
+
+        handler = self._handler("/debug/js?model=gpt-4&js=1+1", debug=False)
+        with patch.dict(os.environ, {"SBSLLM_DEBUG_ENDPOINTS": "1"}):
+            handler._handle_debug = MagicMock()
+            OpenAIHandler.do_GET(handler)
+            handler._handle_debug.assert_called_once_with(self.RID)
+
+    def test_env_var_off_value_keeps_routes_off(self):
+        """A falsy env value does not silently enable anything."""
+        import os
+
+        handler = self._handler("/debug/js?model=gpt-4&js=1+1", debug=False)
+        with patch.dict(os.environ, {"SBSLLM_DEBUG_ENDPOINTS": "0"}):
+            handler._handle_debug = MagicMock()
+            OpenAIHandler.do_GET(handler)
+            handler._handle_debug.assert_not_called()
+
+    def test_unknown_route_404(self):
+        handler = self._handler("/debug/nope?model=gpt-4", tab_pages={"gpt-4": None})
+        handler._handle_debug(self.RID)
+        handler._send_error.assert_called_once_with(
+            404, "unknown debug route: /debug/nope", "not_found", self.RID
+        )
+
+    def test_no_tab_for_model_404(self):
+        handler = self._handler("/debug/js?model=nope&js=1", tab_pages={"gpt-4": None})
+        handler._handle_debug(self.RID)
+        handler._send_error.assert_called_once_with(
+            404,
+            "no tab for model='nope'; known: ['gpt-4']",
+            "not_found",
+            self.RID,
+        )
+
+    def test_js_missing_param_400(self):
+        handler = self._handler("/debug/js?model=gpt-4", tab_pages={"gpt-4": object()})
+        handler._handle_debug(self.RID)
+        handler._send_error.assert_called_once_with(
+            400, "missing js param", "bad_request", self.RID
+        )
+
+    def test_js_oversize_param_400(self):
+        big = "//" + ("x" * _DEBUG_JS_MAX_BYTES)
+        handler = self._handler(
+            f"/debug/js?model=gpt-4&js={big}", tab_pages={"gpt-4": object()}
+        )
+        handler._handle_debug(self.RID)
+        args, _ = handler._send_error.call_args
+        assert args[0] == 400
+        assert "too large" in args[1]
+
+    def test_js_returns_result(self):
+        handler = self._handler(
+            "/debug/js?model=gpt-4&js=document.title", tab_pages={"gpt-4": object()}
+        )
+        with patch("sbsllm.server.run_js_value", return_value="A title") as run_js:
+            handler._handle_debug(self.RID)
+        run_js.assert_called_once()
+        assert run_js.call_args.args[0] is handler.server.tab_map["gpt-4"]
+        assert run_js.call_args.args[1] == "document.title"
+        handler._send_json.assert_called_once_with(
+            200,
+            {"model": "gpt-4", "result": "A title", "request_id": self.RID},
+            self.RID,
+        )
+
+    def test_js_error_maps_to_500(self):
+        from sbsllm.browser import BrowserError
+
+        handler = self._handler(
+            "/debug/js?model=gpt-4&js=0/0", tab_pages={"gpt-4": object()}
+        )
+        with patch("sbsllm.server.run_js_value", side_effect=BrowserError("boom")):
+            handler._handle_debug(self.RID)
+        args, _ = handler._send_error.call_args
+        assert args[0] == 500
+        assert "debug js failed" in args[1]
+        assert args[2] == "debug_error"
+
+    def test_js_does_not_take_tab_lock(self):
+        """A read-only probe must not block on, or be blocked by, a chat turn."""
+        registry = _ModelLockRegistry()
+        held = registry.get("gpt-4")
+        held.acquire()
+        handler = self._handler(
+            "/debug/js?model=gpt-4&js=document.title", tab_pages={"gpt-4": object()}
+        )
+        handler.server.model_locks = registry
+        with patch("sbsllm.server.run_js_value", return_value="A title"):
+            handler._handle_debug(self.RID)
+        handler._send_json.assert_called_once()
+        assert held.locked()
+        held.release()
+
+    def test_reload_ensures_site_url(self):
+        page = object()
+        handler = self._handler(
+            "/debug/reload?model=gpt-4",
+            tab_pages={"gpt-4": page},
+            model_map={"gpt-4": "chatgpt"},
+        )
+        with patch("sbsllm.server.run_js_value", return_value="ok") as run_js, patch(
+            "sbsllm.server.run_in_browser_thread",
+            side_effect=lambda fn, **kw: fn(),
+        ):
+            handler._handle_debug(self.RID)
+        # A bare reload cannot leave a half-loaded page: the site URL is re-applied.
+        assert run_js.call_count == 2
+        assert "location.reload()" in run_js.call_args_list[0].args[1]
+        setup_js = run_js.call_args_list[1].args[1]
+        assert "https://chatgpt.com" in setup_js
+        handler._send_json.assert_called_once_with(
+            200, {"model": "gpt-4", "reloaded": True, "request_id": self.RID}, self.RID
+        )
+
+    def test_reload_without_known_site_skips_setup(self):
+        handler = self._handler(
+            "/debug/reload?model=orphan",
+            tab_pages={"orphan": object()},
+            model_map={},
+        )
+        with patch("sbsllm.server.run_js_value", return_value="ok") as run_js, patch(
+            "sbsllm.server.run_in_browser_thread",
+            side_effect=lambda fn, **kw: fn(),
+        ):
+            handler._handle_debug(self.RID)
+        assert run_js.call_count == 1
+
+    def test_reload_refuses_while_tab_busy(self):
+        registry = _ModelLockRegistry()
+        registry.get("gpt-4").acquire()
+        handler = self._handler(
+            "/debug/reload?model=gpt-4",
+            tab_pages={"gpt-4": object()},
+            model_map={"gpt-4": "chatgpt"},
+        )
+        handler.server.model_locks = registry
+        with patch("sbsllm.server.run_js_value"), patch(
+            "sbsllm.server._DEBUG_TAB_LOCK_TIMEOUT", 0.05
+        ), patch("sbsllm.server.run_in_browser_thread"):
+            handler._handle_debug(self.RID)
+        args, _ = handler._send_error.call_args
+        assert args[0] == 503
+        assert args[1] and "gpt-4" in args[1]
+        assert handler._send_json.call_count == 0
+
+    def test_reload_error_maps_to_500(self):
+        handler = self._handler(
+            "/debug/reload?model=gpt-4",
+            tab_pages={"gpt-4": object()},
+            model_map={"gpt-4": "chatgpt"},
+        )
+        with patch("sbsllm.server.run_js_value"), patch(
+            "sbsllm.server.run_in_browser_thread", side_effect=RuntimeError("wedged")
+        ):
+            handler._handle_debug(self.RID)
+        args, _ = handler._send_error.call_args
+        assert args[0] == 500
+        assert "debug reload failed" in args[1]
+
+    def test_navigate_uses_configured_url(self):
+        page = object()
+        handler = self._handler(
+            "/debug/navigate?model=gpt-4&url=https://chatgpt.com/",
+            tab_pages={"gpt-4": page},
+            model_map={"gpt-4": "chatgpt"},
+        )
+        with patch("sbsllm.server.run_js_value", return_value="ok") as run_js, patch(
+            "sbsllm.server.run_in_browser_thread",
+            side_effect=lambda fn, **kw: fn(),
+        ):
+            handler._handle_debug(self.RID)
+        setup_js = run_js.call_args.args[1]
+        assert "https://chatgpt.com" in setup_js
+        handler._send_json.assert_called_once_with(
+            200,
+            {"model": "gpt-4", "navigated": "https://chatgpt.com/", "request_id": self.RID},
+            self.RID,
+        )
+
+    def test_navigate_accepts_trailing_slash_variation(self):
+        handler = self._handler(
+            "/debug/navigate?model=gpt-4&url=https://chatgpt.com",
+            tab_pages={"gpt-4": object()},
+            model_map={"gpt-4": "chatgpt"},
+        )
+        with patch("sbsllm.server.run_js_value"), patch(
+            "sbsllm.server.run_in_browser_thread", side_effect=lambda fn, **kw: fn()
+        ):
+            handler._handle_debug(self.RID)
+        handler._send_json.assert_called_once()
+
+    def test_navigate_rejects_foreign_url(self):
+        handler = self._handler(
+            "/debug/navigate?model=gpt-4&url=https://evil.example/steal",
+            tab_pages={"gpt-4": object()},
+            model_map={"gpt-4": "chatgpt"},
+        )
+        handler._handle_debug(self.RID)
+        args, _ = handler._send_error.call_args
+        assert args[0] == 400
+        assert "configured chat URL" in args[1]
+
+    def test_navigate_missing_url_400(self):
+        handler = self._handler(
+            "/debug/navigate?model=gpt-4",
+            tab_pages={"gpt-4": object()},
+            model_map={"gpt-4": "chatgpt"},
+        )
+        handler._handle_debug(self.RID)
+        args, _ = handler._send_error.call_args
+        assert args[0] == 400
+        assert args[1] == "missing url param"
+
+    def test_navigate_unknown_model_site_400(self):
+        handler = self._handler(
+            "/debug/navigate?model=orphan&url=https://x.example/",
+            tab_pages={"orphan": object()},
+            model_map={},
+        )
+        handler._handle_debug(self.RID)
+        args, _ = handler._send_error.call_args
+        assert args[0] == 400
+        assert "cannot determine configured URL" in args[1]
+
+    def test_state_changing_actions_release_tab_lock(self):
+        handler = self._handler(
+            "/debug/reload?model=gpt-4",
+            tab_pages={"gpt-4": object()},
+            model_map={"gpt-4": "chatgpt"},
+        )
+        with patch("sbsllm.server.run_js_value"), patch(
+            "sbsllm.server.run_in_browser_thread", side_effect=lambda fn, **kw: fn()
+        ):
+            handler._handle_debug(self.RID)
+        assert not handler.server.model_locks.get("gpt-4").locked()
+
+    def test_create_server_debug_off_by_default(self):
+        server = create_server()
+        assert server.debug_endpoints is False
+
+    def test_create_server_debug_opt_in(self):
+        server = create_server(debug_endpoints=True)
+        assert server.debug_endpoints is True
+
+    def test_handler_setting_reads_off_when_unset(self):
+        """A legacy server object lacking the attribute keeps the gate off."""
+        handler = OpenAIHandler.__new__(OpenAIHandler)
+        handler.server = MagicMock(spec=[])
+        assert handler._debug_endpoints_enabled() is False
 
 
 class TestHandlerHelpers:

@@ -133,6 +133,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Output logs in JSON format for structured logging",
     )
+    parser.add_argument(
+        "--debug-endpoints",
+        action="store_true",
+        help=(
+            "Enable the operator diagnostics routes GET /debug/js, "
+            "/debug/reload and /debug/navigate. They run in the browser tabs "
+            "that hold your live sign-in sessions, so off by default."
+        ),
+    )
     return parser
 
 
@@ -274,6 +283,7 @@ def run(
     json_log: bool = False,
     browser_timeout: int | None = None,
     user_data_dir: str | None = None,
+    debug_endpoints: bool = False,
 ) -> int:
     """Main orchestration. Returns exit code."""
     # Setup logging
@@ -330,6 +340,7 @@ def run(
             response_idle_timeout=config.response_idle_timeout,
             thinking_patience=config.thinking_patience,
             duplicate_prompt_cooldown=config.duplicate_prompt_cooldown,
+            debug_endpoints=debug_endpoints or config.debug_endpoints,
         )
         server_thread = _start_server(server)
         if server_thread is None:
@@ -408,6 +419,7 @@ def run_server(
     json_log: bool = False,
     browser_timeout: int | None = None,
     user_data_dir: str | None = None,
+    debug_endpoints: bool = False,
 ) -> int:
     """Run the OpenAI-compatible server."""
     chats = config.chats
@@ -458,6 +470,7 @@ def run_server(
             response_idle_timeout=config.response_idle_timeout,
             thinking_patience=config.thinking_patience,
             duplicate_prompt_cooldown=config.duplicate_prompt_cooldown,
+            debug_endpoints=debug_endpoints or config.debug_endpoints,
         )
 
         server_thread = _start_server(server)
@@ -512,6 +525,7 @@ def main() -> None:
             args.chrome_bin,
             args.json_log,
             user_data_dir=args.user_data_dir,
+            debug_endpoints=args.debug_endpoints,
         )
     else:
         exit_code = run(
@@ -523,6 +537,7 @@ def main() -> None:
             args.port,
             args.json_log,
             user_data_dir=args.user_data_dir,
+            debug_endpoints=args.debug_endpoints,
         )
 
     sys.exit(exit_code)

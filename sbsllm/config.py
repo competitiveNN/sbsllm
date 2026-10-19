@@ -103,6 +103,15 @@ class Config(BaseModel):
             "SBSLLM_USER_DATA_DIR or this field."
         ),
     )
+    debug_endpoints: bool = Field(
+        default=False,
+        description=(
+            "Enable the operator diagnostics routes (GET /debug/js, /debug/reload, "
+            "/debug/navigate) for examining a wedged chat tab. They operate on "
+            "tabs that hold your live sign-in sessions, so keep this off unless "
+            "you are actively debugging."
+        ),
+    )
 
     @field_validator("chats")
     @classmethod

@@ -10,13 +10,16 @@ import concurrent.futures
 import hashlib
 import json
 import logging
+import os
 import re
 import signal
+import sys
 import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, ClassVar
+from urllib.parse import parse_qs, urlparse
 
 from playwright.sync_api import Error as PlaywrightError
 
@@ -33,6 +36,8 @@ from .browser import (
     get_page_snapshot,
     inject_and_submit,
     is_new_response,
+    run_in_browser_thread,
+    run_js_value,
     wait_for_response,
 )
 from .inject import extract_js, inject_prompt, popup_check_js, submit_js
@@ -127,6 +132,22 @@ def _popup_error_message(site_id: str, popup_text: str) -> str:
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8080
 MAX_REQUEST_BYTES = 1_000_000
+
+# Operator diagnostics under GET /debug/* (_handle_debug). OFF by default:
+# /debug/js runs arbitrary JavaScript inside a tab that holds live sign-in
+# sessions for every configured chat, so it is an explicit opt-in
+# (`debug_endpoints` in config.yaml, `--debug-endpoints` on the CLI, or the
+# SBSLLM_DEBUG_ENDPOINTS env var).
+DEFAULT_DEBUG_ENDPOINTS = False
+# Per-request bounds for /debug actions. page.evaluate carries no timeout of
+# its own, so every page call is bounded here instead (see browser.py).
+_DEBUG_JS_MAX_BYTES = 100_000
+_DEBUG_OPERATION_TIMEOUT = 10.0
+# reload/navigate wait out a page load, which is slower than a DOM read.
+_DEBUG_TAB_OP_TIMEOUT = 20.0
+# A debug action refuses rather than queues behind a chat: holding a request
+# open for a whole answer to reload a tab is not diagnostic, it is a stall.
+_DEBUG_TAB_LOCK_TIMEOUT = 5.0
 # Default timeout for browser operations (seconds)
 DEFAULT_BROWSER_TIMEOUT = 60
 # How long the extracted answer/thinking may stay unchanged before we treat
@@ -309,6 +330,7 @@ class _SBSHTTPServer(ThreadingHTTPServer):
         self.poll_interval: float = DEFAULT_POLL_INTERVAL
         self.model_map: dict[str, str] = {}
         self.tab_map: dict[str, object] = {}
+        self.debug_endpoints: bool = DEFAULT_DEBUG_ENDPOINTS
 
     def process_request(self, request: Any, client_address: Any) -> None:
         with self._active_lock:
@@ -424,13 +446,18 @@ class OpenAIHandler(BaseHTTPRequestHandler):
     def _send_json(
         self, status: int, data: dict, request_id: str | None = None
     ) -> None:
-        """Send a JSON response."""
+        """Send a JSON response.
+
+        ``default=str`` keeps an unencodable value (a returned Date, Map or
+        other exotic object from /debug/js) from turning a successful call into
+        a 500 -- it is a diagnostic answer either way.
+        """
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         if request_id:
             self.send_header(REQUEST_ID_HEADER, request_id)
         self.end_headers()
-        self.wfile.write(json.dumps(data).encode("utf-8"))
+        self.wfile.write(json.dumps(data, default=str).encode("utf-8"))
 
     def _send_error(
         self,
@@ -518,8 +545,213 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             self._handle_health(request_id)
         elif self.path == "/metrics":
             self._handle_metrics(request_id)
+        elif self.path.startswith("/debug/") and self._debug_endpoints_enabled():
+            self._handle_debug(request_id)
         else:
             self._send_error(404, f"Not found: {self.path}", "not_found", request_id)
+
+    def _debug_endpoints_enabled(self) -> bool:
+        """Whether the operator diagnostics endpoints are enabled.
+
+        Off unless opted in — `debug_endpoints` in config.yaml (or the CLI
+        `--debug-endpoints`, which sets it), or ``SBSLLM_DEBUG_ENDPOINTS=1``
+        (also ``true``/``yes``/``on``), matching how the other environment
+        switches are read. While off the routes answer a plain 404, so a probe
+        cannot tell they exist.
+        """
+        if self._server_setting("debug_endpoints", DEFAULT_DEBUG_ENDPOINTS):
+            return True
+        env = os.environ.get("SBSLLM_DEBUG_ENDPOINTS", "").strip().lower()
+        return env in ("1", "true", "yes", "on")
+
+    def _debug_model_site(self, model: str):
+        """Return the site dict for `model`, or None.
+
+        `tab_map` is keyed by model name while `SITES` is keyed by site id, so
+        the site is looked up through `model_map` (the mapping the server
+        validated at construction) rather than by using the model name directly
+        — a model aliased to another site id otherwise re-ran nothing.
+        """
+        server = getattr(self, "server", None)
+        model_map = getattr(server, "model_map", None) or {}
+        site_id = model_map.get(model)
+        return get_site(site_id) if site_id else None
+
+    def _debug_acquire_tab(self, request_id: str, model: str):
+        """Take the chat tab lock for a state-changing debug action.
+
+        Returns ``(proceed, lock)``. A tab that is mid-turn refuses (503)
+        instead of queueing behind a whole answer: reloading or navigating it
+        would tear down the response another request is streaming.
+        """
+        lock, acquired, wait_timeout = self._acquire_browser_lock(
+            model, timeout=_DEBUG_TAB_LOCK_TIMEOUT
+        )
+        if not acquired:
+            self._send_busy_error(request_id, model, wait_timeout)
+            return False, None
+        return True, lock
+
+    def _handle_debug(self, request_id: str) -> None:
+        """Read-only inspection + minimal tab actions for operator diagnostics.
+
+        Routes (all GET, only served while `debug_endpoints` is on):
+          /debug/js?model=X&js=<expression>  evaluate JS in the tab, return result
+          /debug/reload?model=X              reload the tab (site setup_js re-run)
+          /debug/navigate?model=X&url=Y      navigate back to the tab's chat URL
+
+        These exist because a wedged/landing-page tab otherwise only surfaces as an
+        opaque inject failure ("NO_MARKED_INPUT", "no answer within first_token_timeout")
+        that can only be diagnosed by looking at the live page. The state-changing
+        routes hold the same per-tab lock a chat request takes, so they cannot
+        pull a conversation out from under an in-flight turn.
+        """
+        parsed = urlparse(self.path)
+        server = getattr(self, "server", None)
+        if server is None:
+            self._send_error(500, "server not attached", "server_error", request_id)
+            return
+
+        handlers = {
+            "/debug/js": self._debug_js,
+            "/debug/reload": self._debug_reload,
+            "/debug/navigate": self._debug_navigate,
+        }
+        handler = handlers.get(parsed.path)
+        if handler is None:
+            self._send_error(
+                404, f"unknown debug route: {parsed.path}", "not_found", request_id
+            )
+            return
+
+        qs = parse_qs(parsed.query)
+        model = (qs.get("model") or [""])[0]
+        page = server.tab_map.get(model)
+        if page is None:
+            self._send_error(
+                404,
+                f"no tab for model={model!r}; known: {sorted(server.tab_map)}",
+                "not_found",
+                request_id,
+            )
+            return
+        handler(request_id, model, page, qs)
+
+    def _debug_js(self, request_id: str, model: str, page, qs: dict) -> None:
+        """Evaluate an arbitrary expression in the tab and return its value."""
+        js = (qs.get("js") or [""])[0]
+        if not js:
+            self._send_error(400, "missing js param", "bad_request", request_id)
+            return
+        if len(js.encode("utf-8")) > _DEBUG_JS_MAX_BYTES:
+            self._send_error(
+                400,
+                f"js param too large (max {_DEBUG_JS_MAX_BYTES} bytes)",
+                "bad_request",
+                request_id,
+            )
+            return
+        try:
+            result = run_js_value(page, js, timeout=_DEBUG_OPERATION_TIMEOUT)
+        except Exception as e:  # noqa: BLE001
+            self._send_error(500, f"debug js failed: {e}", "debug_error", request_id)
+            return
+        self._send_json(
+            200,
+            {"model": model, "result": result, "request_id": request_id},
+            request_id,
+        )
+
+    def _debug_reload(self, request_id: str, model: str, page, qs: dict) -> None:
+        """Reload the tab and re-arm the site's JS setup hook."""
+        site = self._debug_model_site(model) or {}
+        site_url = site.get("url")
+        setup_code = (
+            "(() => { if (location.href !== "
+            + json.dumps(site_url)
+            + ") location.href = "
+            + json.dumps(site_url)
+            + "; return true; })()"
+            if site_url
+            else None
+        )
+        proceed, lock = self._debug_acquire_tab(request_id, model)
+        if not proceed:
+            return
+        try:
+
+            def _run() -> None:
+                run_js_value(page, "location.reload()", timeout=_DEBUG_OPERATION_TIMEOUT)
+                if setup_code:
+                    run_js_value(page, setup_code, timeout=_DEBUG_OPERATION_TIMEOUT)
+
+            run_in_browser_thread(_run, operation_timeout=_DEBUG_TAB_OP_TIMEOUT)
+        except Exception as e:  # noqa: BLE001
+            self._send_error(500, f"debug reload failed: {e}", "debug_error", request_id)
+            return
+        finally:
+            self._release_browser_lock(lock)
+        self._send_json(
+            200,
+            {"model": model, "reloaded": True, "request_id": request_id},
+            request_id,
+        )
+
+    def _debug_navigate(self, request_id: str, model: str, page, qs: dict) -> None:
+        """Navigate the tab back to its configured chat URL.
+
+        Only the model's own site URL is accepted: the tab holds live sign-in
+        sessions for every configured chat, so an arbitrary URL (a phishing
+        page, an attacker endpoint) has no legitimate diagnostic use.
+        """
+        url = (qs.get("url") or [""])[0]
+        site = self._debug_model_site(model) or {}
+        site_url = site.get("url")
+        if not url:
+            self._send_error(400, "missing url param", "bad_request", request_id)
+            return
+        if not site_url:
+            self._send_error(
+                400,
+                f"cannot determine configured URL for model={model!r}",
+                "bad_request",
+                request_id,
+            )
+            return
+        if url.rstrip("/") != site_url.rstrip("/"):
+            self._send_error(
+                400,
+                f"url must be the configured chat URL for model={model!r}: {site_url}",
+                "bad_request",
+                request_id,
+            )
+            return
+
+        proceed, lock = self._debug_acquire_tab(request_id, model)
+        if not proceed:
+            return
+        try:
+
+            def _run() -> None:
+                run_js_value(
+                    page,
+                    "location.href = " + json.dumps(site_url),
+                    timeout=_DEBUG_OPERATION_TIMEOUT,
+                )
+
+            run_in_browser_thread(_run, operation_timeout=_DEBUG_TAB_OP_TIMEOUT)
+        except Exception as e:  # noqa: BLE001
+            self._send_error(
+                500, f"debug navigate failed: {e}", "debug_error", request_id
+            )
+            return
+        finally:
+            self._release_browser_lock(lock)
+        self._send_json(
+            200,
+            {"model": model, "navigated": site_url, "request_id": request_id},
+            request_id,
+        )
 
     def _handle_health(self, request_id: str) -> None:
         """Return health status including browser connectivity."""
@@ -817,12 +1049,14 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                     return content
         return ""
 
-    def _acquire_browser_lock(self, model: str):
+    def _acquire_browser_lock(self, model: str, timeout: float | None = None):
         """Acquire the lock for `model`'s tab; returns (lock, acquired, timeout).
 
         The lock is per tab, not global, so a request to one chat never blocks
         an unrelated chat. `lock` is None when acquisition failed, so the
-        caller cannot accidentally release a lock it does not hold.
+        caller cannot accidentally release a lock it does not hold. `timeout`
+        overrides the configured `browser_lock_timeout` for callers that must
+        refuse rather than queue (the /debug actions).
         """
         server_obj = getattr(self, "server", None)
         registry = getattr(server_obj, "model_locks", None)
@@ -832,8 +1066,9 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         if registry is None:
             return None, True, 0
         lock = registry.get(model)
-        acquired = lock.acquire(timeout=browser_lock_timeout)
-        return (lock if acquired else None), acquired, browser_lock_timeout
+        wait = float(browser_lock_timeout if timeout is None else timeout)
+        acquired = lock.acquire(timeout=wait)
+        return (lock if acquired else None), acquired, wait
 
     def _release_browser_lock(self, browser_lock) -> None:
         if browser_lock is not None:
@@ -2968,6 +3203,7 @@ class Server:
         keepalive_interval: float = DEFAULT_KEEPALIVE_INTERVAL,
         poll_interval: float = DEFAULT_POLL_INTERVAL,
         duplicate_prompt_cooldown: float = DEFAULT_DUPLICATE_PROMPT_COOLDOWN,
+        debug_endpoints: bool = DEFAULT_DEBUG_ENDPOINTS,
     ):
         self.model_map = dict(model_map) if model_map else {}
         # The virtual `multi` model fans a prompt out to every
@@ -3012,6 +3248,7 @@ class Server:
         self.keepalive_interval = max(float(keepalive_interval), 0.1)
         self.poll_interval = max(float(poll_interval), 0.01)
         self.duplicate_prompt_cooldown = max(float(duplicate_prompt_cooldown), 0.0)
+        self.debug_endpoints = bool(debug_endpoints)
         self._server: _SBSHTTPServer | None = None
         self._ready = threading.Event()
         self._startup_error: BaseException | None = None
@@ -3111,6 +3348,7 @@ class Server:
             server.poll_interval = self.poll_interval
             server.model_map = self.model_map
             server.tab_map = self.tab_map
+            server.debug_endpoints = self.debug_endpoints
             if announce:
                 print(
                     f"sbsllm server listening on {self.url.rstrip('/')}",
@@ -3262,6 +3500,7 @@ def create_server(
     keepalive_interval: float = DEFAULT_KEEPALIVE_INTERVAL,
     poll_interval: float = DEFAULT_POLL_INTERVAL,
     duplicate_prompt_cooldown: float = DEFAULT_DUPLICATE_PROMPT_COOLDOWN,
+    debug_endpoints: bool = DEFAULT_DEBUG_ENDPOINTS,
 ) -> Server:
     """Create a new server instance."""
     return Server(
@@ -3280,4 +3519,5 @@ def create_server(
         keepalive_interval=keepalive_interval,
         poll_interval=poll_interval,
         duplicate_prompt_cooldown=duplicate_prompt_cooldown,
+        debug_endpoints=debug_endpoints,
     )
