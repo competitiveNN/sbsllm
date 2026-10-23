@@ -124,3 +124,7 @@ JavaScript injection to type and send your prompt into each chat's input field.
 > **Note**: The DOM selectors used for injection are fragile — chat sites change
 > their markup frequently. If a chat stops working, the selectors in `sites.py`
 > may need updating.
+
+## TODO
+
+- [ ] **File attachments** — the next big feature: support uploading files with prompts and forwarding them to every configured chat.
